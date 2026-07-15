@@ -32,46 +32,26 @@ Opsail 只提取接收到的 HTML；它不会执行 JavaScript、维护浏览器
 
 ### 预编译二进制
 
-下载适合当前平台的压缩包，解压后将 `opsail`（Windows 为 `opsail.exe`）放入 `PATH`：
+在 macOS 或 Linux 上运行：
+
+```sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.sh | sh
+```
+
+在 Windows 上，使用 PowerShell 运行：
+
+```powershell
+irm -UseBasicParsing https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.ps1 | iex
+```
+
+安装器会自动识别平台、验证 SHA-256 校验和，并安装到 `~/.local/bin`。Windows 会自动将该目录加入用户 `PATH`；macOS 和 Linux 在需要时会输出 PATH 配置提示。
+
+手动下载：
 
 - macOS：[Apple Silicon](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-apple-darwin.tar.gz) · [Intel](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-apple-darwin.tar.gz)
 - Linux：[x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-unknown-linux-musl.tar.gz) · [ARM64](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-unknown-linux-musl.tar.gz)
 - Windows：[x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-pc-windows-msvc.zip)
 - [SHA-256 校验文件](https://github.com/lencx/opsail/releases/latest/download/SHA256SUMS)
-
-在 macOS 或 Linux 上，将 `TARGET` 设置为当前平台对应的值，然后运行：
-
-```sh
-TARGET=aarch64-apple-darwin
-curl -fL "https://github.com/lencx/opsail/releases/latest/download/opsail-${TARGET}.tar.gz" -o "opsail-${TARGET}.tar.gz"
-tar -xzf "opsail-${TARGET}.tar.gz"
-sudo install -d /usr/local/bin
-sudo install -m 755 "opsail-${TARGET}/opsail" /usr/local/bin/opsail
-opsail --version
-```
-
-示例安装 Apple Silicon 版本。其他平台请将 `TARGET` 替换为 `x86_64-apple-darwin`、`x86_64-unknown-linux-musl` 或 `aarch64-unknown-linux-musl`。
-
-在 Windows 上，使用 PowerShell 运行：
-
-```powershell
-$target = "x86_64-pc-windows-msvc"
-$archive = "opsail-$target.zip"
-$bin = Join-Path $HOME "bin"
-
-Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/lencx/opsail/releases/latest/download/$archive" -OutFile $archive
-Expand-Archive $archive -DestinationPath . -Force
-New-Item -ItemType Directory -Force $bin | Out-Null
-Copy-Item ".\opsail-$target\opsail.exe" "$bin\opsail.exe" -Force
-
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($userPath -split ";") -notcontains $bin) {
-    $newPath = if ($userPath) { "$userPath;$bin" } else { $bin }
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-}
-$env:Path = "$bin;$env:Path"
-opsail --version
-```
 
 ### Cargo
 

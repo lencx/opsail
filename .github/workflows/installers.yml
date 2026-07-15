@@ -1,0 +1,131 @@
+name: Installer smoke tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/installers.yml"
+      - "scripts/install.ps1"
+      - "scripts/install.sh"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/installers.yml"
+      - "scripts/install.ps1"
+      - "scripts/install.sh"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installers-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unix:
+    name: Install on ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15
+          - macos-15-intel
+          - ubuntu-24.04
+          - ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check shell syntax
+        run: sh -n scripts/install.sh
+
+      - name: Install latest release
+        env:
+          OPSAIL_INSTALL_DIR: ${{ runner.temp }}/opsail-bin
+        shell: sh
+        run: |
+          scripts/install.sh
+          "$OPSAIL_INSTALL_DIR/opsail" --version
+          "$OPSAIL_INSTALL_DIR/opsail" read --help >/dev/null
+
+  windows:
+    name: Install on windows-2025
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Check PowerShell syntax
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path "scripts/install.ps1"),
+              [ref] $tokens,
+              [ref] $errors
+          ) | Out-Null
+
+          if ($errors.Count -gt 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              exit 1
+          }
+
+      - name: Install with Windows PowerShell
+        env:
+          OPSAIL_INSTALL_DIR: ${{ runner.temp }}\opsail-bin-windows-powershell
+        shell: powershell
+        run: |
+          Set-StrictMode -Off
+          $ErrorActionPreference = "Continue"
+
+          Get-Content -Raw "scripts/install.ps1" | Invoke-Expression
+
+          if ($ErrorActionPreference -ne "Continue") {
+              throw "installer leaked ErrorActionPreference"
+          }
+
+          try {
+              $null = $opsailUndefinedStrictModeProbe
+          } catch {
+              throw "installer leaked strict mode"
+          }
+
+          $ErrorActionPreference = "Stop"
+          & "$env:OPSAIL_INSTALL_DIR\opsail.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:OPSAIL_INSTALL_DIR\opsail.exe" read --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install with PowerShell
+        env:
+          OPSAIL_INSTALL_DIR: ${{ runner.temp }}\opsail-bin-powershell
+        shell: pwsh
+        run: |
+          Set-StrictMode -Off
+          $ErrorActionPreference = "Continue"
+
+          Get-Content -Raw "scripts/install.ps1" | Invoke-Expression
+
+          if ($ErrorActionPreference -ne "Continue") {
+              throw "installer leaked ErrorActionPreference"
+          }
+
+          try {
+              $null = $opsailUndefinedStrictModeProbe
+          } catch {
+              throw "installer leaked strict mode"
+          }
+
+          $ErrorActionPreference = "Stop"
+          & "$env:OPSAIL_INSTALL_DIR\opsail.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "$env:OPSAIL_INSTALL_DIR\opsail.exe" read --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -32,46 +32,26 @@ Opsail extracts the HTML it receives; it does not execute JavaScript, maintain a
 
 ### Prebuilt binaries
 
-Download the archive for your platform, extract it, and place `opsail` (`opsail.exe` on Windows) somewhere on your `PATH`:
+On macOS or Linux:
+
+```sh
+curl --proto '=https' --proto-redir '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.sh | sh
+```
+
+On Windows, run in PowerShell:
+
+```powershell
+irm -UseBasicParsing https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.ps1 | iex
+```
+
+The installers detect the platform, verify the SHA-256 checksum, and install to `~/.local/bin`. Windows adds that directory to the user `PATH`; on macOS and Linux, the installer prints PATH setup guidance when needed.
+
+Manual downloads:
 
 - macOS: [Apple Silicon](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-apple-darwin.tar.gz) · [Intel](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-apple-darwin.tar.gz)
 - Linux: [x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-unknown-linux-musl.tar.gz) · [ARM64](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-unknown-linux-musl.tar.gz)
 - Windows: [x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-pc-windows-msvc.zip)
 - [SHA-256 checksums](https://github.com/lencx/opsail/releases/latest/download/SHA256SUMS)
-
-On macOS or Linux, set `TARGET` to the value for your platform and run:
-
-```sh
-TARGET=aarch64-apple-darwin
-curl -fL "https://github.com/lencx/opsail/releases/latest/download/opsail-${TARGET}.tar.gz" -o "opsail-${TARGET}.tar.gz"
-tar -xzf "opsail-${TARGET}.tar.gz"
-sudo install -d /usr/local/bin
-sudo install -m 755 "opsail-${TARGET}/opsail" /usr/local/bin/opsail
-opsail --version
-```
-
-The example installs the Apple Silicon build. Use `x86_64-apple-darwin`, `x86_64-unknown-linux-musl`, or `aarch64-unknown-linux-musl` for the other supported platforms.
-
-On Windows, run in PowerShell:
-
-```powershell
-$target = "x86_64-pc-windows-msvc"
-$archive = "opsail-$target.zip"
-$bin = Join-Path $HOME "bin"
-
-Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/lencx/opsail/releases/latest/download/$archive" -OutFile $archive
-Expand-Archive $archive -DestinationPath . -Force
-New-Item -ItemType Directory -Force $bin | Out-Null
-Copy-Item ".\opsail-$target\opsail.exe" "$bin\opsail.exe" -Force
-
-$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
-if (($userPath -split ";") -notcontains $bin) {
-    $newPath = if ($userPath) { "$userPath;$bin" } else { $bin }
-    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
-}
-$env:Path = "$bin;$env:Path"
-opsail --version
-```
 
 ### Cargo
 
