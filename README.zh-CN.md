@@ -6,14 +6,76 @@ Opsail 是一个模块化 Rust CLI，为软件 Agent 提供小型、可组合的
 
 Opsail 只提取接收到的 HTML；它不会执行 JavaScript、维护浏览器会话、登录网站、抓取链接或与页面交互。
 
-| Crate | 版本 | 描述 |
-| --- | --- | --- |
-| [`opsail`](https://crates.io/crates/opsail) | [![crates.io 版本](https://img.shields.io/crates/v/opsail)](https://crates.io/crates/opsail) | 面向 Agent 行动的 CLI 与统一命令入口 |
-| [`opsail-read`](https://crates.io/crates/opsail-read) | [![crates.io 版本](https://img.shields.io/crates/v/opsail-read)](https://crates.io/crates/opsail-read) | 从静态 HTML 中提取干净的 Markdown、清洗后的 HTML 和结构化 JSON |
+<table>
+  <thead>
+    <tr>
+      <th width="180">Crate</th>
+      <th width="180">版本</th>
+      <th>描述</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td width="180"><a href="https://crates.io/crates/opsail"><code>opsail</code></a></td>
+      <td width="180"><a href="https://crates.io/crates/opsail"><img src="https://img.shields.io/crates/v/opsail" alt="crates.io 版本"></a></td>
+      <td>面向 Agent 行动的 CLI 与统一命令入口</td>
+    </tr>
+    <tr>
+      <td width="180"><a href="https://crates.io/crates/opsail-read"><code>opsail-read</code></a></td>
+      <td width="180"><a href="https://crates.io/crates/opsail-read"><img src="https://img.shields.io/crates/v/opsail-read" alt="crates.io 版本"></a></td>
+      <td>从静态 HTML 中提取干净的 Markdown、清洗后的 HTML 和结构化 JSON</td>
+    </tr>
+  </tbody>
+</table>
 
 ## 安装
 
-Opsail 需要 Rust 1.97 或更高版本。从 crates.io 安装最新版本：
+### 预编译二进制
+
+下载适合当前平台的压缩包，解压后将 `opsail`（Windows 为 `opsail.exe`）放入 `PATH`：
+
+- macOS：[Apple Silicon](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-apple-darwin.tar.gz) · [Intel](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-apple-darwin.tar.gz)
+- Linux：[x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-unknown-linux-musl.tar.gz) · [ARM64](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-unknown-linux-musl.tar.gz)
+- Windows：[x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-pc-windows-msvc.zip)
+- [SHA-256 校验文件](https://github.com/lencx/opsail/releases/latest/download/SHA256SUMS)
+
+在 macOS 或 Linux 上，将 `TARGET` 设置为当前平台对应的值，然后运行：
+
+```sh
+TARGET=aarch64-apple-darwin
+curl -fL "https://github.com/lencx/opsail/releases/latest/download/opsail-${TARGET}.tar.gz" -o "opsail-${TARGET}.tar.gz"
+tar -xzf "opsail-${TARGET}.tar.gz"
+sudo install -d /usr/local/bin
+sudo install -m 755 "opsail-${TARGET}/opsail" /usr/local/bin/opsail
+opsail --version
+```
+
+示例安装 Apple Silicon 版本。其他平台请将 `TARGET` 替换为 `x86_64-apple-darwin`、`x86_64-unknown-linux-musl` 或 `aarch64-unknown-linux-musl`。
+
+在 Windows 上，使用 PowerShell 运行：
+
+```powershell
+$target = "x86_64-pc-windows-msvc"
+$archive = "opsail-$target.zip"
+$bin = Join-Path $HOME "bin"
+
+Invoke-WebRequest -UseBasicParsing -Uri "https://github.com/lencx/opsail/releases/latest/download/$archive" -OutFile $archive
+Expand-Archive $archive -DestinationPath . -Force
+New-Item -ItemType Directory -Force $bin | Out-Null
+Copy-Item ".\opsail-$target\opsail.exe" "$bin\opsail.exe" -Force
+
+$userPath = [Environment]::GetEnvironmentVariable("Path", "User")
+if (($userPath -split ";") -notcontains $bin) {
+    $newPath = if ($userPath) { "$userPath;$bin" } else { $bin }
+    [Environment]::SetEnvironmentVariable("Path", $newPath, "User")
+}
+$env:Path = "$bin;$env:Path"
+opsail --version
+```
+
+### Cargo
+
+通过 crates.io 安装时，Opsail 需要 Rust 1.97 或更高版本：
 
 ```sh
 cargo install opsail
