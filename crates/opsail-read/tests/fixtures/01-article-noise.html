@@ -1,0 +1,77 @@
+<!-- base-url: https://example.test/journal/field-notes/quiet-tools -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Quiet Tools for Careful Work | Field Journal</title>
+  </head>
+  <body>
+    <header class="site-header">
+      <a href="/">Field Journal</a>
+      <nav aria-label="Primary navigation">
+        <a href="/latest">Latest</a>
+        <a href="/topics">Topics</a>
+        <a href="/archive">Archive</a>
+        <a href="/subscribe">Subscribe</a>
+      </nav>
+    </header>
+
+    <div class="cookie-banner">
+      This site stores preferences. <button type="button">Accept</button>
+    </div>
+
+    <main>
+      <article>
+        <h1>Quiet Tools for Careful Work</h1>
+        <p class="byline">By Mira Chen</p>
+        <p>
+          A dependable command-line tool should make a complicated task feel
+          ordinary. It accepts a clearly bounded input, reports failures without
+          disguising them, and produces an artifact that can be inspected before
+          another action begins. These properties matter most when the caller is
+          an automated worker that cannot infer what a silent command intended.
+        </p>
+        <p>
+          The useful workflow is deliberately small: acquire a document, locate
+          its main argument, preserve meaningful structure, and remove the page
+          furniture that was designed for browsing rather than reading. Headings,
+          paragraphs, lists, quotations, code, links, and tables carry meaning;
+          menus, promotional panels, account controls, and repeated footers do not.
+        </p>
+        <h2>A stable handoff</h2>
+        <p>
+          Stable output makes later work cheaper. A reviewer can compare revisions,
+          a cache can recognize unchanged content, and a second command can consume
+          the result without reconstructing the original layout. The boundary also
+          keeps fetching concerns separate from extraction, so archived files and
+          live responses follow the same deterministic path after input arrives.
+        </p>
+        <blockquote>
+          Reliability begins when each step leaves evidence that the next step can
+          understand.
+        </blockquote>
+        <ul>
+          <li>Keep content order predictable.</li>
+          <li>Keep meaningful links attached to their labels.</li>
+          <li>Keep diagnostics outside the primary document stream.</li>
+        </ul>
+      </article>
+
+      <aside class="recommendations">
+        <h2>More to explore</h2>
+        <p>This recommendation panel is unrelated to the article.</p>
+        <a href="/unrelated/one">A different story</a>
+        <a href="/unrelated/two">Another different story</a>
+      </aside>
+    </main>
+
+    <footer>
+      <nav aria-label="Footer navigation">
+        <a href="/about">About</a>
+        <a href="/terms">Terms</a>
+        <a href="/privacy">Privacy</a>
+      </nav>
+      <p>Copyright notice and newsletter invitation.</p>
+    </footer>
+  </body>
+</html>

@@ -1,0 +1,57 @@
+<!-- base-url: https://example.test/reference/seasonal-readings -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Seasonal Reading Tables</title>
+  </head>
+  <body>
+    <nav><a href="/reference">Reference home</a> <a href="/download">Downloads</a></nav>
+    <article>
+      <h1>Seasonal Reading Tables</h1>
+      <p>
+        Tables preserve relationships that disappear when cells are flattened into
+        a single stream. The first example has a conventional header and complete
+        rows. The second deliberately uses spanning cells and a missing value so the
+        conversion path must remain stable even when the source is irregular.
+      </p>
+
+      <table id="regular-readings">
+        <caption>Regular monthly readings</caption>
+        <thead>
+          <tr><th>Month</th><th>Rainfall</th><th>Open days</th></tr>
+        </thead>
+        <tbody>
+          <tr><td>April</td><td>82 mm</td><td>22</td></tr>
+          <tr><td>May</td><td>61 mm</td><td>27</td></tr>
+          <tr><td>June</td><td>94 mm</td><td>24</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Irregular maintenance record</h2>
+      <table id="irregular-record">
+        <caption>Work windows and shared notes</caption>
+        <tr>
+          <th rowspan="2">Window</th>
+          <th colspan="2">Measurements</th>
+          <th rowspan="2">Note</th>
+        </tr>
+        <tr><th>Before</th><th>After</th></tr>
+        <tr>
+          <td>Morning</td><td>14.2</td><td>14.6</td>
+          <td rowspan="2">Sensor cleaned<br>and checked</td>
+        </tr>
+        <tr><td>Afternoon</td><td>14.6</td></tr>
+        <tr><td colspan="3">Evening reading postponed</td><td>Path closed</td></tr>
+      </table>
+
+      <p>
+        A readable result should preserve the regular grid as a Markdown table and
+        handle the irregular grid without panicking, duplicating distant prose, or
+        silently discarding every value. Captions should stay near the table they
+        describe, and line breaks inside a cell should remain understandable.
+      </p>
+    </article>
+    <footer>Reference navigation and repeated download controls.</footer>
+  </body>
+</html>

@@ -1,0 +1,68 @@
+<!-- base-url: https://example.test/security/untrusted-page -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Visible Notes from an Untrusted Page</title>
+    <style>.concealed { display: none; }</style>
+    <script>window.unwantedGlobal = "SCRIPT_TEXT_MUST_NOT_APPEAR";</script>
+  </head>
+  <body onload="startTracking()">
+    <nav onclick="recordClick()"><a href="/">Home</a> <a href="/account">Account</a></nav>
+
+    <main>
+      <article oncopy="copyPrivateData()">
+        <h1>Visible Notes from an Untrusted Page</h1>
+        <p>
+          The visible article explains how cleaned output should behave when input
+          contains browser-only attributes and unsafe destinations. Readers should
+          keep this paragraph, its ordinary emphasis, and safe links while active
+          behavior is removed before the document is handed to another command.
+        </p>
+
+        <p hidden>HIDDEN_ATTRIBUTE_TEXT_MUST_NOT_APPEAR</p>
+        <div aria-hidden="true">ARIA_HIDDEN_TEXT_MUST_NOT_APPEAR</div>
+        <p style="display: none">DISPLAY_NONE_TEXT_MUST_NOT_APPEAR</p>
+        <p style="visibility: hidden">VISIBILITY_HIDDEN_TEXT_MUST_NOT_APPEAR</p>
+        <p class="concealed">HIDDEN_CLASS_TEXT_MUST_NOT_APPEAR</p>
+        <p aria-hidden="TRUE">UPPERCASE_ARIA_HIDDEN_MUST_NOT_APPEAR</p>
+        <p style="DISPLAY : none">UPPERCASE_DISPLAY_NONE_MUST_NOT_APPEAR</p>
+        <p class="HIDDEN">UPPERCASE_HIDDEN_CLASS_MUST_NOT_APPEAR</p>
+
+        <section class="advertisement promoted-content" id="ad-panel">
+          <h2>Promoted offer</h2>
+          <p>ADVERTISEMENT_TEXT_MUST_NOT_APPEAR</p>
+        </section>
+
+        <p onclick="stealSelection()">
+          Event attributes on visible elements must disappear without deleting the
+          visible sentence that carried them. The same rule applies to
+          <strong onmouseover="openPanel()">meaningful inline text</strong>.
+        </p>
+        <p>
+          <a href="javascript:runUnexpectedAction()" onclick="runUnexpectedAction()">
+            Unsafe action link
+          </a>
+          must not retain an executable destination. A
+          <a href="/safety/allowed" onfocus="recordFocus()">safe relative link</a>
+          should remain readable and resolve against the page origin.
+        </p>
+        <img
+          src="javascript:loadUnexpectedImage()"
+          onerror="sendDocument()"
+          alt="Unsafe image source must not survive"
+        >
+        <p>
+          Cleaning should also remove scripts, embedded controls, forms, and hidden
+          promotional material without treating their text as part of the article.
+          The final Markdown must be inert even if a later renderer enables links.
+        </p>
+      </article>
+    </main>
+
+    <aside class="advertisement">SECOND_ADVERTISEMENT_MUST_NOT_APPEAR</aside>
+    <form action="javascript:submitUnexpectedly()"><button>Unsafe form control</button></form>
+    <iframe src="javascript:loadFrame()" title="Unsafe frame"></iframe>
+    <footer onmouseenter="recordHover()">Footer controls and tracking links.</footer>
+  </body>
+</html>

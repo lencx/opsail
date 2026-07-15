@@ -1,0 +1,33 @@
+[package]
+name = "opsail-read"
+description = "Agent-ready web content extraction for Opsail"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+ammonia.workspace = true
+dom_query.workspace = true
+dom_smoothie.workspace = true
+encoding_rs.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-segmentation.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio.workspace = true
+wiremock.workspace = true
+
+[lints]
+workspace = true

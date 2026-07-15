@@ -1,0 +1,59 @@
+<!-- base-url: https://example.test/guides/cli/index.html -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Building a Predictable Text Command</title>
+  </head>
+  <body>
+    <header>
+      <nav><a href="../">Guide index</a> <a href="/search">Search</a></nav>
+    </header>
+    <main>
+      <article>
+        <h1>Building a Predictable Text Command</h1>
+        <p>
+          A text command should accept a file or standard input, write its primary
+          result to standard output, and reserve standard error for diagnostics.
+          The <code>--base-url</code> option supplies the context needed to preserve
+          links when an HTML document is read outside its original page.
+        </p>
+        <h2>Minimal Rust entry point</h2>
+        <pre><code class="language-rust">use std::io::{self, Read};
+
+fn main() -&gt; Result&lt;(), Box&lt;dyn std::error::Error&gt;&gt; {
+    let mut input = String::new();
+    io::stdin().read_to_string(&amp;mut input)?;
+
+    if input.contains("&lt;article") {
+        println!("{}", input);
+    }
+    Ok(())
+}</code></pre>
+        <p>
+          The fenced block must retain its language hint, four-space indentation,
+          braces, ampersands, and angle brackets. Inline code remains separate from
+          prose, while normal punctuation around it should not become part of the
+          command token.
+        </p>
+        <figure>
+          <img src="./images/input-to-text.png" alt="Input flowing into a readable text document">
+          <figcaption>A relative image used by this guide.</figcaption>
+        </figure>
+        <p>
+          Continue with the <a href="../reference/output-contract.html">output
+          contract</a>, review the <a href="/policies/untrusted-input">untrusted
+          input policy</a>, or jump to <a href="#verification">verification</a>.
+          These destinations should remain useful after the source page is gone.
+        </p>
+        <h2 id="verification">Verification</h2>
+        <p>
+          A fixture should confirm that code is unchanged, relative destinations
+          are resolved against the supplied page URL, and fragment-only links stay
+          attached to the current document rather than becoming unrelated paths.
+        </p>
+      </article>
+    </main>
+    <aside>Account shortcuts and unrelated guide suggestions.</aside>
+  </body>
+</html>
