@@ -6,6 +6,11 @@ Opsail is a modular Rust CLI for small, composable actions used by software agen
 
 Opsail extracts the HTML it receives; it does not execute JavaScript, maintain a browser session, authenticate to sites, crawl links, or interact with pages.
 
+| Crate | Version | Description |
+| --- | --- | --- |
+| [`opsail`](https://crates.io/crates/opsail) | [![crates.io version](https://img.shields.io/crates/v/opsail)](https://crates.io/crates/opsail) | Agent action CLI and unified command entry point |
+| [`opsail-read`](https://crates.io/crates/opsail-read) | [![crates.io version](https://img.shields.io/crates/v/opsail-read)](https://crates.io/crates/opsail-read) | Extracts clean Markdown, sanitized HTML, and structured JSON from static HTML |
+
 ## Installation
 
 Opsail requires Rust 1.97 or newer. Install the latest release from crates.io:

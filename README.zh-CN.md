@@ -6,6 +6,11 @@ Opsail 是一个模块化 Rust CLI，为软件 Agent 提供小型、可组合的
 
 Opsail 只提取接收到的 HTML；它不会执行 JavaScript、维护浏览器会话、登录网站、抓取链接或与页面交互。
 
+| Crate | 版本 | 描述 |
+| --- | --- | --- |
+| [`opsail`](https://crates.io/crates/opsail) | [![crates.io 版本](https://img.shields.io/crates/v/opsail)](https://crates.io/crates/opsail) | 面向 Agent 行动的 CLI 与统一命令入口 |
+| [`opsail-read`](https://crates.io/crates/opsail-read) | [![crates.io 版本](https://img.shields.io/crates/v/opsail-read)](https://crates.io/crates/opsail-read) | 从静态 HTML 中提取干净的 Markdown、清洗后的 HTML 和结构化 JSON |
+
 ## 安装
 
 Opsail 需要 Rust 1.97 或更高版本。从 crates.io 安装最新版本：
