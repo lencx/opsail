@@ -1,6 +1,12 @@
-# Opsail
+<p align="center">
+  <img src="https://raw.githubusercontent.com/lencx/opsail/main/assets/opsail-logo.png" alt="Opsail Logo" width="160">
+</p>
 
-[English](https://github.com/lencx/opsail/blob/main/README.md) | 简体中文
+<h1 align="center">Opsail</h1>
+
+<p align="center">
+  <a href="https://github.com/lencx/opsail/blob/main/README.md">English</a> | 简体中文
+</p>
 
 Opsail 是一个模块化 Rust CLI，为软件 Agent 提供小型、可组合的行动能力。首个行动 `read` 可将 HTTP(S) URL、本地文件或标准输入中的静态 HTML 转换为可阅读的 Markdown、清洗后的 HTML 或带版本号的 JSON。
 
