@@ -1,6 +1,8 @@
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use opsail_chrome::{CdpSource, ChromeSource};
 use serde::Serialize;
 use serde_json::{Value, json};
 use url::Url;
@@ -10,14 +12,84 @@ pub const DEFAULT_MAX_ELEMENTS: usize = 50_000;
 pub const DEFAULT_MAX_DEPTH: usize = 256;
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const DEFAULT_USER_AGENT: &str = concat!("opsail/", env!("CARGO_PKG_VERSION"));
 
-/// The source to read.
-#[derive(Debug, Clone)]
-pub enum Input {
+/// A caller-managed document captured from a browser or another rendered host.
+#[derive(Clone)]
+pub struct CapturedDocument {
+    pub html: String,
+    pub base_url: Option<Url>,
+    pub final_url: Option<Url>,
+}
+
+impl CapturedDocument {
+    pub fn new(html: impl Into<String>, final_url: Option<Url>) -> Self {
+        Self {
+            html: html.into(),
+            base_url: final_url.clone(),
+            final_url,
+        }
+    }
+
+    pub fn with_urls(
+        html: impl Into<String>,
+        base_url: Option<Url>,
+        final_url: Option<Url>,
+    ) -> Self {
+        Self {
+            html: html.into(),
+            base_url,
+            final_url,
+        }
+    }
+}
+
+impl fmt::Debug for CapturedDocument {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CapturedDocument")
+            .field("html_bytes", &self.html.len())
+            .field("has_base_url", &self.base_url.is_some())
+            .field("has_final_url", &self.final_url.is_some())
+            .finish()
+    }
+}
+
+/// The source to acquire and read.
+#[derive(Clone)]
+pub enum ReadSource {
     Url(Url),
     File(PathBuf),
     Stdin(Vec<u8>),
+    Html(CapturedDocument),
+    Cdp(CdpSource),
+    Chrome(ChromeSource),
+    /// Compatibility input for callers that supplied HTML through `ReadOptions::base_url`.
+    Memory(String),
 }
+
+impl fmt::Debug for ReadSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Url(_) => formatter.debug_tuple("Url").field(&"<redacted>").finish(),
+            Self::File(_) => formatter.debug_tuple("File").field(&"<redacted>").finish(),
+            Self::Stdin(bytes) => formatter
+                .debug_struct("Stdin")
+                .field("bytes", &bytes.len())
+                .finish(),
+            Self::Html(document) => formatter.debug_tuple("Html").field(document).finish(),
+            Self::Cdp(source) => formatter.debug_tuple("Cdp").field(source).finish(),
+            Self::Chrome(source) => formatter.debug_tuple("Chrome").field(source).finish(),
+            Self::Memory(html) => formatter
+                .debug_struct("Memory")
+                .field("html_bytes", &html.len())
+                .finish(),
+        }
+    }
+}
+
+/// Backwards-compatible name for [`ReadSource`].
+pub type Input = ReadSource;
 
 /// Limits and request settings used while acquiring a document.
 #[derive(Debug, Clone)]
@@ -26,7 +98,8 @@ pub struct ReadOptions {
     pub timeout: Duration,
     pub connect_timeout: Duration,
     pub max_bytes: usize,
-    pub user_agent: String,
+    /// An exact User-Agent value, or `None` to select the automatic profile.
+    pub user_agent: Option<String>,
     pub accept_language: Option<String>,
 }
 
@@ -37,7 +110,7 @@ impl Default for ReadOptions {
             timeout: DEFAULT_TIMEOUT,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             max_bytes: DEFAULT_MAX_BYTES,
-            user_agent: format!("opsail/{}", env!("CARGO_PKG_VERSION")),
+            user_agent: None,
             accept_language: None,
         }
     }
@@ -49,6 +122,9 @@ pub enum SourceKind {
     Url,
     File,
     Stdin,
+    Html,
+    Cdp,
+    Chrome,
     Memory,
 }
 

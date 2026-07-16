@@ -6,6 +6,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
+readme = "README.md"
 repository.workspace = true
 
 [dependencies]
@@ -14,6 +15,7 @@ dom_query.workspace = true
 dom_smoothie.workspace = true
 encoding_rs.workspace = true
 futures-util.workspace = true
+opsail-chrome = { path = "../opsail-chrome", version = "0.1.0" }
 reqwest.workspace = true
 rustls.workspace = true
 serde.workspace = true
@@ -27,6 +29,7 @@ url.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 tokio.workspace = true
+tokio-tungstenite.workspace = true
 wiremock.workspace = true
 
 [lints]

@@ -6,11 +6,13 @@ use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
-use opsail_read::{Input, ReadOptions, ReadResult, read};
+use opsail_read::{CdpSource, CdpWaitUntil, ChromeSource, Input, ReadOptions, ReadResult, read};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 use url::Url;
+
+mod machine;
 
 const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction";
 
@@ -18,7 +20,7 @@ const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, autho
 #[command(
     name = "opsail",
     version,
-    about = "Composable actions for software agents",
+    about = "Native tools that agents can rely on",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -41,7 +43,30 @@ enum Command {
 #[derive(Debug, Args)]
 #[command(arg_required_else_help = true)]
 struct ReadArgs {
-    /// URL, HTML file, or '-' for stdin. Defaults to stdin.
+    /// Read one versioned JSON request from stdin and write one JSON response to stdout.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "source",
+            "format",
+            "property",
+            "output",
+            "base_url",
+            "timeout",
+            "max_bytes",
+            "user_agent",
+            "accept_language",
+            "cdp",
+            "launch",
+            "chrome_path",
+            "target_id",
+            "cdp_direct",
+            "wait_until"
+        ]
+    )]
+    machine: bool,
+
+    /// URL, HTML file, or '-' for stdin. Browser modes accept an HTTP(S) URL.
     #[arg(value_name = "SOURCE")]
     source: Option<PathBuf>,
 
@@ -63,10 +88,43 @@ struct ReadArgs {
     output: Option<PathBuf>,
 
     /// HTTP(S) base URL used to resolve relative links in file or stdin input.
-    #[arg(long, value_name = "URL")]
+    #[arg(
+        long,
+        value_name = "URL",
+        conflicts_with_all = ["cdp", "launch", "chrome_path"]
+    )]
     base_url: Option<Url>,
 
-    /// Overall network timeout in seconds.
+    /// Capture through a caller-managed Chrome DevTools Protocol endpoint.
+    #[arg(long, value_name = "ENDPOINT", conflicts_with = "launch")]
+    cdp: Option<String>,
+
+    /// Discover, launch, and stop an isolated local Chrome process.
+    #[arg(long, conflicts_with = "cdp")]
+    launch: bool,
+
+    /// Chrome or Chromium executable used by --launch.
+    #[arg(long, value_name = "PATH", requires = "launch", conflicts_with = "cdp")]
+    chrome_path: Option<PathBuf>,
+
+    /// Capture or navigate this existing CDP page target.
+    #[arg(
+        long,
+        value_name = "ID",
+        requires = "cdp",
+        conflicts_with = "cdp_direct"
+    )]
+    target_id: Option<String>,
+
+    /// Treat --cdp as a page-scoped provider WebSocket.
+    #[arg(long, requires = "cdp")]
+    cdp_direct: bool,
+
+    /// Browser lifecycle event to await after CDP navigation.
+    #[arg(long, value_enum, value_name = "STATE")]
+    wait_until: Option<CdpWaitArg>,
+
+    /// Overall HTTP or Chrome CDP acquisition timeout in seconds.
     #[arg(long, value_name = "SECONDS", value_parser = parse_positive_u64)]
     timeout: Option<u64>,
 
@@ -74,11 +132,11 @@ struct ReadArgs {
     #[arg(long, value_name = "BYTES", value_parser = parse_positive_usize)]
     max_bytes: Option<usize>,
 
-    /// User-Agent header used for URL requests.
+    /// User-Agent used for HTTP requests or Chrome CDP navigation.
     #[arg(long, value_name = "VALUE")]
     user_agent: Option<String>,
 
-    /// Accept-Language header used for URL requests.
+    /// Accept-Language used for HTTP requests or Chrome CDP navigation.
     #[arg(long, value_name = "VALUE")]
     accept_language: Option<String>,
 }
@@ -90,17 +148,46 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CdpWaitArg {
+    None,
+    DomContentLoaded,
+    Load,
+    NetworkIdle,
+}
+
+impl From<CdpWaitArg> for CdpWaitUntil {
+    fn from(value: CdpWaitArg) -> Self {
+        match value {
+            CdpWaitArg::None => Self::None,
+            CdpWaitArg::DomContentLoaded => Self::DomContentLoaded,
+            CdpWaitArg::Load => Self::Load,
+            CdpWaitArg::NetworkIdle => Self::NetworkIdle,
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
-    match run(cli.command).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            let _ = writeln!(io::stderr().lock(), "{error:?}");
-            ExitCode::FAILURE
-        }
+    tokio::select! {
+        exit_code = execute(cli.command) => exit_code,
+        () = shutdown_signal() => ExitCode::from(130),
+    }
+}
+
+async fn execute(command: Command) -> ExitCode {
+    match command {
+        Command::Read(args) if args.machine => machine::run().await,
+        command => match run(command).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                let _ = writeln!(io::stderr().lock(), "{error:?}");
+                ExitCode::FAILURE
+            }
+        },
     }
 }
 
@@ -111,7 +198,9 @@ fn init_tracing(verbosity: u8) {
         2 => "debug",
         _ => "trace",
     };
-    let filter = EnvFilter::new(format!("error,opsail={level},opsail_read={level}"));
+    let filter = EnvFilter::new(format!(
+        "error,opsail={level},opsail_read={level},opsail_chrome={level}"
+    ));
 
     tracing_subscriber::fmt()
         .compact()
@@ -121,6 +210,37 @@ fn init_tracing(verbosity: u8) {
         .with_writer(io::stderr)
         .finish()
         .init();
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
+        signal(SignalKind::interrupt()),
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+    ) else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    tokio::select! {
+        _ = interrupt.recv() => {}
+        _ = terminate.recv() => {}
+        _ = hangup.recv() => {}
+    }
+}
+
+#[cfg(windows)]
+async fn shutdown_signal() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+async fn shutdown_signal() {
+    std::future::pending::<()>().await;
 }
 
 fn parse_positive_u64(value: &str) -> std::result::Result<u64, String> {
@@ -153,11 +273,18 @@ async fn run(command: Command) -> Result<()> {
 
 async fn run_read(args: ReadArgs) -> Result<()> {
     let ReadArgs {
+        machine: _,
         source,
         format,
         property,
         output,
         base_url,
+        cdp,
+        launch,
+        chrome_path,
+        target_id,
+        cdp_direct,
+        wait_until,
         timeout,
         max_bytes,
         user_agent,
@@ -178,14 +305,26 @@ async fn run_read(args: ReadArgs) -> Result<()> {
     if let Some(max_bytes) = max_bytes {
         options.max_bytes = max_bytes;
     }
-    if let Some(user_agent) = user_agent {
-        options.user_agent = user_agent;
-    }
+    options.user_agent = user_agent;
     if let Some(accept_language) = accept_language {
         options.accept_language = Some(accept_language);
     }
 
-    let input = resolve_input(source, options.max_bytes).await?;
+    let requested_browser_wait = wait_until.is_some();
+    let wait_until = wait_until.map_or_else(CdpWaitUntil::default, Into::into);
+    let input = match (cdp, launch) {
+        (Some(endpoint), false) => {
+            resolve_cdp_input(source, endpoint, target_id, cdp_direct, wait_until)?
+        }
+        (None, true) => resolve_chrome_input(source, chrome_path, wait_until)?,
+        (None, false) => {
+            if requested_browser_wait {
+                return Err(miette!("--wait-until requires --cdp or --launch"));
+            }
+            resolve_input(source, options.max_bytes).await?
+        }
+        (Some(_), true) => unreachable!("clap rejects --cdp with --launch"),
+    };
     let result = read(input, &options)
         .await
         .into_diagnostic()
@@ -197,6 +336,68 @@ async fn run_read(args: ReadArgs) -> Result<()> {
 
     let data = render_result(&result, format, property.as_deref())?;
     write_output(output.as_deref(), &data).await
+}
+
+fn resolve_chrome_input(
+    source: Option<PathBuf>,
+    executable_path: Option<PathBuf>,
+    wait_until: CdpWaitUntil,
+) -> Result<Input> {
+    let source = source.ok_or_else(|| miette!("--launch requires an HTTP(S) SOURCE URL"))?;
+    let value = source
+        .to_str()
+        .ok_or_else(|| miette!("Chrome source URL must be valid Unicode"))?;
+    let url = Url::parse(value)
+        .into_diagnostic()
+        .wrap_err("invalid Chrome source URL")?;
+    validate_web_url(&url, "Chrome source URL")?;
+
+    Ok(Input::Chrome(ChromeSource {
+        url,
+        executable_path,
+        wait_until,
+    }))
+}
+
+fn resolve_cdp_input(
+    source: Option<PathBuf>,
+    endpoint: String,
+    target_id: Option<String>,
+    direct_page: bool,
+    wait_until: CdpWaitUntil,
+) -> Result<Input> {
+    if endpoint.is_empty() {
+        return Err(miette!("CDP endpoint must not be empty"));
+    }
+    if target_id.as_deref().is_some_and(str::is_empty) {
+        return Err(miette!("CDP target ID must not be empty"));
+    }
+
+    let url = source
+        .map(|source| {
+            let value = source
+                .to_str()
+                .ok_or_else(|| miette!("CDP source URL must be valid Unicode"))?;
+            if value == "-" || !value.contains("://") {
+                return Err(miette!(
+                    "when --cdp is used, SOURCE must be an HTTP(S) URL or omitted"
+                ));
+            }
+            let url = Url::parse(value)
+                .into_diagnostic()
+                .wrap_err("invalid CDP source URL")?;
+            validate_web_url(&url, "CDP source URL")?;
+            Ok(url)
+        })
+        .transpose()?;
+
+    Ok(Input::Cdp(CdpSource {
+        endpoint,
+        url,
+        target_id,
+        direct_page,
+        wait_until,
+    }))
 }
 
 async fn resolve_input(source: Option<PathBuf>, max_bytes: usize) -> Result<Input> {

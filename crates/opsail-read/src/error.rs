@@ -58,6 +58,12 @@ pub enum ReadError {
     #[error("request for `{url}` returned HTTP {status}")]
     HttpStatus { url: String, status: u16 },
 
+    #[error("request for `{url}` returned an interactive verification page")]
+    VerificationRequired { url: String },
+
+    #[error(transparent)]
+    Chrome(#[from] opsail_chrome::ChromeError),
+
     #[error("failed while reading the response from `{url}`")]
     ReadResponse {
         url: String,

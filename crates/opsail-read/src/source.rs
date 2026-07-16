@@ -2,14 +2,28 @@ use std::sync::Once;
 
 use encoding_rs::{Encoding, UTF_8, WINDOWS_1252};
 use futures_util::StreamExt;
+use opsail_chrome::{
+    CaptureOptions, CapturedPage, CdpSource, ChromeError, ChromeSource, RenderedPageEvidence,
+    capture_cdp_with_probes, capture_chrome_with_probes,
+};
 use reqwest::header::{ACCEPT, ACCEPT_LANGUAGE, CONTENT_LENGTH, CONTENT_TYPE};
 use tokio::io::AsyncReadExt;
 use url::Url;
 
 use crate::error::ReadError;
-use crate::model::{Input, ReadOptions, SourceInfo, SourceKind};
+use crate::model::{
+    CapturedDocument, DEFAULT_USER_AGENT, Input, ReadOptions, SourceInfo, SourceKind,
+};
+use crate::verification;
 
 const ACCEPT_VALUE: &str = "text/html, application/xhtml+xml;q=0.9, */*;q=0.1";
+const MAX_ERROR_HTML_PROBE_BYTES: usize = 512 * 1024;
+const WECHAT_BROWSER_USER_AGENT: &str = concat!(
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ",
+    "AppleWebKit/537.36 (KHTML, like Gecko) ",
+    "Chrome/138.0.0.0 Safari/537.36 opsail/",
+    env!("CARGO_PKG_VERSION")
+);
 static INSTALL_TLS_PROVIDER: Once = Once::new();
 
 pub(crate) struct LoadedDocument {
@@ -17,6 +31,12 @@ pub(crate) struct LoadedDocument {
     pub base_url: Option<Url>,
     pub source: SourceInfo,
     pub warnings: Vec<String>,
+    verification_context: VerificationContext,
+}
+
+enum VerificationContext {
+    Static,
+    Browser(Option<RenderedPageEvidence>),
 }
 
 pub(crate) async fn load(input: Input, options: &ReadOptions) -> Result<LoadedDocument, ReadError> {
@@ -24,6 +44,12 @@ pub(crate) async fn load(input: Input, options: &ReadOptions) -> Result<LoadedDo
         validate_web_url(base_url)?;
     }
 
+    let loaded = load_unchecked(input, options).await?;
+    validate_loaded_document(&loaded)?;
+    Ok(loaded)
+}
+
+async fn load_unchecked(input: Input, options: &ReadOptions) -> Result<LoadedDocument, ReadError> {
     match input {
         Input::Url(url) => load_url(url, options).await,
         Input::File(path) => {
@@ -109,7 +135,139 @@ pub(crate) async fn load(input: Input, options: &ReadOptions) -> Result<LoadedDo
             Some("text/html".to_owned()),
             options.max_bytes,
         ),
+        Input::Html(document) => load_captured(document, options),
+        Input::Cdp(source) => load_cdp(source, options).await,
+        Input::Chrome(source) => load_chrome(source, options).await,
+        Input::Memory(html) => load_memory(html, options),
     }
+}
+
+pub(crate) fn load_captured(
+    document: CapturedDocument,
+    options: &ReadOptions,
+) -> Result<LoadedDocument, ReadError> {
+    let final_url = document.final_url;
+    let base_url = document
+        .base_url
+        .or_else(|| final_url.clone())
+        .or_else(|| options.base_url.clone());
+    let requested = final_url
+        .as_ref()
+        .or(base_url.as_ref())
+        .map_or_else(|| "<html>".to_owned(), ToString::to_string);
+    load_utf8_html(
+        document.html,
+        SourceKind::Html,
+        requested,
+        base_url,
+        final_url,
+        options.max_bytes,
+    )
+}
+
+pub(crate) fn validate_loaded_document(loaded: &LoadedDocument) -> Result<(), ReadError> {
+    let (rendered, allow_static_profile) = match &loaded.verification_context {
+        VerificationContext::Static => (None, true),
+        VerificationContext::Browser(rendered) => (rendered.as_ref(), false),
+    };
+    reject_verification_page_with_context(
+        &loaded.html,
+        loaded
+            .source
+            .resolved_url
+            .as_ref()
+            .or(loaded.base_url.as_ref()),
+        &loaded.source.requested,
+        rendered,
+        allow_static_profile,
+    )
+}
+
+async fn load_cdp(source: CdpSource, options: &ReadOptions) -> Result<LoadedDocument, ReadError> {
+    if let Some(url) = source.url.as_ref() {
+        validate_web_url(url)?;
+    }
+    let requested = source.url.as_ref().map(ToString::to_string);
+    let probes = verification::rendered_probes().map_err(ReadError::Chrome)?;
+    let captured = capture_cdp_with_probes(&source, &capture_options(options), &probes)
+        .await
+        .map_err(map_chrome_error)?;
+    let requested = requested.unwrap_or_else(|| captured.final_url.to_string());
+    load_browser_capture(captured, SourceKind::Cdp, requested, options.max_bytes)
+}
+
+async fn load_chrome(
+    source: ChromeSource,
+    options: &ReadOptions,
+) -> Result<LoadedDocument, ReadError> {
+    validate_web_url(&source.url)?;
+    let requested = source.url.to_string();
+    let probes = verification::rendered_probes().map_err(ReadError::Chrome)?;
+    let captured = capture_chrome_with_probes(&source, &capture_options(options), &probes)
+        .await
+        .map_err(map_chrome_error)?;
+    load_browser_capture(captured, SourceKind::Chrome, requested, options.max_bytes)
+}
+
+fn load_browser_capture(
+    captured: CapturedPage,
+    kind: SourceKind,
+    requested: String,
+    max_bytes: usize,
+) -> Result<LoadedDocument, ReadError> {
+    validate_web_url(&captured.final_url)?;
+    if let Some(response) = captured.response() {
+        reject_verification_response(
+            response.status(),
+            response.header("cf-mitigated"),
+            response.header("x-amzn-waf-action"),
+            &requested,
+        )?;
+    }
+    let rendered_evidence = captured.rendered_evidence().cloned();
+    let final_url = captured.final_url;
+    let mut loaded = load_utf8_html(
+        captured.html,
+        kind,
+        requested,
+        Some(final_url.clone()),
+        Some(final_url),
+        max_bytes,
+    )?;
+    loaded.verification_context = VerificationContext::Browser(rendered_evidence);
+    Ok(loaded)
+}
+
+fn capture_options(options: &ReadOptions) -> CaptureOptions {
+    CaptureOptions {
+        timeout: options.timeout,
+        connect_timeout: options.connect_timeout,
+        max_bytes: options.max_bytes,
+        user_agent: options.user_agent.clone(),
+        accept_language: options.accept_language.clone(),
+    }
+}
+
+fn map_chrome_error(error: ChromeError) -> ReadError {
+    match error {
+        ChromeError::CaptureTooLarge { limit } => ReadError::InputTooLarge { limit },
+        error => ReadError::Chrome(error),
+    }
+}
+
+fn load_memory(html: String, options: &ReadOptions) -> Result<LoadedDocument, ReadError> {
+    let requested = options
+        .base_url
+        .as_ref()
+        .map_or_else(|| "<memory>".to_owned(), ToString::to_string);
+    load_utf8_html(
+        html,
+        SourceKind::Memory,
+        requested,
+        options.base_url.clone(),
+        options.base_url.clone(),
+        options.max_bytes,
+    )
 }
 
 async fn load_url(url: Url, options: &ReadOptions) -> Result<LoadedDocument, ReadError> {
@@ -119,7 +277,7 @@ async fn load_url(url: Url, options: &ReadOptions) -> Result<LoadedDocument, Rea
         let _ = rustls::crypto::ring::default_provider().install_default();
     });
     let client = reqwest::Client::builder()
-        .user_agent(&options.user_agent)
+        .user_agent(request_user_agent(&url, options.user_agent.as_deref()))
         .connect_timeout(options.connect_timeout)
         .timeout(options.timeout)
         .redirect(redirect_policy())
@@ -138,35 +296,50 @@ async fn load_url(url: Url, options: &ReadOptions) -> Result<LoadedDocument, Rea
     let status = response.status();
     let final_url = response.url().clone();
     validate_web_url(&final_url)?;
-    if !status.is_success() {
-        return Err(ReadError::HttpStatus {
-            url: final_url.to_string(),
-            status: status.as_u16(),
-        });
-    }
-
-    if response
+    reject_verification_response(
+        status.as_u16(),
+        response
+            .headers()
+            .get("cf-mitigated")
+            .and_then(|value| value.to_str().ok()),
+        response
+            .headers()
+            .get("x-amzn-waf-action")
+            .and_then(|value| value.to_str().ok()),
+        url.as_str(),
+    )?;
+    let body_limit = if status.is_success() {
+        options.max_bytes
+    } else {
+        options.max_bytes.min(MAX_ERROR_HTML_PROBE_BYTES)
+    };
+    let declared_too_large = response
         .headers()
         .get(CONTENT_LENGTH)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|length| length > options.max_bytes)
-    {
-        return Err(ReadError::InputTooLarge {
-            limit: options.max_bytes,
-        });
-    }
+        .is_some_and(|length| length > body_limit);
 
     let content_type = response
         .headers()
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
         .map(str::to_owned);
-    if let Some(content_type) = &content_type
-        && !content_type_is_html(content_type)
-        && !content_type_is_tolerated_generic(content_type)
-    {
-        return Err(ReadError::UnsupportedContentType(content_type.clone()));
+    let unsupported_content_type = content_type.as_ref().is_some_and(|content_type| {
+        !content_type_is_html(content_type) && !content_type_is_tolerated_generic(content_type)
+    });
+    if !status.is_success() && (declared_too_large || unsupported_content_type) {
+        return Err(http_status_error(&final_url, status.as_u16()));
+    }
+    if declared_too_large {
+        return Err(ReadError::InputTooLarge {
+            limit: options.max_bytes,
+        });
+    }
+    if unsupported_content_type {
+        return Err(ReadError::UnsupportedContentType(
+            content_type.expect("unsupported content type is present"),
+        ));
     }
 
     let mut bytes = Vec::new();
@@ -176,7 +349,10 @@ async fn load_url(url: Url, options: &ReadOptions) -> Result<LoadedDocument, Rea
             url: final_url.to_string(),
             source: source.without_url(),
         })?;
-        if bytes.len().saturating_add(chunk.len()) > options.max_bytes {
+        if bytes.len().saturating_add(chunk.len()) > body_limit {
+            if !status.is_success() {
+                return Err(http_status_error(&final_url, status.as_u16()));
+            }
             return Err(ReadError::InputTooLarge {
                 limit: options.max_bytes,
             });
@@ -184,15 +360,83 @@ async fn load_url(url: Url, options: &ReadOptions) -> Result<LoadedDocument, Rea
         bytes.extend_from_slice(&chunk);
     }
 
-    decode_loaded(
+    let loaded = decode_loaded(
         bytes,
         SourceKind::Url,
         url.to_string(),
         Some(final_url.clone()),
-        Some(final_url),
+        Some(final_url.clone()),
         content_type,
-        options.max_bytes,
-    )
+        body_limit,
+    );
+    if !status.is_success() {
+        if let Ok(loaded) = loaded {
+            reject_verification_page(
+                &loaded.html,
+                loaded.source.resolved_url.as_ref(),
+                url.as_str(),
+            )?;
+        }
+        return Err(http_status_error(&final_url, status.as_u16()));
+    }
+    loaded
+}
+
+fn http_status_error(url: &Url, status: u16) -> ReadError {
+    ReadError::HttpStatus {
+        url: url.to_string(),
+        status,
+    }
+}
+
+fn request_user_agent<'a>(url: &Url, configured: Option<&'a str>) -> &'a str {
+    match configured {
+        Some(user_agent) => user_agent,
+        None if is_wechat_url(url) => WECHAT_BROWSER_USER_AGENT,
+        None => DEFAULT_USER_AGENT,
+    }
+}
+
+fn reject_verification_page(
+    html: &str,
+    resolved_url: Option<&Url>,
+    requested_url: &str,
+) -> Result<(), ReadError> {
+    reject_verification_page_with_context(html, resolved_url, requested_url, None, true)
+}
+
+fn reject_verification_page_with_context(
+    html: &str,
+    resolved_url: Option<&Url>,
+    requested_url: &str,
+    rendered: Option<&RenderedPageEvidence>,
+    allow_static_profile: bool,
+) -> Result<(), ReadError> {
+    if verification::detect_document(html, resolved_url, rendered, allow_static_profile).is_some() {
+        return Err(ReadError::VerificationRequired {
+            url: verification::redacted_url(requested_url),
+        });
+    }
+    Ok(())
+}
+
+fn reject_verification_response(
+    status: u16,
+    cf_mitigated: Option<&str>,
+    aws_waf_action: Option<&str>,
+    requested_url: &str,
+) -> Result<(), ReadError> {
+    if verification::detect_response(status, cf_mitigated, aws_waf_action).is_some() {
+        return Err(ReadError::VerificationRequired {
+            url: verification::redacted_url(requested_url),
+        });
+    }
+    Ok(())
+}
+
+fn is_wechat_url(url: &Url) -> bool {
+    url.host_str()
+        .is_some_and(|host| host.eq_ignore_ascii_case("mp.weixin.qq.com"))
 }
 
 pub(crate) fn validate_web_url(url: &Url) -> Result<(), ReadError> {
@@ -275,6 +519,49 @@ fn decode_loaded(
             bytes: bytes.len(),
         },
         warnings,
+        verification_context: VerificationContext::Static,
+    })
+}
+
+fn load_utf8_html(
+    html: String,
+    kind: SourceKind,
+    requested: String,
+    base_url: Option<Url>,
+    resolved_url: Option<Url>,
+    max_bytes: usize,
+) -> Result<LoadedDocument, ReadError> {
+    if let Some(base_url) = base_url.as_ref() {
+        validate_web_url(base_url)?;
+    }
+    if let Some(resolved_url) = resolved_url.as_ref() {
+        validate_web_url(resolved_url)?;
+    }
+
+    let bytes = html.len();
+    if bytes > max_bytes {
+        return Err(ReadError::InputTooLarge { limit: max_bytes });
+    }
+    if html.is_empty() {
+        return Err(ReadError::EmptyInput);
+    }
+    if html.as_bytes().iter().take(4096).any(|byte| *byte == 0) || !looks_like_html(&html) {
+        return Err(ReadError::NotHtml);
+    }
+
+    Ok(LoadedDocument {
+        html,
+        base_url,
+        source: SourceInfo {
+            kind,
+            requested,
+            resolved_url,
+            content_type: Some("text/html".to_owned()),
+            charset: "utf-8".to_owned(),
+            bytes,
+        },
+        warnings: Vec::new(),
+        verification_context: VerificationContext::Static,
     })
 }
 
@@ -389,5 +676,127 @@ mod tests {
     #[test]
     fn accepts_html_fragments() {
         assert!(looks_like_html("  <main><p>Readable</p></main>"));
+    }
+
+    #[test]
+    fn uses_a_browser_compatible_default_user_agent_for_wechat() {
+        let url = Url::parse("https://mp.weixin.qq.com/s/example").unwrap();
+        let user_agent = request_user_agent(&url, None);
+
+        assert!(user_agent.starts_with("Mozilla/5.0 "));
+        assert!(user_agent.contains("Safari/537.36"));
+        assert!(user_agent.contains("opsail/"));
+    }
+
+    #[test]
+    fn preserves_an_explicit_user_agent_for_wechat() {
+        let url = Url::parse("https://mp.weixin.qq.com/s/example").unwrap();
+        assert_eq!(
+            request_user_agent(&url, Some("research-reader/42")),
+            "research-reader/42"
+        );
+        assert_eq!(
+            request_user_agent(&url, Some(DEFAULT_USER_AGENT)),
+            DEFAULT_USER_AGENT
+        );
+
+        let unrelated = Url::parse("https://example.test/article").unwrap();
+        assert_eq!(request_user_agent(&unrelated, None), DEFAULT_USER_AGENT);
+    }
+
+    #[test]
+    fn rejects_a_high_confidence_wechat_verification_page() {
+        let requested_url =
+            "https://mp.weixin.qq.com/s/challenge-fixture?poc_token=request-secret#fragment";
+        let resolved_url = Url::parse(
+            "https://mp.weixin.qq.com/mp/wappoc_appmsgcaptcha?poc_token=redirect-secret",
+        )
+        .unwrap();
+        let html = r#"<!doctype html>
+            <html><head>
+              <script>var PAGE_MID = 'mmbizwap:secitptpage/verify.html';</script>
+              <link rel="stylesheet" href="/secitptpage/verify.css">
+            </head><body>
+              <main id="js_verify" class="weui-msg">
+                <h1>当前环境异常</h1><a href="/mp/verify">去验证</a>
+              </main>
+            </body></html>"#;
+
+        assert!(matches!(
+            reject_verification_page(html, Some(&resolved_url), requested_url),
+            Err(ReadError::VerificationRequired { url: rejected })
+                if rejected == "https://mp.weixin.qq.com/s/challenge-fixture"
+                    && !rejected.contains("request-secret")
+        ));
+    }
+
+    #[test]
+    fn does_not_reject_articles_or_non_wechat_pages_with_verification_markers() {
+        let wechat = Url::parse("https://mp.weixin.qq.com/s/article").unwrap();
+        let unrelated = Url::parse("https://example.test/copied-page").unwrap();
+        let article = r#"<!doctype html><html><body>
+            <script>var example = 'secitptpage/verify';</script>
+            <article id="js_article"><div id="js_content">
+              <div id="js_verify" class="weui-msg">Quoted interface markup.</div>
+            </div></article>
+        </body></html>"#;
+        let copied_challenge = r#"<!doctype html><html><body>
+            <script>var PAGE_MID = 'mmbizwap:secitptpage/verify.html';</script>
+            <main id="js_verify" class="weui-msg">Copied verification page.</main>
+        </body></html>"#;
+
+        assert!(reject_verification_page(article, Some(&wechat), wechat.as_str()).is_ok());
+        assert!(
+            reject_verification_page(copied_challenge, Some(&unrelated), unrelated.as_str())
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn rejects_a_high_confidence_cloudflare_challenge_page() {
+        let requested_url = "https://www.npmjs.com/package/opsail";
+        let resolved_url = Url::parse(requested_url).unwrap();
+        let html = r#"<!doctype html>
+            <html lang="en"><head>
+              <title>Just a moment...</title>
+              <meta name="robots" content="noindex,nofollow">
+            </head><body>
+              <main class="main-wrapper" role="main">
+                <noscript><span id="challenge-error-text">
+                  Enable JavaScript and cookies to continue
+                </span></noscript>
+                <form id="challenge-form" action="/__cf_chl_f_tk=challenge-secret"></form>
+              </main>
+              <script>
+                window._cf_chl_opt = {
+                  cZone: 'www.npmjs.com',
+                  cType: 'managed',
+                  cRay: '0123456789abcdef'
+                };
+                var challenge = document.createElement('script');
+                challenge.src = '/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1';
+              </script>
+            </body></html>"#;
+
+        assert!(matches!(
+            reject_verification_page(html, Some(&resolved_url), requested_url),
+            Err(ReadError::VerificationRequired { .. })
+        ));
+    }
+
+    #[test]
+    fn does_not_reject_an_article_discussing_cloudflare_challenges() {
+        let url = Url::parse("https://example.test/cloudflare-challenge-guide").unwrap();
+        let article = r#"<!doctype html><html><head>
+          <title>Understanding Cloudflare challenge pages</title>
+        </head><body><article>
+          <h1>Diagnosing a Cloudflare challenge</h1>
+          <p>A visitor may briefly see “Just a moment...” while checks run.</p>
+          <p>Diagnostic terms include <code>_cf_chl_opt</code>, <code>cf-ray</code>,
+             <code>challenge-form</code>, and <code>/cdn-cgi/challenge-platform</code>.</p>
+          <p>This article explains those indicators and is not itself a verification page.</p>
+        </article></body></html>"#;
+
+        assert!(reject_verification_page(article, Some(&url), url.as_str()).is_ok());
     }
 }
