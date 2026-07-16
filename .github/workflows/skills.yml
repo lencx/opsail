@@ -1,0 +1,55 @@
+name: Skill contract tests
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/skills.yml"
+      - "CONTRIBUTING.md"
+      - "packages/node/package.json"
+      - "packages/node/test/skill.test.js"
+      - "README.md"
+      - "scripts/install.ps1"
+      - "scripts/install.sh"
+      - "skills/bootstrap-opsail/**"
+      - "skills/opsail/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/release.yml"
+      - ".github/workflows/skills.yml"
+      - "CONTRIBUTING.md"
+      - "packages/node/package.json"
+      - "packages/node/test/skill.test.js"
+      - "README.md"
+      - "scripts/install.ps1"
+      - "scripts/install.sh"
+      - "skills/bootstrap-opsail/**"
+      - "skills/opsail/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skills-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  contract:
+    name: Verify Skill contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+
+      - name: Test Skill contracts
+        run: node --test packages/node/test/skill.test.js
