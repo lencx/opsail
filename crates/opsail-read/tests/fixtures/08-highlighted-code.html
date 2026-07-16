@@ -1,0 +1,51 @@
+<!-- base-url: https://example.test/guides/code-layouts -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Readable Highlighted Code</title>
+  </head>
+  <body>
+    <article>
+      <h1>Readable Highlighted Code</h1>
+      <p>
+        Syntax highlighters frequently render a visual gutter beside the program.
+        The gutter is presentation, while indentation, punctuation, and language
+        metadata belong to the readable document.
+      </p>
+
+      <h2>Table gutter</h2>
+      <div class="highlight"><div class="chroma">
+        <table class="lntable"><tbody><tr>
+          <td class="lntd"><pre><code><span class="lnt">1
+</span><span class="lnt">2
+</span><span class="lnt">3
+</span></code></pre></td>
+          <td class="lntd"><pre><code class="language-rust" data-lang="rust"><span class="line"><span class="cl">fn total(values: &amp;[u32]) -&gt; u32 {
+</span></span><span class="line"><span class="cl">    values.iter().sum()
+</span></span><span class="line"><span class="cl">}
+</span></span></code></pre></td>
+        </tr></tbody></table>
+      </div></div>
+
+      <p>
+        Inline gutters are another common representation. Their digits must not
+        become part of identifiers or change the program copied by an agent.
+      </p>
+      <h2>Inline gutter</h2>
+      <div class="highlight"><table class="lntable"><tbody><tr>
+        <td class="lntd"><pre><code><span class="lnt">10
+</span><span class="lnt">11
+</span></code></pre></td>
+        <td class="lntd"><pre><code class="language-python"><span class="lineno">10</span>def greet(name):
+<span class="lineno">11</span>    return f"Hello, {name}"
+</code></pre></td>
+      </tr></tbody></table></div>
+
+      <p>
+        Prose after the examples is retained so a layout table cannot replace the
+        surrounding explanation as the page's main extraction candidate.
+      </p>
+    </article>
+  </body>
+</html>

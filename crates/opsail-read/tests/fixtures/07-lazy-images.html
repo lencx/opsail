@@ -1,0 +1,82 @@
+<!-- base-url: https://example.test/guides/read/index.html -->
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Recovering Deferred Images</title>
+  </head>
+  <body>
+    <main>
+      <article>
+        <h1>Recovering Deferred Images</h1>
+        <p>
+          Documentation pages often defer large diagrams until they approach the
+          viewport. A text reader still needs the real resource URL, alternative
+          text, and caption even though it never executes the page's JavaScript.
+        </p>
+
+        <figure>
+          <picture>
+            <source
+              type="image/webp"
+              srcset="./images/pipeline-small.webp 1x, ./images/pipeline-large.webp 2x">
+            <img
+              src="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw=="
+              alt="The document processing pipeline">
+          </picture>
+          <figcaption>The document processing pipeline.</figcaption>
+        </figure>
+
+        <p>
+          Some loaders keep the destination in a data attribute instead of a
+          source set. The extracted document should publish that destination as
+          an ordinary image without retaining loader-specific attributes.
+        </p>
+        <figure>
+          <img data-src="../media/deferred-map.png" alt="A map loaded from a data attribute">
+          <figcaption>A map loaded from a data attribute.</figcaption>
+        </figure>
+
+        <p>
+          Responsive galleries often wrap image-only cards in layout containers.
+          Those cards remain meaningful even when they add little visible text to
+          the article scoring model.
+        </p>
+        <div class="GroupedBlock-root">
+          <div class="GroupedBlock-items">
+            <div class="GroupedBlock-item" style="width:50%">
+              <figure>
+                <div class="Lazy-root"></div>
+                <noscript><img src="/gallery/first.jpg" alt="First gallery diagram"></noscript>
+                <figcaption>First gallery diagram.</figcaption>
+              </figure>
+            </div>
+            <div class="GroupedBlock-item" style="width:50%">
+              <figure>
+                <div class="Lazy-root"></div>
+                <noscript><img src="/gallery/second.jpg" alt="Second gallery diagram"></noscript>
+                <figcaption>Second gallery diagram.</figcaption>
+              </figure>
+            </div>
+          </div>
+        </div>
+
+        <p>
+          Server-rendered applications may place the only usable image inside a
+          noscript fallback beside a transparent placeholder. Static extraction
+          must recover the fallback before removing the noscript wrapper.
+        </p>
+        <figure>
+          <img
+            src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='1' height='1'/%3E"
+            aria-hidden="true"
+            alt="">
+          <noscript>
+            <img src="/assets/static-fallback.svg" alt="A server-rendered fallback diagram">
+          </noscript>
+          <figcaption>A server-rendered fallback diagram.</figcaption>
+        </figure>
+      </article>
+    </main>
+  </body>
+</html>

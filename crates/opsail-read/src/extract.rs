@@ -1,12 +1,18 @@
 use ammonia::{Builder, UrlRelative};
-use dom_query::Document;
+use dom_query::{Document, Selection};
 use dom_smoothie::{Article, CandidateSelectMode, Config, Metadata, Readability, TextMode};
+use unicode_segmentation::UnicodeSegmentation;
 use url::Url;
 
 use crate::error::ReadError;
 use crate::model::{DEFAULT_MAX_DEPTH, DEFAULT_MAX_ELEMENTS, DocumentMetadata, ExtractionMethod};
+use crate::standardize::standardize_document;
 
 const SEMANTIC_FALLBACK_THRESHOLD: usize = 120;
+const SEMANTIC_FALLBACK_MIN_GAIN: usize = 120;
+const HIDDEN_FALLBACK_WORD_THRESHOLD: usize = 50;
+const HIDDEN_FALLBACK_MIN_WORDS: usize = 30;
+const HIDDEN_FALLBACK_MAX_LINK_PERCENT: usize = 35;
 
 pub(crate) struct Extracted {
     pub content: String,
@@ -27,7 +33,7 @@ struct Candidate {
 }
 
 pub(crate) fn extract(html: &str, base_url: Option<&Url>) -> Result<Extracted, ReadError> {
-    let prepared_html = prepare_for_extraction(html)?;
+    let prepared_html = prepare_for_extraction(html, base_url)?;
     let fallback_metadata = read_metadata(html, base_url)?;
     let primary = read_candidate(
         &prepared_html,
@@ -55,21 +61,52 @@ pub(crate) fn extract(html: &str, base_url: Option<&Url>) -> Result<Extracted, R
     };
 
     candidate.metadata = merge_metadata(fallback_metadata.clone(), candidate.metadata);
-    if visible_characters(&candidate.text) < SEMANTIC_FALLBACK_THRESHOLD
-        && let Some(semantic) = semantic_candidate(&prepared_html, fallback_metadata)
-        && visible_characters(&semantic.text) > visible_characters(&candidate.text)
-    {
-        candidate = semantic;
+    let mut semantic_was_substantially_richer = false;
+    let candidate_characters = visible_characters(&candidate.text);
+    if let Some(semantic) = semantic_candidate(&prepared_html, fallback_metadata.clone()) {
+        let semantic_characters = visible_characters(&semantic.text);
+        let preserves_more_media = semantic_preserves_substantially_more_media(
+            &candidate,
+            candidate_characters,
+            &semantic,
+            semantic_characters,
+        );
+        if candidate_characters < SEMANTIC_FALLBACK_THRESHOLD
+            && semantic_characters > candidate_characters
+        {
+            candidate = semantic;
+        } else if semantic_is_substantially_richer(candidate_characters, semantic_characters)
+            || preserves_more_media
+        {
+            candidate = semantic;
+            semantic_was_substantially_richer = true;
+        }
     }
 
     let mut extracted = finish_candidate(candidate, base_url)?;
     if extracted.method == ExtractionMethod::Semantic {
-        extracted.warnings.push(
-            "used semantic fallback because article scoring returned thin content".to_owned(),
-        );
+        let warning = if semantic_was_substantially_richer {
+            "used semantic fallback because it preserved substantially more content"
+        } else {
+            "used semantic fallback because article scoring returned thin content"
+        };
+        extracted.warnings.push(warning.to_owned());
         if let Some(error) = first_error {
             tracing::debug!(error, "article scoring failed before semantic fallback");
         }
+    }
+
+    if should_try_hidden_fallback(&extracted)
+        && let Some(hidden_candidate) =
+            hidden_semantic_candidate(html, base_url, fallback_metadata)?
+        && let Ok(mut recovered) = finish_candidate(hidden_candidate, base_url)
+        && hidden_fallback_is_substantially_richer(&extracted, &recovered)
+    {
+        recovered.warnings.push(
+            "used hidden-content fallback because visible extraction was unusually short"
+                .to_owned(),
+        );
+        return Ok(recovered);
     }
     Ok(extracted)
 }
@@ -108,8 +145,10 @@ fn config(mode: CandidateSelectMode) -> Config {
     }
 }
 
-fn prepare_for_extraction(html: &str) -> Result<String, ReadError> {
+fn prepare_for_extraction(html: &str, base_url: Option<&Url>) -> Result<String, ReadError> {
     let document = Document::from(html);
+    validate_document(&document)?;
+    standardize_document(&document, base_url);
     validate_document(&document)?;
     for selector in [
         "script",
@@ -163,14 +202,9 @@ fn remove_hidden_elements(document: &Document) {
         }
     }
     for selection in document.select("[style]").iter() {
-        let hidden = selection.attr("style").is_some_and(|value| {
-            let style: String = value
-                .chars()
-                .filter(|character| !character.is_ascii_whitespace())
-                .flat_map(char::to_lowercase)
-                .collect();
-            style.contains("display:none") || style.contains("visibility:hidden")
-        });
+        let hidden = selection
+            .attr("style")
+            .is_some_and(|value| style_hides_element(value.as_ref()));
         if hidden {
             selection.remove();
         }
@@ -188,6 +222,148 @@ fn remove_hidden_elements(document: &Document) {
             selection.remove();
         }
     }
+}
+
+fn style_hides_element(style: &str) -> bool {
+    style.split(';').any(|declaration| {
+        let Some((property, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let property = property.trim();
+        let value = value
+            .split_once('!')
+            .map_or(value, |(value, _)| value)
+            .trim();
+        (property.eq_ignore_ascii_case("display") && value.eq_ignore_ascii_case("none"))
+            || (property.eq_ignore_ascii_case("visibility") && value.eq_ignore_ascii_case("hidden"))
+    })
+}
+
+fn should_try_hidden_fallback(extracted: &Extracted) -> bool {
+    visible_characters(&extracted.text) < SEMANTIC_FALLBACK_THRESHOLD
+        || extracted.text.unicode_words().count() < HIDDEN_FALLBACK_WORD_THRESHOLD
+}
+
+fn hidden_semantic_candidate(
+    html: &str,
+    base_url: Option<&Url>,
+    metadata: Metadata,
+) -> Result<Option<Candidate>, ReadError> {
+    let document = Document::from(html);
+    validate_document(&document)?;
+    standardize_document(&document, base_url);
+    validate_document(&document)?;
+
+    let best = document
+        .select("[hidden], [aria-hidden], [class]")
+        .iter()
+        .filter(is_hidden_fallback_root)
+        .filter(|candidate| hidden_candidate_has_article_structure(candidate))
+        .filter(|candidate| !hidden_candidate_has_clutter_context(candidate))
+        .filter(|candidate| {
+            hidden_candidate_link_density(candidate) <= HIDDEN_FALLBACK_MAX_LINK_PERCENT
+        })
+        .map(|candidate| {
+            let score = visible_characters(candidate.text().as_ref());
+            (score, candidate)
+        })
+        .filter(|(characters, candidate)| {
+            *characters >= SEMANTIC_FALLBACK_THRESHOLD
+                && candidate.text().unicode_words().count() >= HIDDEN_FALLBACK_MIN_WORDS
+        })
+        .max_by_key(|(score, _)| *score)
+        .map(|(_, candidate)| candidate);
+
+    let Some(candidate) = best else {
+        return Ok(None);
+    };
+    let prepared = prepare_for_extraction(candidate.inner_html().as_ref(), base_url)?;
+    Ok(semantic_candidate(&prepared, metadata))
+}
+
+fn is_hidden_fallback_root(candidate: &Selection<'_>) -> bool {
+    candidate.has_attr("hidden")
+        || candidate
+            .attr("aria-hidden")
+            .is_some_and(|value| value.as_ref().eq_ignore_ascii_case("true"))
+        || candidate.attr("class").is_some_and(|classes| {
+            classes
+                .split_ascii_whitespace()
+                .any(|class| matches!(class.to_ascii_lowercase().as_str(), "hidden" | "invisible"))
+        })
+}
+
+fn hidden_candidate_has_article_structure(candidate: &Selection<'_>) -> bool {
+    let has_semantic_root = candidate.is("article, main, [role='main']")
+        || candidate.select("article, main, [role='main']").exists();
+    let has_heading = candidate
+        .select("h1, h2, h3")
+        .iter()
+        .any(|heading| visible_characters(heading.text().as_ref()) > 1);
+    let meaningful_blocks = candidate
+        .select("p, li, pre, blockquote, td")
+        .iter()
+        .filter(|block| visible_characters(block.text().as_ref()) >= 20)
+        .take(2)
+        .count();
+    has_semantic_root && has_heading && meaningful_blocks >= 2
+}
+
+fn hidden_candidate_has_clutter_context(candidate: &Selection<'_>) -> bool {
+    std::iter::once(candidate.clone())
+        .chain(candidate.ancestors(Some(32)).iter())
+        .any(|node| {
+            node.is(
+                "nav, aside, footer, header, form, template, svg, math, mjx-container, \
+                 .katex-html, .MathJax, [role='menu'], [role='navigation'], \
+                 [role='tooltip'], [role='status'], [role='alert']",
+            ) || ["class", "id"]
+                .iter()
+                .filter_map(|attribute| node.attr(attribute))
+                .flat_map(|value| {
+                    value
+                        .split(|character: char| !character.is_ascii_alphanumeric())
+                        .map(str::to_ascii_lowercase)
+                        .collect::<Vec<_>>()
+                })
+                .any(|token| {
+                    matches!(
+                        token.as_str(),
+                        "ad" | "ads"
+                            | "advert"
+                            | "advertisement"
+                            | "cookie"
+                            | "modal"
+                            | "newsletter"
+                            | "popover"
+                            | "promo"
+                            | "promoted"
+                            | "sidebar"
+                            | "social"
+                    )
+                })
+        })
+}
+
+fn hidden_candidate_link_density(candidate: &Selection<'_>) -> usize {
+    let characters = visible_characters(candidate.text().as_ref()).max(1);
+    let link_characters = candidate
+        .select("a")
+        .iter()
+        .map(|link| visible_characters(link.text().as_ref()))
+        .sum::<usize>();
+    link_characters.saturating_mul(100) / characters
+}
+
+fn hidden_fallback_is_substantially_richer(current: &Extracted, alternative: &Extracted) -> bool {
+    let current_characters = visible_characters(&current.text);
+    let alternative_characters = visible_characters(&alternative.text);
+    let current_words = current.text.unicode_words().count();
+    let alternative_words = alternative.text.unicode_words().count();
+    alternative_characters >= SEMANTIC_FALLBACK_THRESHOLD
+        && alternative_words >= HIDDEN_FALLBACK_MIN_WORDS
+        && alternative_characters > current_characters.saturating_mul(2)
+        && alternative_words > current_words.saturating_mul(2)
 }
 
 fn candidate_from_article(
@@ -645,6 +821,50 @@ fn visible_characters(value: &str) -> usize {
         .count()
 }
 
+fn semantic_is_substantially_richer(current: usize, alternative: usize) -> bool {
+    let required_gain = SEMANTIC_FALLBACK_MIN_GAIN.max(current.saturating_mul(3) / 4);
+    alternative > current.saturating_add(required_gain)
+}
+
+fn semantic_preserves_substantially_more_media(
+    current: &Candidate,
+    current_characters: usize,
+    alternative: &Candidate,
+    alternative_characters: usize,
+) -> bool {
+    alternative_characters >= current_characters
+        && meaningful_image_count(&alternative.content_html)
+            >= meaningful_image_count(&current.content_html).saturating_add(2)
+}
+
+fn meaningful_image_count(html: &str) -> usize {
+    Document::from(html)
+        .select("img[src][alt]")
+        .iter()
+        .filter(|image| {
+            image.attr("alt").is_some_and(|alt| !alt.trim().is_empty())
+                && image
+                    .attr("src")
+                    .is_some_and(|source| is_safe_image_source(source.as_ref()))
+        })
+        .count()
+}
+
+fn is_safe_image_source(value: &str) -> bool {
+    let value = value.trim();
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return false;
+    }
+    if value.starts_with("//") {
+        return Url::parse(&format!("https:{value}")).is_ok_and(|url| !url_has_credentials(&url));
+    }
+    match Url::parse(value) {
+        Ok(url) => matches!(url.scheme(), "http" | "https") && !url_has_credentials(&url),
+        Err(url::ParseError::RelativeUrlWithoutBase) => true,
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +1002,51 @@ mod tests {
             ensure_document_title("Lead.\n\n# Existing title".to_owned(), ""),
             "Lead.\n\n# Existing title"
         );
+    }
+
+    #[test]
+    fn requires_a_large_gain_before_replacing_a_scored_candidate() {
+        assert!(!semantic_is_substantially_richer(200, 320));
+        assert!(!semantic_is_substantially_richer(200, 350));
+        assert!(semantic_is_substantially_richer(200, 351));
+        assert!(semantic_is_substantially_richer(1_000, 1_751));
+    }
+
+    #[test]
+    fn counts_only_publishable_images_with_meaningful_alt_text() {
+        assert_eq!(
+            meaningful_image_count(
+                r#"<div>
+                    <img src="/one.png" alt="Diagram one">
+                    <img src="https://example.test/two.png" alt="Diagram two">
+                    <img src="data:image/gif;base64,bad" alt="Placeholder">
+                    <img src="javascript:alert(1)" alt="Unsafe">
+                    <img src="/decorative.png" alt="">
+                </div>"#
+            ),
+            2
+        );
+    }
+
+    #[test]
+    fn hidden_style_detection_requires_exact_css_declarations() {
+        for hidden in [
+            "display: none",
+            "DISPLAY : none !important",
+            "color: red; visibility: HIDDEN",
+        ] {
+            assert!(style_hides_element(hidden), "should be hidden: {hidden}");
+        }
+        for visible in [
+            "--footer-display: none",
+            "--panel-visibility: hidden",
+            "display: block",
+            "content: 'display:none'",
+        ] {
+            assert!(
+                !style_hides_element(visible),
+                "should be visible: {visible}"
+            );
+        }
     }
 }

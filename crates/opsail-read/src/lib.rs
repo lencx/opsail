@@ -4,6 +4,7 @@ mod error;
 mod extract;
 mod model;
 mod source;
+mod standardize;
 
 use std::time::Instant;
 
