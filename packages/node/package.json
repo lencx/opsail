@@ -1,0 +1,52 @@
+{
+  "name": "opsail",
+  "version": "0.1.0",
+  "description": "Native tools that agents can rely on",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./src/index.js",
+      "default": "./src/index.js"
+    }
+  },
+  "types": "./index.d.ts",
+  "bin": {
+    "opsail": "./bin/opsail.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "pretest": "cargo build --manifest-path ../../Cargo.toml --package opsail --locked",
+    "test": "node --test",
+    "pack:check": "npm pack --dry-run",
+    "pack:platform": "node scripts/build-platform-package.js",
+    "release:matrix": "node scripts/print-release-matrix.js"
+  },
+  "optionalDependencies": {
+    "@opsail/darwin-arm64": "0.1.0",
+    "@opsail/darwin-x64": "0.1.0",
+    "@opsail/linux-arm64": "0.1.0",
+    "@opsail/linux-x64": "0.1.0",
+    "@opsail/win32-x64": "0.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lencx/opsail.git",
+    "directory": "packages/node"
+  },
+  "homepage": "https://github.com/lencx/opsail#readme",
+  "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
