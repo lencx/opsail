@@ -1,6 +1,6 @@
 [package]
 name = "opsail"
-description = "Composable actions for software agents"
+description = "Native tools that agents can rely on"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
