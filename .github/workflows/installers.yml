@@ -4,15 +4,15 @@ on:
   pull_request:
     paths:
       - ".github/workflows/installers.yml"
-      - "scripts/install.ps1"
-      - "scripts/install.sh"
+      - "skills/bootstrap-opsail/scripts/install.ps1"
+      - "skills/bootstrap-opsail/scripts/install.sh"
   push:
     branches:
       - main
     paths:
       - ".github/workflows/installers.yml"
-      - "scripts/install.ps1"
-      - "scripts/install.sh"
+      - "skills/bootstrap-opsail/scripts/install.ps1"
+      - "skills/bootstrap-opsail/scripts/install.sh"
 
 permissions:
   contents: read
@@ -41,16 +41,40 @@ jobs:
           persist-credentials: false
 
       - name: Check shell syntax
-        run: sh -n scripts/install.sh
+        run: sh -n skills/bootstrap-opsail/scripts/install.sh
 
-      - name: Install latest release
+      - name: Install latest and exact release
         env:
           OPSAIL_INSTALL_DIR: ${{ runner.temp }}/opsail-bin
         shell: sh
         run: |
-          scripts/install.sh
-          "$OPSAIL_INSTALL_DIR/opsail" --version
+          set -eu
+          skills/bootstrap-opsail/scripts/install.sh
+          latest_version_output="$("$OPSAIL_INSTALL_DIR/opsail" --version)"
+          case "$latest_version_output" in
+            "opsail "?*) resolved_version="${latest_version_output#opsail }" ;;
+            *) echo "unexpected version output: $latest_version_output" >&2; exit 1 ;;
+          esac
+          case "$resolved_version" in
+            *[!0-9A-Za-z.+_-]*) echo "unexpected version output: $latest_version_output" >&2; exit 1 ;;
+          esac
           "$OPSAIL_INSTALL_DIR/opsail" read --help >/dev/null
+
+          exact_install_dir="$RUNNER_TEMP/opsail-bin-exact"
+          (
+            unset HOME
+            OPSAIL_INSTALL_DIR="$exact_install_dir"
+            OPSAIL_VERSION="$resolved_version"
+            export OPSAIL_INSTALL_DIR OPSAIL_VERSION
+            skills/bootstrap-opsail/scripts/install.sh
+          )
+
+          exact_version_output="$("$exact_install_dir/opsail" --version)"
+          if [ "$exact_version_output" != "$latest_version_output" ]; then
+            echo "exact install version mismatch: $exact_version_output" >&2
+            exit 1
+          fi
+          "$exact_install_dir/opsail" read --help >/dev/null
 
   windows:
     name: Install on windows-2025
@@ -65,16 +89,20 @@ jobs:
       - name: Check PowerShell syntax
         shell: powershell
         run: |
-          $tokens = $null
-          $errors = $null
-          [System.Management.Automation.Language.Parser]::ParseFile(
-              (Resolve-Path "scripts/install.ps1"),
-              [ref] $tokens,
-              [ref] $errors
-          ) | Out-Null
+          $allErrors = @()
+          foreach ($scriptPath in @("skills/bootstrap-opsail/scripts/install.ps1")) {
+              $tokens = $null
+              $parseErrors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                  (Resolve-Path $scriptPath),
+                  [ref] $tokens,
+                  [ref] $parseErrors
+              ) | Out-Null
+              $allErrors += $parseErrors
+          }
 
-          if ($errors.Count -gt 0) {
-              $errors | ForEach-Object { Write-Error $_.Message }
+          if ($allErrors.Count -gt 0) {
+              $allErrors | ForEach-Object { Write-Error $_.Message }
               exit 1
           }
 
@@ -85,17 +113,32 @@ jobs:
         run: |
           Set-StrictMode -Off
           $ErrorActionPreference = "Continue"
-
-          Get-Content -Raw "scripts/install.ps1" | Invoke-Expression
-
-          if ($ErrorActionPreference -ne "Continue") {
-              throw "installer leaked ErrorActionPreference"
-          }
+          $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $originalProcessPath = $env:Path
+          $originalUpdatePath = $env:OPSAIL_UPDATE_PATH
 
           try {
-              $null = $opsailUndefinedStrictModeProbe
-          } catch {
-              throw "installer leaked strict mode"
+              $env:OPSAIL_UPDATE_PATH = $null
+              Get-Content -Raw "skills/bootstrap-opsail/scripts/install.ps1" | Invoke-Expression
+
+              $currentUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+              if ($currentUserPath -cne $originalUserPath) {
+                  throw "installer changed the user PATH without OPSAIL_UPDATE_PATH=1"
+              }
+
+              if ($ErrorActionPreference -ne "Continue") {
+                  throw "installer leaked ErrorActionPreference"
+              }
+
+              try {
+                  $null = $opsailUndefinedStrictModeProbe
+              } catch {
+                  throw "installer leaked strict mode"
+              }
+          } finally {
+              [Environment]::SetEnvironmentVariable("Path", $originalUserPath, "User")
+              $env:Path = $originalProcessPath
+              $env:OPSAIL_UPDATE_PATH = $originalUpdatePath
           }
 
           $ErrorActionPreference = "Stop"
@@ -111,17 +154,74 @@ jobs:
         run: |
           Set-StrictMode -Off
           $ErrorActionPreference = "Continue"
-
-          Get-Content -Raw "scripts/install.ps1" | Invoke-Expression
-
-          if ($ErrorActionPreference -ne "Continue") {
-              throw "installer leaked ErrorActionPreference"
-          }
+          $originalUserPath = [Environment]::GetEnvironmentVariable("Path", "User")
+          $originalProcessPath = $env:Path
+          $originalOpsailVersion = $env:OPSAIL_VERSION
+          $originalUpdatePath = $env:OPSAIL_UPDATE_PATH
 
           try {
-              $null = $opsailUndefinedStrictModeProbe
-          } catch {
-              throw "installer leaked strict mode"
+              $env:OPSAIL_UPDATE_PATH = $null
+              Get-Content -Raw "skills/bootstrap-opsail/scripts/install.ps1" | Invoke-Expression
+
+              $userPathAfterDefaultInstall = [Environment]::GetEnvironmentVariable("Path", "User")
+              if ($userPathAfterDefaultInstall -cne $originalUserPath) {
+                  throw "installer changed the user PATH without OPSAIL_UPDATE_PATH=1"
+              }
+
+              $versionOutput = (& "$env:OPSAIL_INSTALL_DIR\opsail.exe" --version | Out-String).Trim()
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+              if ($versionOutput -notmatch '^opsail ([0-9A-Za-z.+_-]+)$') {
+                  throw "unexpected version output: $versionOutput"
+              }
+              $resolvedVersion = $Matches[1]
+
+              $seededUserPath = @(
+                  $originalUserPath
+                  "$env:OPSAIL_INSTALL_DIR\"
+                  $env:OPSAIL_INSTALL_DIR.ToUpperInvariant()
+              ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+              [Environment]::SetEnvironmentVariable("Path", ($seededUserPath -join ";"), "User")
+              $env:Path = "$env:Path;$env:OPSAIL_INSTALL_DIR\;$($env:OPSAIL_INSTALL_DIR.ToUpperInvariant())"
+
+              & "skills/bootstrap-opsail/scripts/install.ps1" `
+                  -Version $resolvedVersion `
+                  -InstallDir $env:OPSAIL_INSTALL_DIR `
+                  -UpdatePath
+
+              $normalizedInstallDir = $env:OPSAIL_INSTALL_DIR.TrimEnd([char[]]"\/")
+              $matchingUserEntries = @(
+                  [Environment]::GetEnvironmentVariable("Path", "User") -split ";" |
+                      Where-Object { $_.Trim().TrimEnd([char[]]"\/") -ieq $normalizedInstallDir }
+              )
+              if ($matchingUserEntries.Count -ne 1) {
+                  throw "installer did not normalize and deduplicate the user PATH entry"
+              }
+              if ($matchingUserEntries[0] -cne $env:OPSAIL_INSTALL_DIR) {
+                  throw "installer did not preserve the canonical install directory in user PATH"
+              }
+
+              $matchingProcessEntries = @(
+                  $env:Path -split ";" |
+                      Where-Object { $_.Trim().TrimEnd([char[]]"\/") -ieq $normalizedInstallDir }
+              )
+              if ($matchingProcessEntries.Count -ne 1) {
+                  throw "installer did not normalize and deduplicate the process PATH entry"
+              }
+
+              if ($ErrorActionPreference -ne "Continue") {
+                  throw "installer leaked ErrorActionPreference"
+              }
+
+              try {
+                  $null = $opsailUndefinedStrictModeProbe
+              } catch {
+                  throw "installer leaked strict mode"
+              }
+          } finally {
+              [Environment]::SetEnvironmentVariable("Path", $originalUserPath, "User")
+              $env:Path = $originalProcessPath
+              $env:OPSAIL_VERSION = $originalOpsailVersion
+              $env:OPSAIL_UPDATE_PATH = $originalUpdatePath
           }
 
           $ErrorActionPreference = "Stop"
