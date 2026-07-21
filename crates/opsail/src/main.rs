@@ -7,6 +7,10 @@ use std::time::Duration;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use opsail_read::{CdpSource, CdpWaitUntil, ChromeSource, Input, ReadOptions, ReadResult, read};
+use opsail_refit_codex::{
+    CodexRefit, CodexRefitConfig, CodexRefitError, DEFAULT_CODEX_DEBUG_PORT, LaunchPolicy,
+    SessionMode,
+};
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
@@ -37,7 +41,89 @@ struct Cli {
 enum Command {
     /// Read a URL or HTML input and extract its primary content.
     #[command(visible_alias = "extract")]
-    Read(ReadArgs),
+    Read(Box<ReadArgs>),
+    /// Apply a reversible, target-validated application refit.
+    Refit(RefitArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
+struct RefitArgs {
+    #[command(subcommand)]
+    target: RefitTarget,
+}
+
+#[derive(Debug, Subcommand)]
+enum RefitTarget {
+    /// Manage the verified Codex renderer in the macOS ChatGPT app.
+    Codex(CodexRefitArgs),
+}
+
+#[derive(Debug, Args)]
+#[command(arg_required_else_help = true)]
+struct CodexRefitArgs {
+    /// 127.0.0.1 CDP port; defaults to 55321 and may be explicitly overridden.
+    #[arg(long, global = true, default_value_t = DEFAULT_CODEX_DEBUG_PORT)]
+    port: u16,
+
+    #[command(subcommand)]
+    command: CodexRefitCommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum CodexRefitCommand {
+    /// Enable a refit feature idempotently.
+    Enable(CodexEnableArgs),
+    /// Disable a refit feature and remove all of its renderer artifacts.
+    Disable(CodexFeatureArgs),
+    /// Inspect the current renderer refit state.
+    Status,
+    /// Run read-only target, bridge, and state diagnostics.
+    Doctor,
+}
+
+#[derive(Debug, Args)]
+struct CodexFeatureArgs {
+    #[arg(value_enum)]
+    feature: CodexRefitFeature,
+}
+
+#[derive(Debug, Args)]
+struct CodexEnableArgs {
+    #[arg(value_enum)]
+    feature: CodexRefitFeature,
+
+    /// Inject only the current document, confirm health, close CDP, and exit; persistent managed mode is the default.
+    #[arg(long)]
+    once: bool,
+
+    /// Start a validated, stopped ChatGPT app once; otherwise enable is attach-only.
+    #[arg(long)]
+    launch: bool,
+}
+
+impl CodexEnableArgs {
+    fn session_mode(&self) -> SessionMode {
+        if self.once {
+            SessionMode::Once
+        } else {
+            SessionMode::Persistent
+        }
+    }
+
+    fn launch_policy(&self) -> LaunchPolicy {
+        if self.launch {
+            LaunchPolicy::LaunchIfStopped
+        } else {
+            LaunchPolicy::AttachOnly
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CodexRefitFeature {
+    /// Show remaining account rate-limit windows in the sidebar account row.
+    Usage,
 }
 
 #[derive(Debug, Args)]
@@ -199,7 +285,7 @@ fn init_tracing(verbosity: u8) {
         _ => "trace",
     };
     let filter = EnvFilter::new(format!(
-        "error,opsail={level},opsail_read={level},opsail_chrome={level}"
+        "error,opsail={level},opsail_read={level},opsail_chrome={level},opsail_refit_codex={level}"
     ));
 
     tracing_subscriber::fmt()
@@ -267,8 +353,63 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
 
 async fn run(command: Command) -> Result<()> {
     match command {
-        Command::Read(args) => run_read(args).await,
+        Command::Read(args) => run_read(*args).await,
+        Command::Refit(args) => run_refit(args).await,
     }
+}
+
+async fn run_refit(args: RefitArgs) -> Result<()> {
+    match args.target {
+        RefitTarget::Codex(args) => run_codex_refit(args).await,
+    }
+}
+
+async fn run_codex_refit(args: CodexRefitArgs) -> Result<()> {
+    let adapter = CodexRefit::new(CodexRefitConfig::new(args.port)).map_err(codex_diagnostic)?;
+    match args.command {
+        CodexRefitCommand::Enable(enable) => {
+            let mode = enable.session_mode();
+            let launch_policy = enable.launch_policy();
+            let session = match enable.feature {
+                CodexRefitFeature::Usage => adapter
+                    .enable_usage(mode, launch_policy)
+                    .await
+                    .map_err(codex_diagnostic)?,
+            };
+            write_codex_json(session.report())?;
+            session.run().await.map_err(codex_diagnostic)
+        }
+        command => {
+            let value = match command {
+                CodexRefitCommand::Disable(CodexFeatureArgs {
+                    feature: CodexRefitFeature::Usage,
+                }) => {
+                    serde_json::to_value(adapter.disable_usage().await.map_err(codex_diagnostic)?)
+                }
+                CodexRefitCommand::Status => {
+                    serde_json::to_value(adapter.status().await.map_err(codex_diagnostic)?)
+                }
+                CodexRefitCommand::Doctor => serde_json::to_value(adapter.doctor().await),
+                CodexRefitCommand::Enable(_) => unreachable!("enable handled by its match arm"),
+            }
+            .into_diagnostic()
+            .wrap_err("failed to serialize Codex refit result")?;
+            write_codex_json(&value)
+        }
+    }
+}
+
+fn write_codex_json(value: &impl serde::Serialize) -> Result<()> {
+    let output = with_trailing_newline(
+        serde_json::to_string_pretty(value)
+            .into_diagnostic()
+            .wrap_err("failed to serialize Codex refit result")?,
+    );
+    write_stdout(output.as_bytes())
+}
+
+fn codex_diagnostic(error: CodexRefitError) -> miette::Report {
+    miette!("[opsail-refit-codex:{}] {error}", error.code().as_str())
 }
 
 async fn run_read(args: ReadArgs) -> Result<()> {
@@ -534,5 +675,41 @@ mod tests {
     fn broken_pipe_is_a_successful_write_termination() {
         let error = io::Error::new(ErrorKind::BrokenPipe, "consumer closed the pipe");
         assert!(finish_stdout_write(Err(error)).is_ok());
+    }
+
+    #[test]
+    fn codex_enable_parses_modes_launch_policy_and_port_defaults() {
+        for (arguments, expected_mode, expected_launch, expected_port) in [
+            (
+                vec![
+                    "opsail", "refit", "codex", "enable", "usage", "--once", "--launch", "--port",
+                    "55400",
+                ],
+                SessionMode::Once,
+                LaunchPolicy::LaunchIfStopped,
+                55400,
+            ),
+            (
+                vec!["opsail", "refit", "codex", "enable", "usage"],
+                SessionMode::Persistent,
+                LaunchPolicy::AttachOnly,
+                DEFAULT_CODEX_DEBUG_PORT,
+            ),
+        ] {
+            let cli = Cli::try_parse_from(arguments).unwrap();
+            let Command::Refit(RefitArgs {
+                target:
+                    RefitTarget::Codex(CodexRefitArgs {
+                        port,
+                        command: CodexRefitCommand::Enable(enable),
+                    }),
+            }) = cli.command
+            else {
+                panic!("expected Codex enable arguments");
+            };
+            assert_eq!(enable.session_mode(), expected_mode);
+            assert_eq!(enable.launch_policy(), expected_launch);
+            assert_eq!(port, expected_port);
+        }
     }
 }

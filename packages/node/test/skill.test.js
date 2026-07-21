@@ -106,7 +106,13 @@ test("bootstrap is independently versioned and runtime matches the public packag
     },
   ]);
   assert(opsailMetadata.hermes);
-  assert.match(opsailSkill, /current capability is `read`/);
+  assert.match(opsailSkill, /`read` extracts readable content/);
+  assert.match(opsailSkill, /opsail refit codex doctor/);
+  assert.match(opsailSkill, /opsail refit codex enable usage/);
+  assert.match(opsailSkill, /opsail refit codex enable usage --launch/);
+  assert.match(opsailSkill, /opsail refit codex disable usage/);
+  assert.match(opsailSkill, /never quit, kill, restart, reload, modify, or re-sign ChatGPT/);
+  assert.match(opsailSkill, /public default port is `55321`/);
 });
 
 test("README and release workflow keep one installer source", async () => {

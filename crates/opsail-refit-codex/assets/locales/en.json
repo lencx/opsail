@@ -1,0 +1,20 @@
+{
+  "locale": "en",
+  "usageTitle": "Usage limits",
+  "summaryItem": "{label} {remaining}%",
+  "remaining": "{remaining}% remaining",
+  "used": "{used}% used",
+  "reset": "Resets {time}",
+  "ariaSummary": "Usage limits: {summary}",
+  "ariaProgress": "{label}: {remaining}% remaining",
+  "stale": "Refresh failed; showing the last successful values",
+  "windowLabels": {
+    "fiveHours": "5h",
+    "weekly": "weekly",
+    "daily": "daily",
+    "monthly": "monthly",
+    "hours": "{value}h",
+    "minutes": "{value}m",
+    "generic": "usage"
+  }
+}

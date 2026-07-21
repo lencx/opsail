@@ -1323,6 +1323,7 @@ dependencies = [
  "clap",
  "miette",
  "opsail-read",
+ "opsail-refit-codex",
  "predicates",
  "serde",
  "serde_json",
@@ -1372,6 +1373,23 @@ dependencies = [
  "unicode-segmentation",
  "url",
  "wiremock",
+]
+
+[[package]]
+name = "opsail-refit-codex"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "url",
 ]
 
 [[package]]

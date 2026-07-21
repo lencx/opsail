@@ -58,6 +58,8 @@ flowchart LR
     BOOTSTRAP_SKILL["bootstrap-opsail Skill"] -.->|"安装 / 注册 runtime skill"| AGENT_HOSTS
 ```
 
+OpenClaw、Hermes Agent、Claude Code 与 Codex 等宿主只需持久化兼容 AgentSkills 的 `opsail` runtime skill。该 Skill 同时记录 `read` 能力和需要用户明确授权、经过目标校验的 Codex refit 命令，并始终只是原生 CLI 的轻量适配层。临时的 `bootstrap-opsail` Skill 负责安装二进制并注册 runtime Skill，不进入任何运行时数据路径。
+
 <table>
   <thead>
     <tr>
@@ -82,8 +84,35 @@ flowchart LR
       <td width="180"><a href="https://crates.io/crates/opsail-read"><img src="https://img.shields.io/crates/v/opsail-read" alt="crates.io 版本"></a></td>
       <td>从静态 HTML 或 Chrome 渲染后的 DOM 中提取干净的 Markdown、清洗后的 HTML 和结构化 JSON</td>
     </tr>
+    <tr>
+      <td width="180"><a href="https://crates.io/crates/opsail-refit-codex"><code>opsail-refit-codex</code></a></td>
+      <td width="180"><a href="https://crates.io/crates/opsail-refit-codex"><img src="https://img.shields.io/crates/v/opsail-refit-codex" alt="crates.io 版本"></a></td>
+      <td>负责经过校验的 Codex renderer refit 生命周期、本机目标安全、额度语义、本地化与 UI payload</td>
+    </tr>
   </tbody>
 </table>
+
+## Codex 左侧栏额度显示
+
+`opsail-refit-codex` 会在 Codex 左侧栏底部账户行加入一个可逆的剩余额度胶囊。数据只通过 renderer 已有的本机账户 bridge 读取，窗口标签按实际额度时长生成，所有用户文案从内嵌多语言 JSON 加载；不会发起模型调用或外部账户请求。
+
+适配器目前只支持签名 macOS 应用 `/Applications/ChatGPT.app`，且 CDP endpoint 必须绑定到 `127.0.0.1`。注入前会校验 Bundle ID、签名 Team ID、代码签名、进程归属与祖先链、renderer URL 与 shell、侧栏结构以及 bridge 能力。普通 enable 只附加；只有显式 `--launch` 才可通过 Rust 进程 API 启动一次已确认停止的应用。Opsail 永远不会退出、kill、重启、重载、修改或重新签名 ChatGPT。
+
+```sh
+opsail refit codex doctor
+opsail refit codex enable usage --launch
+opsail refit codex enable usage --launch --once
+opsail refit codex enable usage
+opsail refit codex enable usage --once
+opsail refit codex status
+opsail refit codex disable usage
+```
+
+`--launch` 是无需手工执行应用启动命令的正式入口：它会先尝试附加已有合法 endpoint，仅当 ChatGPT 已确认停止时才启动一次。应用已运行但缺少所选 CDP endpoint 时返回 `restart-required`，端口冲突时返回 `port-unavailable`；任何命令都不会自动退出或重启应用。`doctor`、`status` 与 `disable` 永远不会启动应用。
+
+公开默认端口为 `55321`，可用 `--port PORT` 覆盖；发现和启动始终只使用 `127.0.0.1`。当前实现不会在默认端口被占用时自动选择其他端口。默认的 `persistent`/managed 启用命令会先输出初始报告，再以前台方式保持连接，从而在不增加服务或监听端口的前提下恢复 renderer 重载。`--once` 是 ephemeral 模式：完成当前 document 的校验、注入和健康确认后关闭 CDP 并退出；hard reload、renderer 重建或应用重启后不会恢复。Disable 可先停止经过校验的 Opsail manager 再清理，但绝不会停止 ChatGPT。
+
+启动与手动附加流程、生命周期保证、刷新策略、本地化与 crate API 详见 [Codex refit 指南](crates/opsail-refit-codex/README.md)。
 
 ## 安装
 

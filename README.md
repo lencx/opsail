@@ -58,7 +58,7 @@ flowchart LR
     BOOTSTRAP_SKILL["bootstrap-opsail Skill"] -.->|"installs / registers runtime skill"| AGENT_HOSTS
 ```
 
-Agent hosts such as OpenClaw, Hermes Agent, Claude Code, and Codex persist only the AgentSkills-compatible `opsail` runtime skill. It currently documents `read` and will grow with the CLI while remaining a thin adapter over the same `ReadResult` path. The transient `bootstrap-opsail` Skill installs the binary and registers that runtime Skill; it is not part of the read data path.
+Agent hosts such as OpenClaw, Hermes Agent, Claude Code, and Codex persist only the AgentSkills-compatible `opsail` runtime skill. It documents the `read` capability and the explicitly authorized, target-validated Codex refit commands while remaining a thin adapter over the native CLI. The transient `bootstrap-opsail` Skill installs the binary and registers that runtime Skill; it is not part of either runtime data path.
 
 <table>
   <thead>
@@ -84,8 +84,35 @@ Agent hosts such as OpenClaw, Hermes Agent, Claude Code, and Codex persist only 
       <td width="180"><a href="https://crates.io/crates/opsail-read"><img src="https://img.shields.io/crates/v/opsail-read" alt="crates.io version"></a></td>
       <td>Extracts clean Markdown, sanitized HTML, and structured JSON from static HTML or Chrome-rendered DOM</td>
     </tr>
+    <tr>
+      <td width="180"><a href="https://crates.io/crates/opsail-refit-codex"><code>opsail-refit-codex</code></a></td>
+      <td width="180"><a href="https://crates.io/crates/opsail-refit-codex"><img src="https://img.shields.io/crates/v/opsail-refit-codex" alt="crates.io version"></a></td>
+      <td>Owns the validated Codex renderer refit lifecycle, local target safety, usage semantics, localization, and UI payload</td>
+    </tr>
   </tbody>
 </table>
+
+## Codex sidebar usage refit
+
+`opsail-refit-codex` adds a reversible remaining-usage capsule to the account row in the Codex sidebar. It reads only through the renderer's existing local account bridge, derives labels from the actual rate-limit window durations, and loads user-facing copy from embedded locale JSON. It does not make model calls or external account requests.
+
+The adapter currently supports only the signed macOS application at `/Applications/ChatGPT.app` and only a CDP endpoint bound to `127.0.0.1`. Opsail validates the bundle identifier, signing team, code signature, process ownership and ancestry, renderer URL and shell, sidebar structure, and bridge capability before injection. Normal enable is attach-only. An explicit `--launch` may start a confirmed-stopped application once through Rust's process API; Opsail never quits, kills, restarts, reloads, modifies, or re-signs ChatGPT.
+
+```sh
+opsail refit codex doctor
+opsail refit codex enable usage --launch
+opsail refit codex enable usage --launch --once
+opsail refit codex enable usage
+opsail refit codex enable usage --once
+opsail refit codex status
+opsail refit codex disable usage
+```
+
+`--launch` is the supported no-manual-start entry point. It first attaches to an already valid endpoint; otherwise it launches only if ChatGPT is confirmed stopped. A running app without the selected CDP endpoint returns `restart-required`, and a conflicting listener returns `port-unavailable`; no command automatically quits or relaunches the app. `doctor`, `status`, and `disable` never launch it.
+
+The public default port is `55321`; `--port PORT` overrides it, while discovery and launch remain fixed to `127.0.0.1`. The current implementation does not automatically select another port when the default is occupied. The default `persistent`/managed enable command prints its initial report and remains in the foreground so renderer reloads can be recovered without another service or listening port. `--once` is ephemeral: it validates and injects the current document, confirms health, closes CDP, and exits. It does not survive a hard reload, renderer reconstruction, or application restart. Disable can stop the validated Opsail manager before cleanup, but never stops ChatGPT.
+
+See the [Codex refit guide](crates/opsail-refit-codex/README.md) for launch and manual attach flows, lifecycle guarantees, refresh behavior, localization, and library APIs.
 
 ## Installation
 

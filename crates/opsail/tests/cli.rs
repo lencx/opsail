@@ -221,6 +221,85 @@ fn read_without_arguments_shows_help_instead_of_reading_stdin() {
 }
 
 #[test]
+fn refit_codex_help_exposes_the_usage_lifecycle_and_default_port() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["refit", "codex", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("enable")
+                .and(predicate::str::contains("disable"))
+                .and(predicate::str::contains("status"))
+                .and(predicate::str::contains("doctor"))
+                .and(predicate::str::contains("--port"))
+                .and(predicate::str::contains("127.0.0.1"))
+                .and(predicate::str::contains("55321")),
+        )
+        .stderr("");
+}
+
+#[test]
+fn refit_codex_enable_accepts_only_the_usage_feature() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["refit", "codex", "enable", "theme"])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("invalid value 'theme'")
+                .and(predicate::str::contains("usage")),
+        );
+}
+
+#[test]
+fn refit_codex_enable_help_documents_launch_once_and_persistent_default() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["refit", "codex", "enable", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--once")
+                .and(predicate::str::contains("--launch"))
+                .and(predicate::str::contains("current document"))
+                .and(predicate::str::contains("close CDP"))
+                .and(predicate::str::contains("attach-only"))
+                .and(predicate::str::contains("stopped ChatGPT app once"))
+                .and(predicate::str::contains(
+                    "persistent managed mode is the default",
+                )),
+        )
+        .stderr("");
+
+    let mut once = cargo_bin_cmd!("opsail");
+    once.args([
+        "refit", "codex", "enable", "usage", "--launch", "--once", "--port", "80",
+    ])
+    .assert()
+    .code(1)
+    .stdout("")
+    .stderr(predicate::str::contains(
+        "[opsail-refit-codex:target-validation-failed]",
+    ));
+}
+
+#[test]
+fn refit_codex_rejects_privileged_ports_before_target_discovery() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["refit", "codex", "status", "--port", "80"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("[opsail-refit-codex:target-validation-failed]")
+                .and(predicate::str::contains("between 1024 and 65535")),
+        );
+}
+
+#[test]
 fn machine_mode_reads_html_and_emits_a_versioned_envelope() {
     let request = serde_json::json!({
         "protocolVersion": 1,
