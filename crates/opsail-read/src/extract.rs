@@ -515,22 +515,22 @@ fn sanitize_and_convert(html: &str, base_url: Option<&Url>) -> (String, String) 
                 let cells: Vec<String> = row
                     .select("th, td")
                     .iter()
-                    .map(|cell| {
-                        cell.formatted_text()
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" ")
+                    .filter_map(|cell| {
+                        for line_break in cell.select("br").iter() {
+                            line_break.replace_with_html(" ");
+                        }
+                        let has_text = cell.formatted_text().split_whitespace().next().is_some();
+                        has_text.then(|| cell.inner_html().to_string())
                     })
-                    .filter(|cell| !cell.is_empty())
                     .collect();
                 if cells.is_empty() {
                     continue;
                 }
-                let row_text = escape_html(&cells.join(" · "));
+                let row_html = cells.join(" · ");
                 if is_header {
-                    readable_rows.push_str(&format!("<p><strong>{row_text}</strong></p>"));
+                    readable_rows.push_str(&format!("<p><strong>{row_html}</strong></p>"));
                 } else {
-                    readable_rows.push_str(&format!("<p>{row_text}</p>"));
+                    readable_rows.push_str(&format!("<p>{row_html}</p>"));
                 }
             }
         }
@@ -994,6 +994,32 @@ mod tests {
             assert!(output.contains("Readable label"));
         }
         assert!(!html.contains("<img"));
+    }
+
+    #[test]
+    fn irregular_layout_tables_preserve_links_in_markdown() {
+        let base = Url::parse("https://news.example.test/news").unwrap();
+        let (_, markdown) = sanitize_and_convert(
+            r#"<table>
+                <tr>
+                    <td>1.</td>
+                    <td><a href="https://stories.example.test/one">Linked story</a></td>
+                </tr>
+                <tr>
+                    <td colspan="2"><a href="item?id=1">4 comments</a></td>
+                </tr>
+            </table>"#,
+            Some(&base),
+        );
+
+        assert!(
+            markdown.contains("[Linked story](https://stories.example.test/one)"),
+            "story destination was discarded: {markdown}"
+        );
+        assert!(
+            markdown.contains("[4 comments](https://news.example.test/item?id=1)"),
+            "comment destination was discarded: {markdown}"
+        );
     }
 
     #[test]
