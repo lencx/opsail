@@ -6,6 +6,7 @@ use crate::error::{CodexRefitError, CodexRefitErrorCode};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedAppIdentity {
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     executable: PathBuf,
     #[cfg(target_os = "macos")]
     user_id: u32,
@@ -44,9 +45,7 @@ impl ValidatedAppIdentity {
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     pub(crate) fn for_test() -> Self {
-        Self {
-            executable: PathBuf::from("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
-        }
+        Self {}
     }
 }
 

@@ -1,0 +1,5 @@
+# Renderer manifests authenticate exact source bytes. Keep embedded text assets
+# on LF across every checkout so Windows builds verify the same bytes.
+crates/opsail-refit-codex/assets/*.css text eol=lf
+crates/opsail-refit-codex/assets/*.js text eol=lf
+crates/opsail-refit-codex/assets/*.json text eol=lf
