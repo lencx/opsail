@@ -14,45 +14,78 @@ mod model;
 mod payload;
 mod platform;
 mod renderer_assets;
+mod renderer_session;
 mod state;
+mod supervisor;
 
+use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use futures_util::stream::{FuturesUnordered, StreamExt as _};
-use serde::Deserialize;
-use tokio::time::{Instant, sleep};
+use tokio::time::sleep;
 
-use cdp::{CdpSession, discover_targets, wait_for_termination};
+use cdp::{CdpSession, discover_targets};
 pub use error::{CodexRefitError, CodexRefitErrorCode};
 use github_update::{GithubRendererAssetClient, RendererAssetUpdateClient};
 use launch::{LaunchBackend, SystemLaunchBackend};
-use lifecycle::{ManagedSession, SessionFuture};
+#[cfg(test)]
+use lifecycle::ManagedSession;
 pub use model::{
-    CodexDoctorReport, CodexRefitOperation, CodexRefitReport, CodexRefitState, CodexTargetHealth,
-    CodexUpdateReport, DoctorCheck, DoctorCheckState, LaunchPolicy, RendererAssetActivation,
-    RendererAssetInfo, RendererAssetSource, RendererAssetUpdatePolicy, SessionMode,
+    CodexDoctorReport, CodexRefitOperation, CodexRefitReport, CodexRefitStage, CodexRefitState,
+    CodexTargetHealth, CodexUpdateReport, DoctorCheck, DoctorCheckState, LaunchPolicy,
+    RendererAssetActivation, RendererAssetInfo, RendererAssetSource, RendererAssetUpdatePolicy,
+    SessionMode,
 };
 #[cfg(test)]
 use payload::usage_payload;
 use payload::{UsagePayload, build_usage_payload};
-use renderer_assets::{RendererAssetStore, embedded_bundle};
-use state::{StateManagedSessionLock, StateStore, TargetRecord};
+use platform::{LaunchedProcess, ValidatedAppIdentity};
+use renderer_assets::{RendererAssetInstallPolicy, RendererAssetStore, embedded_bundle};
+use renderer_session::{CodexSession, close_sessions, probe_renderer, renderer_status};
+#[cfg(test)]
+use renderer_session::{
+    DOM_ADAPTER_API_VERSION, RendererStatus, USAGE_RUNTIME_LISTENER_COUNT, show_launch_notice,
+};
+use state::StateStore;
+#[cfg(test)]
+use state::TargetRecord;
+use supervisor::{PersistentSupervisor, new_manager_token};
+#[cfg(test)]
+use supervisor::{ReconnectBackoff, RecoveryDecision, wait_for_reconnect_or_app_exit};
 
 pub const DEFAULT_CODEX_DEBUG_PORT: u16 = 55321;
-const USAGE_RUNTIME_LISTENER_COUNT: usize = 10;
-const DOM_ADAPTER_API_VERSION: u64 = 1;
 const APP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
-const APP_EXIT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
+type ProgressHandler = dyn Fn(CodexRefitStage) + Send + Sync + 'static;
+
+#[derive(Clone, Default)]
+struct ProgressReporter(Option<Arc<ProgressHandler>>);
+
+impl ProgressReporter {
+    fn report(&self, stage: CodexRefitStage) {
+        if let Some(handler) = &self.0 {
+            handler(stage);
+        }
+    }
+}
+
+impl fmt::Debug for ProgressReporter {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("ProgressReporter")
+            .field(&self.0.as_ref().map(|_| "configured"))
+            .finish()
+    }
+}
 
 /// Configuration for the verified Codex renderer adapter.
 #[derive(Debug, Clone)]
 pub struct CodexRefitConfig {
     port: u16,
     state_dir: Option<PathBuf>,
+    progress: ProgressReporter,
 }
 
 impl Default for CodexRefitConfig {
@@ -60,6 +93,7 @@ impl Default for CodexRefitConfig {
         Self {
             port: DEFAULT_CODEX_DEBUG_PORT,
             state_dir: None,
+            progress: ProgressReporter::default(),
         }
     }
 }
@@ -69,12 +103,22 @@ impl CodexRefitConfig {
         Self {
             port,
             state_dir: None,
+            progress: ProgressReporter::default(),
         }
     }
 
     /// Override the state directory for an embedding application or test.
     pub fn with_state_dir(mut self, state_dir: PathBuf) -> Self {
         self.state_dir = Some(state_dir);
+        self
+    }
+
+    /// Receive infrequent lifecycle milestones. Handlers should return promptly.
+    pub fn with_progress_handler(
+        mut self,
+        handler: impl Fn(CodexRefitStage) + Send + Sync + 'static,
+    ) -> Self {
+        self.progress = ProgressReporter(Some(Arc::new(handler)));
         self
     }
 
@@ -94,6 +138,7 @@ pub struct CodexRefit {
     renderer_asset_content_identity: String,
     update_client: Arc<dyn RendererAssetUpdateClient>,
     launch_backend: Arc<dyn LaunchBackend>,
+    progress: ProgressReporter,
 }
 
 /// An enabled usage session and its initial health report.
@@ -121,40 +166,6 @@ impl CodexUsageSession {
     }
 }
 
-struct PersistentSupervisor {
-    adapter: CodexRefit,
-    sessions: Vec<CodexSession>,
-    manager_token: String,
-    _managed_lock: StateManagedSessionLock,
-}
-
-#[derive(Debug)]
-struct ReconnectBackoff {
-    next: Duration,
-    maximum: Duration,
-}
-
-impl Default for ReconnectBackoff {
-    fn default() -> Self {
-        Self {
-            next: Duration::from_millis(250),
-            maximum: Duration::from_secs(30),
-        }
-    }
-}
-
-impl ReconnectBackoff {
-    fn next_delay(&mut self) -> Duration {
-        let delay = self.next;
-        self.next = self.next.saturating_mul(2).min(self.maximum);
-        delay
-    }
-
-    fn reset(&mut self) {
-        self.next = Duration::from_millis(250);
-    }
-}
-
 impl CodexRefit {
     pub fn new(config: CodexRefitConfig) -> Result<Self, CodexRefitError> {
         if config.port < 1024 {
@@ -163,6 +174,7 @@ impl CodexRefit {
                 "the Codex debug port must be between 1024 and 65535",
             ));
         }
+        config.progress.report(CodexRefitStage::LoadRendererAssets);
         let state_dir = match config.state_dir {
             Some(path) => path,
             None => platform::default_state_dir()?,
@@ -199,6 +211,7 @@ impl CodexRefit {
             renderer_asset_content_identity,
             update_client: Arc::new(GithubRendererAssetClient),
             launch_backend: Arc::new(SystemLaunchBackend),
+            progress: config.progress,
         })
     }
 
@@ -211,6 +224,7 @@ impl CodexRefit {
         &self,
         policy: RendererAssetUpdatePolicy,
     ) -> Result<CodexUpdateReport, CodexRefitError> {
+        self.progress.report(CodexRefitStage::FetchUpdateManifest);
         let manifest = self.update_client.fetch_latest_manifest().await?;
         let candidate_info = manifest.info(RendererAssetSource::Github);
         let candidate_version = semver::Version::parse(&candidate_info.version)
@@ -224,16 +238,10 @@ impl CodexRefit {
             ));
         }
         let content_changed = manifest.content_identity() != self.renderer_asset_content_identity;
-        if content_changed && candidate_version == current_version {
-            return Err(CodexRefitError::new(
-                CodexRefitErrorCode::UpdateFailed,
-                "renderer JavaScript changed without a new asset version; publish a higher assetVersion before updating",
-            ));
-        }
         if content_changed && policy == RendererAssetUpdatePolicy::RequireUnchanged {
             return Err(CodexRefitError::new(
                 CodexRefitErrorCode::UpdateFailed,
-                "renderer JavaScript SHA-256 values changed; rerun `opsail refit codex update --force` (or `-f`) to install the verified bundle",
+                "renderer JavaScript SHA-256 values changed; rerun `opsail refit codex update --force` (or `-f`) to install the validated bundle",
             ));
         }
         let files = manifest.file_count();
@@ -253,6 +261,8 @@ impl CodexRefit {
             });
         }
 
+        self.progress
+            .report(CodexRefitStage::DownloadRendererAssets);
         let bundle = self.update_client.fetch_bundle(manifest).await?;
         build_usage_payload(bundle.sources(), candidate_info).map_err(|error| {
             CodexRefitError::new(
@@ -262,7 +272,13 @@ impl CodexRefit {
         })?;
         let previous = self.payload.asset_info.clone();
         let store = self.renderer_assets.clone();
-        let install = tokio::task::spawn_blocking(move || store.install(&bundle))
+        let install_policy = if allow_content_change {
+            RendererAssetInstallPolicy::AllowSameVersionChange
+        } else {
+            RendererAssetInstallPolicy::Strict
+        };
+        self.progress.report(CodexRefitStage::InstallRendererAssets);
+        let install = tokio::task::spawn_blocking(move || store.install(&bundle, install_policy))
             .await
             .map_err(|_| {
                 CodexRefitError::new(
@@ -300,7 +316,7 @@ impl CodexRefit {
                     ));
                 }
                 let manager_token = new_manager_token();
-                let (mut sessions, result) = self
+                let (mut sessions, result, _, _) = self
                     .connect_and_enable_with_policy(
                         SessionMode::Once,
                         launch_policy,
@@ -319,22 +335,27 @@ impl CodexRefit {
                     return self.existing_persistent_session(launch_policy).await;
                 };
                 let manager_token = new_manager_token();
-                let (sessions, report) = self
+                let (sessions, report, app_identity, launched_process) = self
                     .connect_and_enable_with_policy(
                         SessionMode::Persistent,
                         launch_policy,
                         &manager_token,
                     )
                     .await?;
+                self.progress.report(CodexRefitStage::StartManager);
+                let mut supervisor_adapter = self.clone();
+                supervisor_adapter.progress = ProgressReporter::default();
                 Ok(CodexUsageSession {
                     mode,
                     report,
-                    supervisor: Some(PersistentSupervisor {
-                        adapter: self.clone(),
+                    supervisor: Some(PersistentSupervisor::new(
+                        supervisor_adapter,
                         sessions,
                         manager_token,
-                        _managed_lock: managed_lock,
-                    }),
+                        app_identity,
+                        launched_process,
+                        managed_lock,
+                    )),
                 })
             }
         }
@@ -343,13 +364,27 @@ impl CodexRefit {
     pub async fn disable_usage(&self) -> Result<CodexRefitReport, CodexRefitError> {
         let _operation_lock = self.state.try_operation_lock()?;
         if self.state.managed_session_active()? {
+            self.progress.report(CodexRefitStage::StopManager);
             self.stop_managed_session().await?;
         }
-        let mut sessions = self.connect_sessions(&new_manager_token(), None).await?;
+        let mut sessions = match self.connect_sessions(&new_manager_token(), None).await {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                let port = self.port;
+                let listener_present =
+                    run_blocking(move || platform::debug_listener_present(port)).await?;
+                if can_cleanup_offline(error.code(), listener_present) {
+                    self.progress.report(CodexRefitStage::CleanupUsage);
+                    return self.offline_disable_report();
+                }
+                return Err(error);
+            }
+        };
         if let Err(error) = self.prune_absent_sessions(&sessions) {
             close_sessions(&mut sessions).await;
             return Err(error);
         }
+        self.progress.report(CodexRefitStage::CleanupUsage);
         let result = lifecycle::disable(&mut sessions)
             .await
             .map(|report| self.report_with_port(report));
@@ -359,6 +394,7 @@ impl CodexRefit {
 
     pub async fn status(&self) -> Result<CodexRefitReport, CodexRefitError> {
         let mut sessions = self.connect_sessions(&new_manager_token(), None).await?;
+        self.progress.report(CodexRefitStage::InspectUsage);
         let result = lifecycle::status(&mut sessions)
             .await
             .map(|report| self.report_with_port(report));
@@ -368,6 +404,7 @@ impl CodexRefit {
 
     /// Run read-only checks. This never injects, launches, stops, or reloads the app.
     pub async fn doctor(&self) -> CodexDoctorReport {
+        self.progress.report(CodexRefitStage::RunDiagnostics);
         let mut checks = Vec::new();
         let mut detected_session_modes = Vec::new();
         checks.push(DoctorCheck {
@@ -410,15 +447,19 @@ impl CodexRefit {
             message: "macOS is supported".to_owned(),
         });
 
-        if let Err(error) = run_blocking(platform::validate_app).await {
-            checks.push(failed_check("application", &error));
-            return doctor_report(
-                self.port,
-                self.payload.asset_info.clone(),
-                checks,
-                detected_session_modes,
-            );
-        }
+        self.progress.report(CodexRefitStage::ValidateApplication);
+        let app_identity = match run_blocking(platform::validate_app).await {
+            Ok(identity) => identity,
+            Err(error) => {
+                checks.push(failed_check("application", &error));
+                return doctor_report(
+                    self.port,
+                    self.payload.asset_info.clone(),
+                    checks,
+                    detected_session_modes,
+                );
+            }
+        };
         checks.push(DoctorCheck {
             name: "application",
             state: DoctorCheckState::Pass,
@@ -434,29 +475,33 @@ impl CodexRefit {
             Err(error) => checks.push(failed_check("state", &error)),
         }
 
+        self.progress.report(CodexRefitStage::ValidateListener);
         let port = self.port;
-        let identity = match run_blocking(move || platform::validate_runtime(port)).await {
-            Ok(identity) => {
-                checks.push(DoctorCheck {
-                    name: "listener",
-                    state: DoctorCheckState::Pass,
-                    message:
-                        "the loopback debug listener belongs to the signed ChatGPT process tree"
-                            .to_owned(),
-                });
-                identity
-            }
-            Err(error) => {
-                checks.push(failed_check("listener", &error));
-                return doctor_report(
-                    self.port,
-                    self.payload.asset_info.clone(),
-                    checks,
-                    detected_session_modes,
-                );
-            }
-        };
+        let runtime_app = app_identity.clone();
+        let identity =
+            match run_blocking(move || platform::validate_runtime(port, &runtime_app)).await {
+                Ok(identity) => {
+                    checks.push(DoctorCheck {
+                        name: "listener",
+                        state: DoctorCheckState::Pass,
+                        message:
+                            "the loopback debug listener belongs to the signed ChatGPT process tree"
+                                .to_owned(),
+                    });
+                    identity
+                }
+                Err(error) => {
+                    checks.push(failed_check("listener", &error));
+                    return doctor_report(
+                        self.port,
+                        self.payload.asset_info.clone(),
+                        checks,
+                        detected_session_modes,
+                    );
+                }
+            };
 
+        self.progress.report(CodexRefitStage::DiscoverRenderer);
         let targets = match discover_targets(self.port).await {
             Ok(targets) => {
                 checks.push(DoctorCheck {
@@ -480,6 +525,7 @@ impl CodexRefit {
             }
         };
 
+        self.progress.report(CodexRefitStage::ValidateRenderer);
         let mut valid_renderers = 0usize;
         let mut bridge_missing = false;
         for target in &targets {
@@ -564,7 +610,9 @@ impl CodexRefit {
         });
 
         let port = self.port;
-        match run_blocking(move || platform::revalidate_runtime(port, &identity)).await {
+        match run_blocking(move || platform::revalidate_runtime(port, &app_identity, &identity))
+            .await
+        {
             Ok(()) => checks.push(DoctorCheck {
                 name: "identity-stability",
                 state: DoctorCheckState::Pass,
@@ -585,9 +633,25 @@ impl CodexRefit {
         manager_token: &str,
         launched_pid: Option<u32>,
     ) -> Result<Vec<CodexSession>, CodexRefitError> {
+        self.progress.report(CodexRefitStage::ValidateApplication);
+        let app = run_blocking(platform::validate_app).await?;
+        self.connect_sessions_validated(manager_token, launched_pid, &app)
+            .await
+    }
+
+    async fn connect_sessions_validated(
+        &self,
+        manager_token: &str,
+        launched_pid: Option<u32>,
+        app: &ValidatedAppIdentity,
+    ) -> Result<Vec<CodexSession>, CodexRefitError> {
+        self.progress.report(CodexRefitStage::ValidateListener);
         let port = self.port;
-        let identity = run_blocking(move || platform::validate_runtime(port)).await?;
+        let runtime_app = app.clone();
+        let identity = run_blocking(move || platform::validate_runtime(port, &runtime_app)).await?;
+        self.progress.report(CodexRefitStage::DiscoverRenderer);
         let targets = discover_targets(self.port).await?;
+        self.progress.report(CodexRefitStage::ValidateRenderer);
         let mut sessions = Vec::new();
         let mut bridge_missing = false;
         let mut session_error = None;
@@ -602,14 +666,13 @@ impl CodexRefit {
                 }
             };
             match probe_renderer(&mut cdp, &self.payload).await {
-                Ok(()) => sessions.push(CodexSession {
+                Ok(()) => sessions.push(CodexSession::new(
                     cdp,
-                    port: self.port,
-                    state: self.state.clone(),
-                    payload: Arc::clone(&self.payload),
-                    manager_token: manager_token.to_owned(),
-                    owned_script_identifiers: Vec::new(),
-                }),
+                    self.port,
+                    self.state.clone(),
+                    Arc::clone(&self.payload),
+                    manager_token,
+                )),
                 Err(error) => {
                     bridge_missing |= error.code() == CodexRefitErrorCode::BridgeUnavailable;
                     let error = if launched_pid.is_some()
@@ -648,16 +711,23 @@ impl CodexRefit {
         }
         let port = self.port;
         let revalidation_identity = identity.clone();
-        if let Err(error) =
-            run_blocking(move || platform::revalidate_runtime(port, &revalidation_identity)).await
+        let revalidation_app = app.clone();
+        if let Err(error) = run_blocking(move || {
+            platform::revalidate_runtime(port, &revalidation_app, &revalidation_identity)
+        })
+        .await
         {
             close_sessions(&mut sessions).await;
             return Err(error);
         }
         if let Some(launched_pid) = launched_pid
-            && let Err(error) =
-                run_blocking(move || platform::validate_launched_runtime(&identity, launched_pid))
-                    .await
+            && let Err(error) = {
+                let launched_app = app.clone();
+                run_blocking(move || {
+                    platform::validate_launched_runtime(&identity, &launched_app, launched_pid)
+                })
+                .await
+            }
         {
             close_sessions(&mut sessions).await;
             return Err(error);
@@ -665,19 +735,41 @@ impl CodexRefit {
         Ok(sessions)
     }
 
-    async fn connect_and_enable(
+    async fn connect_and_enable_validated(
         &self,
         mode: SessionMode,
         manager_token: &str,
         launched_pid: Option<u32>,
+        app: &ValidatedAppIdentity,
     ) -> Result<(Vec<CodexSession>, CodexRefitReport), CodexRefitError> {
-        let mut sessions = self.connect_sessions(manager_token, launched_pid).await?;
+        let mut sessions = self
+            .connect_sessions_validated(manager_token, launched_pid, app)
+            .await?;
         if let Err(error) = self.prune_absent_sessions(&sessions) {
             close_sessions(&mut sessions).await;
             return Err(error);
         }
-        match lifecycle::enable(&mut sessions, mode).await {
-            Ok(report) => Ok((sessions, self.report_with_port(report))),
+        self.progress.report(CodexRefitStage::InspectUsage);
+        match lifecycle::enable(&mut sessions, mode, &self.progress).await {
+            Ok(report) => {
+                if launched_pid.is_some()
+                    && let Some(session) = sessions.first_mut()
+                {
+                    match session.show_launch_notice().await {
+                        Ok(true) => {}
+                        Ok(false) => tracing::warn!(
+                            target: "opsail_refit_codex",
+                            "[opsail-refit-codex] renderer declined the launch success notice"
+                        ),
+                        Err(error) => tracing::warn!(
+                            target: "opsail_refit_codex",
+                            code = error.code().as_str(),
+                            "[opsail-refit-codex] launch succeeded but its renderer notice failed"
+                        ),
+                    }
+                }
+                Ok((sessions, self.report_with_port(report)))
+            }
             Err(error) => {
                 close_sessions(&mut sessions).await;
                 Err(error)
@@ -690,17 +782,32 @@ impl CodexRefit {
         mode: SessionMode,
         launch_policy: LaunchPolicy,
         manager_token: &str,
-    ) -> Result<(Vec<CodexSession>, CodexRefitReport), CodexRefitError> {
-        match self.connect_and_enable(mode, manager_token, None).await {
+    ) -> Result<
+        (
+            Vec<CodexSession>,
+            CodexRefitReport,
+            ValidatedAppIdentity,
+            Option<LaunchedProcess>,
+        ),
+        CodexRefitError,
+    > {
+        self.progress.report(CodexRefitStage::ValidateApplication);
+        let app = run_blocking(platform::validate_app).await?;
+        self.progress.report(CodexRefitStage::InspectEndpoint);
+        match self
+            .connect_and_enable_validated(mode, manager_token, None, &app)
+            .await
+        {
             Ok((sessions, mut report)) => {
                 report.launch_policy = Some(launch_policy);
                 report.launched = Some(false);
-                return Ok((sessions, report));
+                return Ok((sessions, report, app, None));
             }
             Err(error) if launch_policy == LaunchPolicy::AttachOnly => return Err(error),
             Err(initial_error) => {
                 let port = self.port;
-                if run_blocking(move || platform::validate_runtime(port))
+                let runtime_app = app.clone();
+                if run_blocking(move || platform::validate_runtime(port, &runtime_app))
                     .await
                     .is_ok()
                 {
@@ -711,16 +818,32 @@ impl CodexRefit {
 
         let port = self.port;
         let backend = Arc::clone(&self.launch_backend);
-        let launched_pid =
-            run_blocking(move || launch::launch_if_stopped(backend.as_ref(), port)).await?;
-        let (sessions, mut report) =
-            launch::wait_for_endpoint(self.port, APP_LAUNCH_TIMEOUT, || {
-                self.connect_and_enable(mode, manager_token, Some(launched_pid))
-            })
-            .await?;
+        let launch_app = app.clone();
+        let launch_progress = self.progress.clone();
+        let launched_process = run_blocking(move || {
+            launch::launch_validated(backend.as_ref(), port, &launch_app, &launch_progress)
+        })
+        .await?;
+        let launched_pid = launched_process.pid();
+        self.progress.report(CodexRefitStage::WaitForEndpoint);
+        let (sessions, mut report) = launch::wait_for_endpoint_or_process_exit(
+            self.port,
+            APP_LAUNCH_TIMEOUT,
+            launched_process.exit_receiver(),
+            || async {
+                let result = self
+                    .connect_and_enable_validated(mode, manager_token, Some(launched_pid), &app)
+                    .await;
+                if result.is_err() {
+                    self.progress.report(CodexRefitStage::WaitForEndpoint);
+                }
+                result
+            },
+        )
+        .await?;
         report.launch_policy = Some(launch_policy);
         report.launched = Some(true);
-        Ok((sessions, report))
+        Ok((sessions, report, app, Some(launched_process)))
     }
 
     async fn existing_persistent_session(
@@ -730,6 +853,7 @@ impl CodexRefit {
         let mut sessions = self.connect_sessions(&new_manager_token(), None).await?;
         let result = async {
             self.prune_absent_sessions(&sessions)?;
+            self.progress.report(CodexRefitStage::InspectUsage);
             let mut report = lifecycle::status(&mut sessions).await?;
             let usable = report.targets.iter().all(|target| {
                 target.healthy
@@ -765,7 +889,7 @@ impl CodexRefit {
     fn prune_absent_sessions(&self, sessions: &[CodexSession]) -> Result<(), CodexRefitError> {
         let target_ids = sessions
             .iter()
-            .map(|session| session.cdp.target_id().to_owned())
+            .map(|session| session.target_id().to_owned())
             .collect::<Vec<_>>();
         self.state.remove_absent_targets(self.port, &target_ids)
     }
@@ -774,6 +898,36 @@ impl CodexRefit {
         report.port = self.port;
         report.renderer_assets = Some(self.payload.asset_info.clone());
         report
+    }
+
+    fn offline_disable_report(&self) -> Result<CodexRefitReport, CodexRefitError> {
+        let removed = self.state.remove_port(self.port)?;
+        let session_mode = removed
+            .first()
+            .map(|record| record.session_mode)
+            .filter(|mode| removed.iter().all(|record| record.session_mode == *mode));
+        let targets = removed
+            .into_iter()
+            .map(|record| {
+                let mut health =
+                    CodexTargetHealth::new(record.target_id, CodexRefitState::Disabled, true)
+                        .with_session_mode(record.session_mode)
+                        .with_detail(
+                            "renderer unavailable; removed the stale local managed marker",
+                        );
+                health.changed = true;
+                health
+            })
+            .collect();
+        Ok(CodexRefitReport {
+            operation: CodexRefitOperation::Disable,
+            port: self.port,
+            session_mode,
+            launch_policy: None,
+            launched: None,
+            renderer_assets: Some(self.payload.asset_info.clone()),
+            targets,
+        })
     }
 
     async fn stop_managed_session(&self) -> Result<(), CodexRefitError> {
@@ -798,420 +952,12 @@ impl CodexRefit {
     }
 }
 
-impl PersistentSupervisor {
-    async fn run(mut self) -> Result<(), CodexRefitError> {
-        let mut backoff = ReconnectBackoff::default();
-        loop {
-            let mut terminations = FuturesUnordered::new();
-            for session in &self.sessions {
-                terminations.push(wait_for_termination(session.cdp.termination_receiver()));
-            }
-            let termination = terminations
-                .next()
-                .await
-                .expect("validated persistent sessions cannot be empty");
-            tracing::info!(
-                target: "opsail_refit_codex",
-                ?termination,
-                "[opsail-refit-codex] managed renderer connection ended"
-            );
-            close_sessions(&mut self.sessions).await;
-
-            loop {
-                let delay = backoff.next_delay();
-                if self.wait_for_reconnect_or_app_exit(delay).await == RecoveryDecision::Stop {
-                    self.adapter
-                        .state
-                        .remove_absent_targets(self.adapter.port, &[])?;
-                    tracing::info!(
-                        target: "opsail_refit_codex",
-                        "[opsail-refit-codex] ChatGPT exited; managed session stopped"
-                    );
-                    return Ok(());
-                }
-                let attempt = async {
-                    let _operation_lock = self.adapter.state.try_operation_lock()?;
-                    self.adapter
-                        .connect_and_enable(SessionMode::Persistent, &self.manager_token, None)
-                        .await
-                }
-                .await;
-                match attempt {
-                    Ok((sessions, _)) => {
-                        self.sessions = sessions;
-                        backoff.reset();
-                        break;
-                    }
-                    Err(error) => tracing::warn!(
-                        target: "opsail_refit_codex",
-                        code = error.code().as_str(),
-                        retry_delay_ms = backoff.next.as_millis(),
-                        "[opsail-refit-codex] managed renderer reconnect failed"
-                    ),
-                }
-            }
-        }
-    }
-
-    async fn wait_for_reconnect_or_app_exit(&self, delay: Duration) -> RecoveryDecision {
-        let backend = Arc::clone(&self.adapter.launch_backend);
-        wait_for_reconnect_or_app_exit(delay, || {
-            let backend = Arc::clone(&backend);
-            async move {
-                match run_blocking(move || backend.app_is_running()).await {
-                    Ok(running) => running,
-                    Err(error) => {
-                        tracing::warn!(
-                            target: "opsail_refit_codex",
-                            code = error.code().as_str(),
-                            "[opsail-refit-codex] could not confirm ChatGPT process state"
-                        );
-                        true
-                    }
-                }
-            }
-        })
-        .await
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RecoveryDecision {
-    Reconnect,
-    Stop,
-}
-
-async fn wait_for_reconnect_or_app_exit<F, Fut>(
-    delay: Duration,
-    mut app_is_running: F,
-) -> RecoveryDecision
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    let deadline = Instant::now() + delay;
-    loop {
-        if !app_is_running().await {
-            return RecoveryDecision::Stop;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return RecoveryDecision::Reconnect;
-        }
-        sleep(remaining.min(APP_EXIT_CHECK_INTERVAL)).await;
-    }
-}
-
-fn new_manager_token() -> String {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!(
-        "opsail-refit-codex:{}:{timestamp}:{sequence}",
-        std::process::id()
-    )
-}
-
-struct CodexSession {
-    cdp: CdpSession,
-    port: u16,
-    state: StateStore,
-    payload: Arc<UsagePayload>,
-    manager_token: String,
-    owned_script_identifiers: Vec<String>,
-}
-
-impl ManagedSession for CodexSession {
-    fn target_id(&self) -> &str {
-        self.cdp.target_id()
-    }
-
-    fn health(&mut self) -> SessionFuture<'_, Result<CodexTargetHealth, CodexRefitError>> {
-        Box::pin(async move {
-            let runtime = renderer_status(&mut self.cdp, &self.payload).await?;
-            let target_id = self.cdp.target_id().to_owned();
-            let record =
-                self.state
-                    .current_record(self.port, &target_id, &self.payload.revision)?;
-            let diagnostics = runtime.diagnostics.as_ref();
-            let detected_mode = diagnostics
-                .map(|value| value.session_mode)
-                .or_else(|| record.as_ref().map(|value| value.session_mode));
-            let lifecycle_healthy = match diagnostics.map(|value| value.session_mode) {
-                Some(SessionMode::Once) => record.is_none(),
-                Some(SessionMode::Persistent) => {
-                    self.state.managed_session_active()?
-                        && record.as_ref().is_some_and(|record| {
-                            record.session_mode == SessionMode::Persistent
-                                && diagnostics.is_some_and(|diagnostics| {
-                                    record.manager_token == diagnostics.manager_token
-                                })
-                        })
-                }
-                None => false,
-            };
-            let diagnostics_healthy = diagnostics.is_some_and(|diagnostics| {
-                diagnostics.installed
-                    && diagnostics.mode == "usage"
-                    && diagnostics.revision == self.payload.revision
-                    && diagnostics.host_count <= 1
-                    && diagnostics.style_count == 1
-                    && diagnostics.details_count == 1
-                    && diagnostics.listener_count == USAGE_RUNTIME_LISTENER_COUNT
-                    && diagnostics.mutation_observer
-                    && diagnostics.resize_observer
-                    && diagnostics.refresh_timer
-                    && diagnostics.bridge_available
-                    && diagnostics.dom_adapter_version == DOM_ADAPTER_API_VERSION
-            });
-            if runtime.installed
-                && runtime.revision.as_deref() == Some(&self.payload.revision)
-                && lifecycle_healthy
-                && diagnostics_healthy
-            {
-                let data_state = runtime
-                    .diagnostics
-                    .as_ref()
-                    .map(|diagnostics| diagnostics.data_state.as_str());
-                let stale = matches!(data_state, Some("stale" | "unavailable"));
-                let mut health = CodexTargetHealth::new(
-                    target_id,
-                    if stale {
-                        CodexRefitState::Stale
-                    } else {
-                        CodexRefitState::Enabled
-                    },
-                    true,
-                );
-                if let Some(mode) = detected_mode {
-                    health = health.with_session_mode(mode);
-                }
-                return Ok(if stale {
-                    health.with_detail(
-                        "the usage UI is installed but its local account data is unavailable or stale",
-                    )
-                } else {
-                    health
-                });
-            }
-            if !runtime.installed
-                && record.is_none()
-                && runtime.host_count == 0
-                && runtime.style_count == 0
-                && runtime.details_count == 0
-            {
-                return Ok(CodexTargetHealth::new(
-                    target_id,
-                    CodexRefitState::Disabled,
-                    true,
-                ));
-            }
-            let mut health = CodexTargetHealth::new(target_id, CodexRefitState::Stale, false)
-                .with_detail("renderer state and its session lifecycle require reconciliation");
-            if let Some(mode) = detected_mode {
-                health = health.with_session_mode(mode);
-            }
-            Ok(health)
-        })
-    }
-
-    fn enable(&mut self, mode: SessionMode) -> SessionFuture<'_, Result<(), CodexRefitError>> {
-        Box::pin(async move {
-            let target_id = self.cdp.target_id().to_owned();
-            for identifier in std::mem::take(&mut self.owned_script_identifiers) {
-                self.cdp.remove_script(&identifier).await?;
-            }
-            match mode {
-                SessionMode::Once => self.state.remove(self.port, &target_id)?,
-                SessionMode::Persistent => {
-                    let identifier = self
-                        .cdp
-                        .add_script(&self.payload.early(&self.manager_token))
-                        .await?;
-                    self.owned_script_identifiers.push(identifier.clone());
-                    let record = TargetRecord {
-                        port: self.port,
-                        target_id: target_id.clone(),
-                        revision: self.payload.revision.clone(),
-                        session_mode: SessionMode::Persistent,
-                        manager_token: self.manager_token.clone(),
-                        manager_pid: std::process::id(),
-                    };
-                    if let Err(error) = self.state.replace(record) {
-                        let _ = self.cdp.remove_script(&identifier).await;
-                        self.owned_script_identifiers.clear();
-                        let _ = self.cdp.evaluate(self.payload.disable()).await;
-                        return Err(error);
-                    }
-                }
-            }
-            if let Err(error) = self
-                .cdp
-                .evaluate(&self.payload.current(mode, &self.manager_token))
-                .await
-            {
-                for identifier in std::mem::take(&mut self.owned_script_identifiers) {
-                    let _ = self.cdp.remove_script(&identifier).await;
-                }
-                let _ = self.state.remove(self.port, &target_id);
-                let _ = self.cdp.evaluate(self.payload.disable()).await;
-                return Err(CodexRefitError::new(
-                    CodexRefitErrorCode::InjectionFailed,
-                    error.to_string(),
-                ));
-            }
-            Ok(())
-        })
-    }
-
-    fn disable(&mut self) -> SessionFuture<'_, Result<(), CodexRefitError>> {
-        Box::pin(async move {
-            let target_id = self.cdp.target_id().to_owned();
-            let mut script_error = None;
-            for identifier in std::mem::take(&mut self.owned_script_identifiers) {
-                if let Err(error) = self.cdp.remove_script(&identifier).await
-                    && script_error.is_none()
-                {
-                    script_error = Some(error);
-                }
-            }
-            let state_error = self.state.remove(self.port, &target_id).err();
-            let cleanup_value =
-                self.cdp
-                    .evaluate(self.payload.disable())
-                    .await
-                    .map_err(|error| {
-                        if error.code() == CodexRefitErrorCode::InjectionFailed {
-                            CodexRefitError::new(
-                                CodexRefitErrorCode::CleanupFailed,
-                                error.to_string(),
-                            )
-                        } else {
-                            error
-                        }
-                    })?;
-            let cleanup: CleanupResult = serde_json::from_value(cleanup_value).map_err(|_| {
-                CodexRefitError::new(
-                    CodexRefitErrorCode::CleanupFailed,
-                    "the renderer returned an invalid cleanup result",
-                )
-            })?;
-            if !cleanup.clean {
-                return Err(CodexRefitError::new(
-                    CodexRefitErrorCode::CleanupFailed,
-                    "the renderer still contains refit artifacts after cleanup",
-                ));
-            }
-            if let Some(error) = script_error {
-                return Err(error);
-            }
-            if let Some(error) = state_error {
-                return Err(error);
-            }
-            Ok(())
-        })
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RendererProbe {
-    app_protocol: bool,
-    shell: bool,
-    sidebar: bool,
-    bridge: bool,
-    dom_adapter_version: u64,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RendererStatus {
-    installed: bool,
-    revision: Option<String>,
-    diagnostics: Option<RendererDiagnostics>,
-    host_count: usize,
-    style_count: usize,
-    details_count: usize,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct RendererDiagnostics {
-    installed: bool,
-    mode: String,
-    session_mode: SessionMode,
-    manager_token: String,
-    revision: String,
-    host_count: usize,
-    style_count: usize,
-    details_count: usize,
-    listener_count: usize,
-    mutation_observer: bool,
-    resize_observer: bool,
-    refresh_timer: bool,
-    bridge_available: bool,
-    #[serde(default)]
-    dom_adapter_version: u64,
-    #[serde(default)]
-    data_state: String,
-}
-
-#[derive(Deserialize)]
-struct CleanupResult {
-    clean: bool,
-}
-
-async fn probe_renderer(
-    session: &mut CdpSession,
-    payload: &UsagePayload,
-) -> Result<(), CodexRefitError> {
-    let probe: RendererProbe = serde_json::from_value(
-        session.evaluate(payload.renderer_probe()).await?,
-    )
-    .map_err(|_| {
-        CodexRefitError::new(
-            CodexRefitErrorCode::TargetValidationFailed,
-            "the renderer returned an invalid identity probe",
+fn can_cleanup_offline(code: CodexRefitErrorCode, listener_present: bool) -> bool {
+    !listener_present
+        && matches!(
+            code,
+            CodexRefitErrorCode::SessionUnavailable | CodexRefitErrorCode::TargetNotFound
         )
-    })?;
-    if probe.dom_adapter_version != DOM_ADAPTER_API_VERSION
-        || !probe.app_protocol
-        || !probe.shell
-        || !probe.sidebar
-    {
-        return Err(CodexRefitError::new(
-            CodexRefitErrorCode::TargetValidationFailed,
-            "the renderer does not match the expected app shell and sidebar",
-        ));
-    }
-    if !probe.bridge {
-        return Err(CodexRefitError::new(
-            CodexRefitErrorCode::BridgeUnavailable,
-            "the renderer does not expose the expected local account bridge",
-        ));
-    }
-    Ok(())
-}
-
-async fn renderer_status(
-    session: &mut CdpSession,
-    payload: &UsagePayload,
-) -> Result<RendererStatus, CodexRefitError> {
-    serde_json::from_value(session.evaluate(&payload.status()).await?).map_err(|_| {
-        CodexRefitError::new(
-            CodexRefitErrorCode::Stale,
-            "the renderer returned an invalid refit health result",
-        )
-    })
-}
-
-async fn close_sessions(sessions: &mut [CodexSession]) {
-    for session in sessions {
-        session.cdp.close().await;
-    }
 }
 
 async fn run_blocking<T, F>(operation: F) -> Result<T, CodexRefitError>
@@ -1258,6 +1004,7 @@ fn doctor_report(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use futures_util::{SinkExt as _, StreamExt as _};
@@ -1389,7 +1136,8 @@ mod tests {
                 "refreshTimer": true,
                 "bridgeAvailable": true,
                 "domAdapterVersion": DOM_ADAPTER_API_VERSION,
-                "dataState": "ready"
+                "dataState": "ready",
+                "visible": true
             },
             "hostCount": 1,
             "styleCount": 1,
@@ -1422,6 +1170,74 @@ mod tests {
     #[test]
     fn public_default_debug_port_is_the_private_high_port() {
         assert_eq!(DEFAULT_CODEX_DEBUG_PORT, 55321);
+    }
+
+    #[test]
+    fn config_progress_handler_receives_bounded_lifecycle_stages() {
+        let directory = tempdir().unwrap();
+        let observed = Arc::new(Mutex::new(Vec::new()));
+        let progress_observed = Arc::clone(&observed);
+        CodexRefit::new(
+            CodexRefitConfig::default()
+                .with_state_dir(directory.path().to_owned())
+                .with_progress_handler(move |stage| {
+                    progress_observed.lock().unwrap().push(stage);
+                }),
+        )
+        .unwrap();
+        assert_eq!(
+            *observed.lock().unwrap(),
+            [CodexRefitStage::LoadRendererAssets]
+        );
+    }
+
+    #[test]
+    fn offline_cleanup_requires_an_absent_listener_and_a_missing_endpoint() {
+        assert!(can_cleanup_offline(
+            CodexRefitErrorCode::SessionUnavailable,
+            false,
+        ));
+        assert!(can_cleanup_offline(
+            CodexRefitErrorCode::TargetNotFound,
+            false,
+        ));
+        assert!(!can_cleanup_offline(
+            CodexRefitErrorCode::TargetValidationFailed,
+            false,
+        ));
+        assert!(!can_cleanup_offline(
+            CodexRefitErrorCode::SessionUnavailable,
+            true,
+        ));
+    }
+
+    #[test]
+    fn offline_disable_removes_only_local_markers_and_is_idempotent() {
+        let directory = tempdir().unwrap();
+        let adapter = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        adapter
+            .state
+            .replace(TargetRecord {
+                port: DEFAULT_CODEX_DEBUG_PORT,
+                target_id: "offline-renderer".to_owned(),
+                revision: adapter.payload.revision.clone(),
+                session_mode: SessionMode::Persistent,
+                manager_token: "opsail-refit-codex:offline".to_owned(),
+                manager_pid: 4242,
+            })
+            .unwrap();
+
+        let first = adapter.offline_disable_report().unwrap();
+        assert_eq!(first.operation, CodexRefitOperation::Disable);
+        assert_eq!(first.targets.len(), 1);
+        assert!(first.targets[0].healthy);
+        assert!(first.targets[0].changed);
+        assert_eq!(first.targets[0].state, CodexRefitState::Disabled);
+        let second = adapter.offline_disable_report().unwrap();
+        assert!(second.targets.is_empty());
     }
 
     #[tokio::test]
@@ -1495,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn force_never_allows_changed_javascript_to_reuse_a_version() {
+    async fn force_installs_changed_javascript_without_inflating_the_prerelease_version() {
         let directory = tempdir().unwrap();
         let mut adapter = CodexRefit::new(
             CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
@@ -1509,13 +1325,21 @@ mod tests {
             ),
         );
 
-        let error = adapter
+        let report = adapter
             .update_renderer_assets(RendererAssetUpdatePolicy::Force)
             .await
-            .unwrap_err();
-        assert_eq!(error.code(), CodexRefitErrorCode::UpdateFailed);
-        assert!(error.to_string().contains("higher assetVersion"));
-        assert_eq!(bundle_fetches.load(AtomicOrdering::Relaxed), 0);
+            .unwrap();
+        assert!(report.changed);
+        assert!(report.forced);
+        assert_eq!(report.installed.version, "1.0.0");
+        assert_eq!(report.installed.source, RendererAssetSource::Github);
+        assert_eq!(bundle_fetches.load(AtomicOrdering::Relaxed), 1);
+
+        let next = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        assert_eq!(next.payload.asset_info, report.installed);
     }
 
     #[tokio::test]
@@ -1569,6 +1393,18 @@ mod tests {
         assert!(expression.contains("location.protocol"));
         assert!(!expression.contains("fetch"));
         assert!(!expression.contains("account/rateLimits"));
+    }
+
+    #[tokio::test]
+    async fn launch_notice_uses_one_renderer_evaluation_and_reports_success() {
+        let payload = usage_payload().unwrap();
+        let (mut cdp, observed) = test_cdp_session(serde_json::json!({ "shown": true })).await;
+        assert!(show_launch_notice(&mut cdp, &payload).await.unwrap());
+        cdp.close().await;
+        let (methods, closed) = observed.await.unwrap();
+        assert_eq!(methods, ["Runtime.evaluate"]);
+        assert!(closed);
+        assert!(payload.launch_notice().contains("launch-notice"));
     }
 
     #[test]
@@ -1650,21 +1486,19 @@ mod tests {
             healthy_renderer_status(&payload, SessionMode::Once, token),
         ])
         .await;
-        let session = CodexSession {
-            cdp,
-            port: DEFAULT_CODEX_DEBUG_PORT,
-            state: state.clone(),
-            payload,
-            manager_token: token.to_owned(),
-            owned_script_identifiers: Vec::new(),
-        };
+        let session =
+            CodexSession::new(cdp, DEFAULT_CODEX_DEBUG_PORT, state.clone(), payload, token);
         let mut sessions = [session];
 
-        let report = lifecycle::enable(&mut sessions, SessionMode::Once)
-            .await
-            .unwrap();
+        let report = lifecycle::enable(
+            &mut sessions,
+            SessionMode::Once,
+            &ProgressReporter::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.session_mode, Some(SessionMode::Once));
-        sessions[0].cdp.close().await;
+        sessions[0].close().await;
         let (methods, closed) = observed.await.unwrap();
         assert_eq!(
             methods,
@@ -1690,17 +1524,16 @@ mod tests {
         let directory = tempdir().unwrap();
         let state = StateStore::new(directory.path().to_owned());
         let (cdp, observed) = test_cdp_session(serde_json::json!({ "clean": true })).await;
-        let mut session = CodexSession {
+        let mut session = CodexSession::new(
             cdp,
-            port: DEFAULT_CODEX_DEBUG_PORT,
+            DEFAULT_CODEX_DEBUG_PORT,
             state,
-            payload: Arc::new(usage_payload().unwrap()),
-            manager_token: "opsail-refit-codex:test-disable".to_owned(),
-            owned_script_identifiers: Vec::new(),
-        };
+            Arc::new(usage_payload().unwrap()),
+            "opsail-refit-codex:test-disable",
+        );
 
         session.disable().await.unwrap();
-        session.cdp.close().await;
+        session.close().await;
         let (methods, closed) = observed.await.unwrap();
         assert_eq!(methods, ["Runtime.evaluate"]);
         assert!(closed);
@@ -1726,10 +1559,14 @@ mod tests {
     #[tokio::test]
     async fn disconnected_manager_stops_immediately_when_chatgpt_is_gone() {
         let inspections = AtomicUsize::new(0);
-        let decision = wait_for_reconnect_or_app_exit(Duration::from_secs(30), || {
-            inspections.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(false)
-        })
+        let decision = wait_for_reconnect_or_app_exit(
+            Duration::from_secs(30),
+            || {
+                inspections.fetch_add(1, AtomicOrdering::Relaxed);
+                std::future::ready(false)
+            },
+            std::future::pending(),
+        )
         .await;
 
         assert_eq!(decision, RecoveryDecision::Stop);
@@ -1739,14 +1576,18 @@ mod tests {
     #[tokio::test]
     async fn disconnected_manager_retries_when_chatgpt_is_still_running() {
         let inspections = AtomicUsize::new(0);
-        let decision = wait_for_reconnect_or_app_exit(Duration::from_millis(1), || {
-            inspections.fetch_add(1, AtomicOrdering::Relaxed);
-            std::future::ready(true)
-        })
+        let decision = wait_for_reconnect_or_app_exit(
+            Duration::from_millis(1),
+            || {
+                inspections.fetch_add(1, AtomicOrdering::Relaxed);
+                std::future::ready(true)
+            },
+            std::future::pending(),
+        )
         .await;
 
         assert_eq!(decision, RecoveryDecision::Reconnect);
-        assert!(inspections.load(AtomicOrdering::Relaxed) >= 1);
+        assert_eq!(inspections.load(AtomicOrdering::Relaxed), 2);
     }
 
     #[test]
@@ -1770,6 +1611,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_distinguishes_unavailable_data_from_missing_layout() {
+        let directory = tempdir().unwrap();
+        let state = StateStore::new(directory.path().to_owned());
+        let payload = Arc::new(usage_payload().unwrap());
+        let token = "opsail-refit-codex:diagnostic-health";
+
+        let mut unavailable = healthy_renderer_status(&payload, SessionMode::Once, token);
+        unavailable["diagnostics"]["dataState"] = serde_json::json!("unavailable");
+        unavailable["diagnostics"]["visible"] = serde_json::json!(false);
+        let (cdp, _) = test_cdp_session(unavailable).await;
+        let mut session = CodexSession::new(
+            cdp,
+            DEFAULT_CODEX_DEBUG_PORT,
+            state.clone(),
+            Arc::clone(&payload),
+            token,
+        );
+        let health = session.health().await.unwrap();
+        assert!(health.healthy);
+        assert_eq!(health.state, CodexRefitState::Stale);
+        assert!(
+            health
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("no valid rate-limit window")
+        );
+        session.close().await;
+
+        let mut no_layout = healthy_renderer_status(&payload, SessionMode::Once, token);
+        no_layout["diagnostics"]["visible"] = serde_json::json!(false);
+        let (cdp, _) = test_cdp_session(no_layout).await;
+        let mut session = CodexSession::new(cdp, DEFAULT_CODEX_DEBUG_PORT, state, payload, token);
+        let health = session.health().await.unwrap();
+        assert!(health.healthy);
+        assert_eq!(health.state, CodexRefitState::Stale);
+        assert!(
+            health
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("safe account-row placement")
+        );
+        session.close().await;
+    }
+
+    #[tokio::test]
     async fn status_distinguishes_once_managed_and_disconnected_managed_sessions() {
         let directory = tempdir().unwrap();
         let state = StateStore::new(directory.path().to_owned());
@@ -1782,33 +1670,31 @@ mod tests {
             once_token,
         ))
         .await;
-        let mut once = CodexSession {
+        let mut once = CodexSession::new(
             cdp,
-            port: DEFAULT_CODEX_DEBUG_PORT,
-            state: state.clone(),
-            payload: Arc::clone(&payload),
-            manager_token: once_token.to_owned(),
-            owned_script_identifiers: Vec::new(),
-        };
+            DEFAULT_CODEX_DEBUG_PORT,
+            state.clone(),
+            Arc::clone(&payload),
+            once_token,
+        );
         let once_health = once.health().await.unwrap();
         assert!(once_health.healthy);
         assert_eq!(once_health.session_mode, Some(SessionMode::Once));
-        once.cdp.close().await;
+        once.close().await;
 
         let (cdp, _) = test_cdp_session(disabled_renderer_status()).await;
-        let mut reloaded_once = CodexSession {
+        let mut reloaded_once = CodexSession::new(
             cdp,
-            port: DEFAULT_CODEX_DEBUG_PORT,
-            state: state.clone(),
-            payload: Arc::clone(&payload),
-            manager_token: once_token.to_owned(),
-            owned_script_identifiers: Vec::new(),
-        };
+            DEFAULT_CODEX_DEBUG_PORT,
+            state.clone(),
+            Arc::clone(&payload),
+            once_token,
+        );
         let reloaded_health = reloaded_once.health().await.unwrap();
         assert!(reloaded_health.healthy);
         assert_eq!(reloaded_health.state, CodexRefitState::Disabled);
         assert_eq!(reloaded_health.session_mode, None);
-        reloaded_once.cdp.close().await;
+        reloaded_once.close().await;
 
         let persistent_token = "opsail-refit-codex:persistent-health";
         state
@@ -1828,18 +1714,17 @@ mod tests {
             persistent_token,
         ))
         .await;
-        let mut persistent = CodexSession {
+        let mut persistent = CodexSession::new(
             cdp,
-            port: DEFAULT_CODEX_DEBUG_PORT,
-            state: state.clone(),
-            payload: Arc::clone(&payload),
-            manager_token: persistent_token.to_owned(),
-            owned_script_identifiers: Vec::new(),
-        };
+            DEFAULT_CODEX_DEBUG_PORT,
+            state.clone(),
+            Arc::clone(&payload),
+            persistent_token,
+        );
         let managed_health = persistent.health().await.unwrap();
         assert!(managed_health.healthy);
         assert_eq!(managed_health.session_mode, Some(SessionMode::Persistent));
-        persistent.cdp.close().await;
+        persistent.close().await;
 
         drop(managed_lock);
         let (cdp, _) = test_cdp_session(healthy_renderer_status(
@@ -1848,14 +1733,13 @@ mod tests {
             persistent_token,
         ))
         .await;
-        let mut disconnected = CodexSession {
+        let mut disconnected = CodexSession::new(
             cdp,
-            port: DEFAULT_CODEX_DEBUG_PORT,
+            DEFAULT_CODEX_DEBUG_PORT,
             state,
             payload,
-            manager_token: persistent_token.to_owned(),
-            owned_script_identifiers: Vec::new(),
-        };
+            persistent_token,
+        );
         let disconnected_health = disconnected.health().await.unwrap();
         assert!(!disconnected_health.healthy);
         assert_eq!(disconnected_health.state, CodexRefitState::Stale);
@@ -1863,7 +1747,7 @@ mod tests {
             disconnected_health.session_mode,
             Some(SessionMode::Persistent)
         );
-        disconnected.cdp.close().await;
+        disconnected.close().await;
     }
 
     #[test]
@@ -1881,7 +1765,7 @@ mod tests {
         assert!(GUIDE.contains("`once` (ephemeral)"));
         assert!(GUIDE.contains("detached manager"));
         assert!(GUIDE.contains("ChatGPT has exited"));
-        assert!(GUIDE.contains("there is no steady-state process polling"));
+        assert!(GUIDE.contains("there is no timer or process polling while the socket is healthy"));
         assert!(GUIDE.contains("--foreground"));
     }
 }

@@ -14,12 +14,12 @@ use crate::error::{CodexRefitError, CodexRefitErrorCode};
 use crate::model::{RendererAssetInfo, RendererAssetSource};
 
 pub(crate) const RENDERER_ASSET_API_VERSION: u32 = 1;
-pub(crate) const RENDERER_ASSET_FILES: [&str; 4] = [
-    "opsail-refit-codex-dom-adapter.js",
-    "opsail-refit-codex-renderer-control.js",
-    "opsail-refit-codex-usage-model.js",
-    "opsail-refit-codex-usage-runtime.js",
-];
+pub(crate) const DOM_ADAPTER_FILE: &str = "opsail-refit-codex-dom-adapter.js";
+pub(crate) const CONTROL_FILE: &str = "opsail-refit-codex-renderer-control.js";
+pub(crate) const MODEL_FILE: &str = "opsail-refit-codex-usage-model.js";
+pub(crate) const RUNTIME_FILE: &str = "opsail-refit-codex-usage-runtime.js";
+pub(crate) const RENDERER_ASSET_FILES: [&str; 4] =
+    [DOM_ADAPTER_FILE, CONTROL_FILE, MODEL_FILE, RUNTIME_FILE];
 
 const MANIFEST_SCHEMA_VERSION: u32 = 1;
 const CURRENT_POINTER_SCHEMA_VERSION: u32 = 1;
@@ -30,22 +30,28 @@ const EMBEDDED_MANIFEST: &str = include_str!("../assets/opsail-refit-codex-updat
 
 const EMBEDDED_SOURCES: [(&str, &str); 4] = [
     (
-        "opsail-refit-codex-dom-adapter.js",
+        DOM_ADAPTER_FILE,
         include_str!("../assets/opsail-refit-codex-dom-adapter.js"),
     ),
     (
-        "opsail-refit-codex-renderer-control.js",
+        CONTROL_FILE,
         include_str!("../assets/opsail-refit-codex-renderer-control.js"),
     ),
     (
-        "opsail-refit-codex-usage-model.js",
+        MODEL_FILE,
         include_str!("../assets/opsail-refit-codex-usage-model.js"),
     ),
     (
-        "opsail-refit-codex-usage-runtime.js",
+        RUNTIME_FILE,
         include_str!("../assets/opsail-refit-codex-usage-runtime.js"),
     ),
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RendererAssetInstallPolicy {
+    Strict,
+    AllowSameVersionChange,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -53,7 +59,6 @@ pub(crate) struct RendererAssetManifest {
     schema_version: u32,
     asset_version: String,
     api_version: u32,
-    minimum_opsail_version: String,
     files: Vec<RendererAssetFile>,
 }
 
@@ -221,14 +226,6 @@ impl RendererAssetManifest {
                 "renderer asset version must be a stable semantic version",
             ));
         }
-        let minimum = parse_version(&self.minimum_opsail_version, "minimum Opsail")?;
-        let current = Version::parse(env!("CARGO_PKG_VERSION"))
-            .expect("the package version is valid semantic versioning");
-        if minimum > current {
-            return Err(update_error(
-                "renderer asset bundle requires a newer Opsail version",
-            ));
-        }
         if self.files.len() != RENDERER_ASSET_FILES.len() {
             return Err(update_error(
                 "renderer asset manifest does not contain the exact JavaScript allowlist",
@@ -297,30 +294,12 @@ impl RendererAssetStore {
     pub(crate) fn load_or_embedded(&self) -> Result<RendererAssetSelection, CodexRefitError> {
         let embedded = embedded_bundle()?;
         match self.load_installed() {
-            Ok(Some(installed)) if installed.version() > embedded.version() => {
+            Ok(Some(installed)) if installed.version() >= embedded.version() => {
                 Ok(RendererAssetSelection {
                     info: installed.info(RendererAssetSource::Github),
                     bundle: installed,
                     warning: None,
                 })
-            }
-            Ok(Some(installed)) if installed.version() == embedded.version() => {
-                if installed.identity() == embedded.identity() {
-                    Ok(RendererAssetSelection {
-                        info: installed.info(RendererAssetSource::Github),
-                        bundle: installed,
-                        warning: None,
-                    })
-                } else {
-                    Ok(RendererAssetSelection {
-                        info: embedded.info(RendererAssetSource::Embedded),
-                        bundle: embedded,
-                        warning: Some(
-                            "ignored an installed renderer bundle that reused an embedded version"
-                                .to_owned(),
-                        ),
-                    })
-                }
             }
             Ok(Some(_)) => Ok(RendererAssetSelection {
                 info: embedded.info(RendererAssetSource::Embedded),
@@ -348,6 +327,7 @@ impl RendererAssetStore {
     pub(crate) fn install(
         &self,
         candidate: &RendererAssetBundle,
+        policy: RendererAssetInstallPolicy,
     ) -> Result<RendererAssetInstall, CodexRefitError> {
         let previous = self.load_or_embedded()?;
         let installed_state = self.load_installed();
@@ -357,7 +337,10 @@ impl RendererAssetStore {
                 "renderer asset downgrade was rejected by version policy",
             ));
         }
-        if ordering.is_eq() && candidate.identity() != previous.bundle.identity() {
+        if ordering.is_eq()
+            && candidate.identity() != previous.bundle.identity()
+            && policy != RendererAssetInstallPolicy::AllowSameVersionChange
+        {
             return Err(update_error(
                 "renderer asset version was reused with different contents",
             ));
@@ -369,7 +352,8 @@ impl RendererAssetStore {
         );
         let embedded_without_pointer = matches!(&installed_state, Ok(None))
             && previous.info.source == RendererAssetSource::Embedded
-            && ordering.is_eq();
+            && ordering.is_eq()
+            && candidate.identity() == previous.bundle.identity();
         if installed_matches || embedded_without_pointer {
             return Ok(RendererAssetInstall {
                 installed: previous.info,
@@ -759,10 +743,9 @@ mod tests {
     }
 
     #[test]
-    fn manifest_rejects_incompatible_or_non_stable_versions() {
+    fn manifest_rejects_incompatible_api_or_non_stable_asset_versions() {
         for (field, value) in [
             ("apiVersion", serde_json::json!(2)),
-            ("minimumOpsailVersion", serde_json::json!("99.0.0")),
             ("assetVersion", serde_json::json!("1.1.0-beta.1")),
         ] {
             let mut manifest: serde_json::Value = serde_json::from_str(EMBEDDED_MANIFEST).unwrap();
@@ -781,7 +764,9 @@ mod tests {
         let directory = tempdir().unwrap();
         let store = RendererAssetStore::new(directory.path().to_owned());
         let candidate = bundle_with_version("1.1.0");
-        let install = store.install(&candidate).unwrap();
+        let install = store
+            .install(&candidate, RendererAssetInstallPolicy::Strict)
+            .unwrap();
         assert!(install.changed);
         assert_eq!(install.installed.version, "1.1.0");
 
@@ -815,7 +800,12 @@ mod tests {
         assert_eq!(fallback.info.source, RendererAssetSource::Embedded);
         assert!(fallback.warning.is_some());
 
-        let install = store.install(&embedded_bundle().unwrap()).unwrap();
+        let install = store
+            .install(
+                &embedded_bundle().unwrap(),
+                RendererAssetInstallPolicy::Strict,
+            )
+            .unwrap();
         assert!(install.changed);
         assert_eq!(install.installed.source, RendererAssetSource::Github);
         assert!(store.load_or_embedded().unwrap().warning.is_none());
@@ -835,7 +825,10 @@ mod tests {
         assert!(selection.warning.is_some());
         assert_eq!(
             store
-                .install(&bundle_with_version("1.1.0"))
+                .install(
+                    &bundle_with_version("1.1.0"),
+                    RendererAssetInstallPolicy::Strict,
+                )
                 .unwrap_err()
                 .code(),
             CodexRefitErrorCode::UpdateFailed
@@ -844,23 +837,42 @@ mod tests {
     }
 
     #[test]
-    fn version_policy_rejects_downgrades_and_same_version_content_reuse() {
+    fn version_policy_rejects_downgrades_and_requires_opt_in_for_same_version_changes() {
         let directory = tempdir().unwrap();
         let store = RendererAssetStore::new(directory.path().to_owned());
-        store.install(&bundle_with_version("1.2.0")).unwrap();
+        store
+            .install(
+                &bundle_with_version("1.2.0"),
+                RendererAssetInstallPolicy::Strict,
+            )
+            .unwrap();
         assert_eq!(
             store
-                .install(&bundle_with_version("1.1.0"))
+                .install(
+                    &bundle_with_version("1.1.0"),
+                    RendererAssetInstallPolicy::Strict,
+                )
                 .unwrap_err()
                 .code(),
             CodexRefitErrorCode::UpdateFailed
         );
 
-        let mut conflicting = bundle_with_version("1.2.0");
-        conflicting.manifest.minimum_opsail_version = "0.0.1".to_owned();
+        let conflicting = test_bundle_with_change("1.2.0", Some(MODEL_FILE));
         assert_eq!(
-            store.install(&conflicting).unwrap_err().code(),
+            store
+                .install(&conflicting, RendererAssetInstallPolicy::Strict)
+                .unwrap_err()
+                .code(),
             CodexRefitErrorCode::UpdateFailed
         );
+
+        let install = store
+            .install(
+                &conflicting,
+                RendererAssetInstallPolicy::AllowSameVersionChange,
+            )
+            .unwrap();
+        assert!(install.changed);
+        assert_eq!(store.load_or_embedded().unwrap().info.version, "1.2.0");
     }
 }

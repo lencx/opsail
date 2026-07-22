@@ -1,9 +1,11 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::ProgressReporter;
 use crate::error::{CodexRefitError, CodexRefitErrorCode};
 use crate::model::{
-    CodexRefitOperation, CodexRefitReport, CodexRefitState, CodexTargetHealth, SessionMode,
+    CodexRefitOperation, CodexRefitReport, CodexRefitStage, CodexRefitState, CodexTargetHealth,
+    SessionMode,
 };
 
 pub(crate) type SessionFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -18,6 +20,7 @@ pub(crate) trait ManagedSession: Send {
 pub(crate) async fn enable<S>(
     sessions: &mut [S],
     mode: SessionMode,
+    progress: &ProgressReporter,
 ) -> Result<CodexRefitReport, CodexRefitError>
 where
     S: ManagedSession,
@@ -33,11 +36,15 @@ where
             }
         };
         let should_change = !is_usable_enabled(&before, mode);
-        if should_change && let Err(error) = sessions[index].enable(mode).await {
-            let _ = sessions[index].disable().await;
-            rollback(sessions, &changed).await;
-            return Err(error);
+        if should_change {
+            progress.report(CodexRefitStage::InjectUsage);
+            if let Err(error) = sessions[index].enable(mode).await {
+                let _ = sessions[index].disable().await;
+                rollback(sessions, &changed).await;
+                return Err(error);
+            }
         }
+        progress.report(CodexRefitStage::ConfirmHealth);
         let mut after = match sessions[index].health().await {
             Ok(health) => health,
             Err(error) => {
@@ -295,15 +302,16 @@ mod tests {
     #[tokio::test]
     async fn repeated_enable_and_disable_are_idempotent() {
         let (mut sessions, state) = sessions(&["renderer"]);
+        let progress = ProgressReporter::default();
         assert!(
-            enable(&mut sessions, SessionMode::Persistent)
+            enable(&mut sessions, SessionMode::Persistent, &progress)
                 .await
                 .unwrap()
                 .targets[0]
                 .changed
         );
         assert!(
-            !enable(&mut sessions, SessionMode::Persistent)
+            !enable(&mut sessions, SessionMode::Persistent, &progress)
                 .await
                 .unwrap()
                 .targets[0]
@@ -333,9 +341,13 @@ mod tests {
     async fn partial_enable_failure_rolls_back_prior_target() {
         let (mut sessions, state) = sessions(&["first", "second"]);
         state.lock().unwrap().fail_enable = Some("second".to_owned());
-        let error = enable(&mut sessions, SessionMode::Persistent)
-            .await
-            .unwrap_err();
+        let error = enable(
+            &mut sessions,
+            SessionMode::Persistent,
+            &ProgressReporter::default(),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.code(), CodexRefitErrorCode::InjectionFailed);
 
         let state = state.lock().unwrap();
@@ -346,7 +358,13 @@ mod tests {
     #[tokio::test]
     async fn once_enable_reports_the_ephemeral_session_mode() {
         let (mut sessions, _) = sessions(&["renderer"]);
-        let report = enable(&mut sessions, SessionMode::Once).await.unwrap();
+        let report = enable(
+            &mut sessions,
+            SessionMode::Once,
+            &ProgressReporter::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(report.session_mode, Some(SessionMode::Once));
         assert_eq!(report.targets[0].session_mode, Some(SessionMode::Once));
     }

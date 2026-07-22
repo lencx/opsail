@@ -100,6 +100,65 @@
   gap: 8px;
 }
 
+#opsail-refit-codex-launch-notice {
+  box-sizing: border-box;
+  position: fixed;
+  z-index: var(--opsail-refit-usage-notice-layer, 1100);
+  top: 30%;
+  left: 50%;
+  display: grid;
+  width: max-content;
+  max-width: calc(100vw - 32px);
+  gap: 2px;
+  padding: 10px 14px;
+  transform: translate(-50%, -50%);
+  border: 1px solid var(--color-token-activity-bar-badge-background, var(--color-token-progress-bar-background, CanvasText));
+  border-radius: 10px;
+  background: var(--color-token-activity-bar-badge-background, var(--color-token-progress-bar-background, CanvasText));
+  box-shadow: var(--elevation-sidebar, none);
+  color: var(--color-token-activity-bar-badge-foreground, var(--color-token-foreground, Canvas));
+  cursor: default;
+  font: inherit;
+  line-height: 1.4;
+  pointer-events: none;
+  text-align: center;
+  animation: opsail-refit-codex-launch-notice 2800ms ease both;
+}
+
+.opsail-refit-codex-launch-notice-title,
+.opsail-refit-codex-launch-notice-message {
+  display: block;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.opsail-refit-codex-launch-notice-title {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.opsail-refit-codex-launch-notice-message {
+  color: inherit;
+  font-size: 11px;
+}
+
+@keyframes opsail-refit-codex-launch-notice {
+  0% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.98);
+  }
+
+  12%, 82% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1);
+  }
+
+  100% {
+    opacity: 0;
+    transform: translate(-50%, -50%) scale(0.98);
+  }
+}
+
 .opsail-refit-codex-usage-stale {
   overflow-wrap: anywhere;
   color: var(--color-token-description-foreground, var(--color-text-foreground-tertiary, currentColor));
@@ -223,6 +282,15 @@
   text-align: end;
 }
 
+.opsail-refit-codex-time-format-note {
+  margin: 0;
+  overflow-wrap: anywhere;
+  color: var(--color-token-description-foreground, var(--color-text-foreground-tertiary, currentColor));
+  font-size: 9px;
+  line-height: 13px;
+  white-space: normal;
+}
+
 .opsail-refit-codex-visually-hidden {
   position: absolute;
   width: 1px;
@@ -235,7 +303,9 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .opsail-refit-codex-usage-track > i {
+  .opsail-refit-codex-usage-track > i,
+  #opsail-refit-codex-launch-notice {
     transition: none;
+    animation: none;
   }
 }

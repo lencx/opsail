@@ -61,6 +61,7 @@ npm run pack:check --prefix packages/node
 - 新增或更新能够证明行为变化的最小测试。
 - 提取 fixture 必须自包含。完整 Markdown golden 的变化需要人工审阅，测试不得自动更新它们。
 - 默认测试保持离线；HTTP 行为使用本地 mock server 测试。
+- 每个 Rust crate 都应显式声明版本并独立管理；仅在该 crate 的发布契约发生变化时升级，同时明确更新依赖方的版本约束。
 - stdout 始终作为数据通道，stderr 始终作为诊断通道。
 - 除非修改 `schemaVersion`，JSON schema 只做兼容性字段扩展。
 - 获取的 HTML、元数据、链接和提取文本均视为不可信输入。

@@ -1,5 +1,31 @@
 use serde::{Deserialize, Serialize};
 
+/// A bounded lifecycle milestone suitable for interactive CLI feedback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum CodexRefitStage {
+    LoadRendererAssets,
+    FetchUpdateManifest,
+    DownloadRendererAssets,
+    InstallRendererAssets,
+    ValidateApplication,
+    InspectEndpoint,
+    ValidateListener,
+    DiscoverRenderer,
+    ValidateRenderer,
+    CheckLaunchReadiness,
+    LaunchApplication,
+    WaitForEndpoint,
+    InspectUsage,
+    InjectUsage,
+    ConfirmHealth,
+    StartManager,
+    StopManager,
+    CleanupUsage,
+    RunDiagnostics,
+}
+
 /// Lifetime policy for an enabled Codex renderer refit.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -119,7 +145,7 @@ pub enum RendererAssetUpdatePolicy {
     /// Validate the latest release, but require explicit confirmation for changed JavaScript.
     #[default]
     RequireUnchanged,
-    /// Allow a verified, non-downgrade bundle with changed JavaScript to be installed.
+    /// Allow a validated, non-downgrade bundle with changed JavaScript to be installed.
     Force,
 }
 

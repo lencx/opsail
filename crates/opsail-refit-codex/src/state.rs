@@ -215,6 +215,23 @@ impl StateStore {
         self.persist(&document)
     }
 
+    pub fn remove_port(&self, port: u16) -> Result<Vec<TargetRecord>, CodexRefitError> {
+        let mut document = self.read()?;
+        let mut removed = Vec::new();
+        document.records.retain(|record| {
+            if record.port == port {
+                removed.push(record.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if !removed.is_empty() {
+            self.persist(&document)?;
+        }
+        Ok(removed)
+    }
+
     pub fn remove_absent_targets(
         &self,
         port: u16,
@@ -480,5 +497,21 @@ mod tests {
             .unwrap();
         assert_eq!(store.records_for(55321, "active").unwrap().len(), 1);
         assert!(store.records_for(55321, "gone").unwrap().is_empty());
+    }
+
+    #[test]
+    fn removing_a_port_returns_stale_markers_and_is_repeatable() {
+        let directory = tempdir().unwrap();
+        let store = StateStore::new(directory.path().to_owned());
+        store.replace(record("first", "manager-1")).unwrap();
+        let mut other = record("other-port", "manager-2");
+        other.port = 55322;
+        store.replace(other).unwrap();
+
+        let removed = store.remove_port(55321).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0].target_id, "first");
+        assert!(store.remove_port(55321).unwrap().is_empty());
+        assert_eq!(store.records_for(55322, "other-port").unwrap().len(), 1);
     }
 }

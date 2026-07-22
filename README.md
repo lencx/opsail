@@ -45,6 +45,8 @@ opsail refit codex enable usage --launch
 
 Persistent mode starts a validated background manager and returns after its health report; `--once` remains ephemeral and `--foreground` is available for diagnostics.
 
+Interactive waits show their current validated lifecycle stage on `stderr`, while the final machine-readable JSON remains isolated on `stdout`.
+
 See [`opsail-refit-codex`](crates/opsail-refit-codex/README.md) for supported targets, attach and launch modes, lifecycle semantics, renderer updates, localization, security checks, and library APIs.
 
 ## Packages

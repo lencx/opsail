@@ -449,48 +449,104 @@ pub(crate) async fn discover_targets(port: u16) -> Result<Vec<RendererTarget>, C
             "renderer discovery returned an invalid target list",
         )
     })?;
-    let (targets, rejected) = collect_valid_targets(values, port);
-    if targets.is_empty() {
+    let collected = collect_valid_targets(values, port);
+    if collected.targets.is_empty() {
         return Err(CodexRefitError::new(
-            if rejected > 0 {
+            if collected.rejected > 0 {
                 CodexRefitErrorCode::TargetValidationFailed
             } else {
                 CodexRefitErrorCode::TargetNotFound
             },
-            "no app renderer matched the required local target shape",
+            if collected.transitional > 0 {
+                "the app renderer is still starting"
+            } else {
+                "no app renderer matched the required local target shape"
+            },
         ));
     }
-    Ok(targets)
+    Ok(collected.targets)
 }
 
-fn collect_valid_targets(values: Vec<Value>, port: u16) -> (Vec<RendererTarget>, usize) {
-    let mut targets = Vec::new();
-    let mut rejected = 0usize;
+#[derive(Default)]
+struct TargetCollection {
+    targets: Vec<RendererTarget>,
+    rejected: usize,
+    transitional: usize,
+}
+
+enum TargetDisposition {
+    Valid(RendererTarget),
+    Transitional,
+    Rejected,
+}
+
+fn collect_valid_targets(values: Vec<Value>, port: u16) -> TargetCollection {
+    let mut collection = TargetCollection::default();
     for value in values {
+        if value.get("type").and_then(Value::as_str) != Some("page") {
+            continue;
+        }
         let Ok(value) = serde_json::from_value::<DiscoveryTarget>(value) else {
-            rejected = rejected.saturating_add(1);
+            collection.rejected = collection.rejected.saturating_add(1);
             continue;
         };
-        match validate_target(value, port) {
-            Some(target) => targets.push(target),
-            None => rejected = rejected.saturating_add(1),
+        match classify_target(value, port) {
+            TargetDisposition::Valid(target) => collection.targets.push(target),
+            TargetDisposition::Transitional => {
+                collection.transitional = collection.transitional.saturating_add(1);
+            }
+            TargetDisposition::Rejected => {
+                collection.rejected = collection.rejected.saturating_add(1);
+            }
         }
     }
-    (targets, rejected)
+    collection
 }
 
-fn validate_target(value: DiscoveryTarget, port: u16) -> Option<RendererTarget> {
+fn classify_target(value: DiscoveryTarget, port: u16) -> TargetDisposition {
     if value.kind != "page" || !valid_target_id(&value.id) {
-        return None;
+        return TargetDisposition::Rejected;
     }
-    let renderer_url = Url::parse(&value.url).ok()?;
+    let Some(mut websocket_url) = validated_websocket_url(&value, port) else {
+        return TargetDisposition::Rejected;
+    };
+    if value.url == "about:blank" {
+        return TargetDisposition::Transitional;
+    }
+    if !is_local_app_renderer_url(&value.url) {
+        return TargetDisposition::Rejected;
+    }
+    if websocket_url.set_host(Some("127.0.0.1")).is_err() {
+        return TargetDisposition::Rejected;
+    }
+    TargetDisposition::Valid(RendererTarget {
+        id: value.id,
+        websocket_url,
+    })
+}
+
+fn is_local_app_renderer_url(value: &str) -> bool {
+    if value.len() > 8_192 {
+        return false;
+    }
+    let Ok(renderer_url) = Url::parse(value) else {
+        return false;
+    };
     if renderer_url.scheme() != "app"
+        || renderer_url.host_str().is_none_or(str::is_empty)
+        || renderer_url.port().is_some()
+        || renderer_url.path().len() <= 1
+        || renderer_url.path().len() > 4_096
         || !renderer_url.username().is_empty()
         || renderer_url.password().is_some()
     {
-        return None;
+        return false;
     }
-    let mut websocket_url = Url::parse(&value.web_socket_debugger_url).ok()?;
+    true
+}
+
+fn validated_websocket_url(value: &DiscoveryTarget, port: u16) -> Option<Url> {
+    let websocket_url = Url::parse(&value.web_socket_debugger_url).ok()?;
     if websocket_url.scheme() != "ws"
         || !is_loopback_host(websocket_url.host_str()?)
         || websocket_url.port() != Some(port)
@@ -502,11 +558,7 @@ fn validate_target(value: DiscoveryTarget, port: u16) -> Option<RendererTarget> 
     {
         return None;
     }
-    websocket_url.set_host(Some("127.0.0.1")).ok()?;
-    Some(RendererTarget {
-        id: value.id,
-        websocket_url,
-    })
+    Some(websocket_url)
 }
 
 fn valid_target_id(value: &str) -> bool {
@@ -579,17 +631,17 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_loopback_app_page_targets_with_matching_ids() {
-        assert!(
-            validate_target(
+    fn accepts_only_loopback_app_page_candidates_with_matching_ids() {
+        assert!(matches!(
+            classify_target(
                 target(
                     "ws://127.0.0.1:55321/devtools/page/renderer-1",
-                    "app://codex/index.html"
+                    "app://-/index.html"
                 ),
                 55321
-            )
-            .is_some()
-        );
+            ),
+            TargetDisposition::Valid(_)
+        ));
         for websocket_url in [
             "ws://example.test:55321/devtools/page/renderer-1",
             "ws://localhost:55321/devtools/page/renderer-1",
@@ -598,20 +650,113 @@ mod tests {
             "ws://127.0.0.1:55321/devtools/page/another",
             "ws://127.0.0.1:55321/devtools/page/renderer-1?token=secret",
         ] {
-            assert!(
-                validate_target(target(websocket_url, "app://codex/index.html"), 55321).is_none()
-            );
+            assert!(matches!(
+                classify_target(target(websocket_url, "app://-/index.html"), 55321),
+                TargetDisposition::Rejected
+            ));
         }
-        assert!(
-            validate_target(
+        for renderer_url in [
+            "https://example.test",
+            "file:///Applications/ChatGPT.app/index.html",
+            "app:///index.html",
+            "app://-/",
+            "app://user@-/index.html",
+            "app://-:55321/index.html",
+        ] {
+            assert!(matches!(
+                classify_target(
+                    target(
+                        "ws://127.0.0.1:55321/devtools/page/renderer-1",
+                        renderer_url,
+                    ),
+                    55321,
+                ),
+                TargetDisposition::Rejected
+            ));
+        }
+        for renderer_url in [
+            "app://-/index.html?initialRoute=%2Flocal%2Fthread-id",
+            "app://-/index.html?mcpAppSandboxDevtools=1#route",
+            "app://shell/main.html?route=%2Flocal%2Fthread-id",
+        ] {
+            assert!(matches!(
+                classify_target(
+                    target(
+                        "ws://127.0.0.1:55321/devtools/page/renderer-1",
+                        renderer_url,
+                    ),
+                    55321,
+                ),
+                TargetDisposition::Valid(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn accepts_the_packaged_chatgpt_renderer_url() {
+        assert!(matches!(
+            classify_target(
                 target(
                     "ws://127.0.0.1:55321/devtools/page/renderer-1",
-                    "https://example.test"
+                    "app://-/index.html",
                 ),
-                55321
-            )
-            .is_none()
+                55321,
+            ),
+            TargetDisposition::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn accepts_a_safe_future_local_app_renderer_for_the_identity_probe() {
+        assert!(matches!(
+            classify_target(
+                target(
+                    "ws://127.0.0.1:55321/devtools/page/renderer-1",
+                    "app://shell/main.html?route=%2Flocal%2Fthread-id",
+                ),
+                55321,
+            ),
+            TargetDisposition::Valid(_)
+        ));
+    }
+
+    #[test]
+    fn startup_blank_page_is_transitional_but_wrong_app_pages_fail_closed() {
+        assert!(matches!(
+            classify_target(
+                target(
+                    "ws://127.0.0.1:55321/devtools/page/renderer-1",
+                    "about:blank",
+                ),
+                55321,
+            ),
+            TargetDisposition::Transitional
+        ));
+        for renderer_url in ["about:blank?unexpected=true", "about:blank#unexpected"] {
+            assert!(matches!(
+                classify_target(
+                    target(
+                        "ws://127.0.0.1:55321/devtools/page/renderer-1",
+                        renderer_url,
+                    ),
+                    55321,
+                ),
+                TargetDisposition::Rejected
+            ));
+        }
+
+        let transitional = collect_valid_targets(
+            vec![serde_json::json!({
+                "type": "page",
+                "id": "renderer-1",
+                "url": "about:blank",
+                "webSocketDebuggerUrl": "ws://127.0.0.1:55321/devtools/page/renderer-1",
+            })],
+            55321,
         );
+        assert!(transitional.targets.is_empty());
+        assert_eq!(transitional.transitional, 1);
+        assert_eq!(transitional.rejected, 0);
     }
 
     #[test]
@@ -629,13 +774,13 @@ mod tests {
             json!({
                 "type": "page",
                 "id": "renderer-1",
-                "url": "app://codex/index.html",
+                "url": "app://-/index.html",
                 "webSocketDebuggerUrl": "ws://127.0.0.1:55321/devtools/page/renderer-1"
             }),
         ];
-        let (targets, rejected) = collect_valid_targets(values, 55321);
-        assert_eq!(targets.len(), 1);
-        assert_eq!(rejected, 1);
+        let collection = collect_valid_targets(values, 55321);
+        assert_eq!(collection.targets.len(), 1);
+        assert_eq!(collection.rejected, 0);
     }
 
     #[tokio::test]

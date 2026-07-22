@@ -7,14 +7,12 @@ use crate::error::{CodexRefitError, CodexRefitErrorCode};
 #[cfg(test)]
 use crate::model::RendererAssetSource;
 use crate::model::{RendererAssetInfo, SessionMode};
-use crate::renderer_assets::RendererSources;
 #[cfg(test)]
 use crate::renderer_assets::embedded_bundle;
+use crate::renderer_assets::{
+    CONTROL_FILE, DOM_ADAPTER_FILE, MODEL_FILE, RUNTIME_FILE, RendererSources,
+};
 
-const MODEL_FILE: &str = "opsail-refit-codex-usage-model.js";
-const DOM_ADAPTER_FILE: &str = "opsail-refit-codex-dom-adapter.js";
-const CONTROL_FILE: &str = "opsail-refit-codex-renderer-control.js";
-const RUNTIME_FILE: &str = "opsail-refit-codex-usage-runtime.js";
 const CSS_SOURCE: &str = include_str!("../assets/opsail-refit-codex-usage.css");
 const LOCALES_SOURCE: &str = include_str!("../assets/locales.json");
 
@@ -38,6 +36,7 @@ pub(crate) struct UsagePayload {
     renderer_probe: String,
     status_template: String,
     disable_source: String,
+    launch_notice_source: String,
     pub asset_info: RendererAssetInfo,
     pub revision: String,
 }
@@ -73,6 +72,10 @@ impl UsagePayload {
 
     pub fn disable(&self) -> &str {
         &self.disable_source
+    }
+
+    pub fn launch_notice(&self) -> &str {
+        &self.launch_notice_source
     }
 }
 
@@ -180,6 +183,14 @@ fn build_payload(
         return Err("renderer status payload is missing its revision placeholder".to_owned());
     }
     let disable_source = render_control(control_template, "disable", "", "null", "void 0", "null")?;
+    let launch_notice_source = render_control(
+        control_template,
+        "launch-notice",
+        "",
+        "null",
+        "void 0",
+        "null",
+    )?;
     if !disable_source.contains("__OPSAIL_REFIT_CODEX_DISABLED__") {
         return Err("renderer cleanup payload is missing its cleanup marker".to_owned());
     }
@@ -202,6 +213,7 @@ fn build_payload(
         renderer_probe,
         status_template,
         disable_source,
+        launch_notice_source,
         asset_info,
         revision,
     })
@@ -418,6 +430,8 @@ mod tests {
                 .disable()
                 .contains("__OPSAIL_REFIT_CODEX_DISABLED__")
         );
+        assert!(payload.launch_notice().contains("launch-notice"));
+        assert!(payload.launch_notice().contains("showLaunchNotice"));
     }
 
     #[test]
@@ -452,6 +466,7 @@ mod tests {
             payload.renderer_probe().to_owned(),
             payload.status(),
             payload.disable().to_owned(),
+            payload.launch_notice().to_owned(),
         ];
         for forbidden in [
             "fetch(",

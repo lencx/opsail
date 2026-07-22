@@ -1,10 +1,56 @@
 use std::path::PathBuf;
 
+use tokio::sync::watch;
+
 use crate::error::{CodexRefitError, CodexRefitErrorCode};
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedAppIdentity {
+    executable: PathBuf,
+    user_id: u32,
+}
+
+#[cfg(test)]
+impl ValidatedAppIdentity {
+    pub(crate) fn for_test() -> Self {
+        Self {
+            executable: PathBuf::from("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+            user_id: 501,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct RuntimeIdentity {
     pub listener_pids: Vec<u32>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LaunchedProcess {
+    pid: u32,
+    exit: watch::Receiver<bool>,
+    #[cfg(test)]
+    _test_guard: Option<watch::Sender<bool>>,
+}
+
+impl LaunchedProcess {
+    pub(crate) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    pub(crate) fn exit_receiver(&self) -> watch::Receiver<bool> {
+        self.exit.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn untracked(pid: u32) -> Self {
+        let (guard, exit) = watch::channel(false);
+        Self {
+            pid,
+            exit,
+            _test_guard: Some(guard),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -20,6 +66,7 @@ mod imp {
     const APP_BUNDLE: &str = "/Applications/ChatGPT.app";
     const APP_IDENTIFIER: &str = "com.openai.codex";
     const APP_EXECUTABLE: &str = "ChatGPT";
+    #[cfg(test)]
     const APP_EXECUTABLE_PATH: &str = "/Applications/ChatGPT.app/Contents/MacOS/ChatGPT";
     const TEAM_IDENTIFIER: &str = "2DC432GLL2";
     const MAX_PARENT_DEPTH: usize = 32;
@@ -42,7 +89,7 @@ mod imp {
             .join("codex"))
     }
 
-    pub(super) fn validate_app() -> Result<(), CodexRefitError> {
+    pub(super) fn validate_app() -> Result<ValidatedAppIdentity, CodexRefitError> {
         let bundle = Path::new(APP_BUNDLE);
         let bundle_metadata = fs::symlink_metadata(bundle).map_err(|_| {
             platform_error(
@@ -131,20 +178,21 @@ mod imp {
                 "the ChatGPT signing team is not recognized",
             ));
         }
-        Ok(())
-    }
-
-    pub(super) fn validate_runtime(port: u16) -> Result<RuntimeIdentity, CodexRefitError> {
-        validate_app()?;
-        let expected_executable = fs::canonicalize(
-            Path::new(APP_BUNDLE)
-                .join("Contents/MacOS")
-                .join(APP_EXECUTABLE),
-        )
-        .map_err(|_| validation_error("could not resolve the ChatGPT executable"))?;
-        let current_uid = command_text("/usr/bin/id", &["-u"])?
+        let executable = fs::canonicalize(executable)
+            .map_err(|_| validation_error("could not resolve the ChatGPT executable"))?;
+        let user_id = command_text("/usr/bin/id", &["-u"])?
             .parse::<u32>()
             .map_err(|_| validation_error("could not determine the current user"))?;
+        Ok(ValidatedAppIdentity {
+            executable,
+            user_id,
+        })
+    }
+
+    pub(super) fn validate_runtime(
+        port: u16,
+        app: &ValidatedAppIdentity,
+    ) -> Result<RuntimeIdentity, CodexRefitError> {
         let mut listener_pids = listener_pids(port)?;
         if listener_pids.is_empty() {
             return Err(platform_error(
@@ -155,18 +203,12 @@ mod imp {
         listener_pids.sort_unstable();
         listener_pids.dedup();
         for pid in &listener_pids {
-            validate_listener_owner(*pid, current_uid, &expected_executable)?;
+            validate_listener_owner(*pid, app.user_id, &app.executable)?;
         }
         Ok(RuntimeIdentity { listener_pids })
     }
 
-    pub(super) fn app_is_running() -> Result<bool, CodexRefitError> {
-        validate_app()?;
-        let current_uid = command_text("/usr/bin/id", &["-u"])?
-            .parse::<u32>()
-            .map_err(|_| launch_error("could not determine the current user"))?;
-        let expected_executable = fs::canonicalize(APP_EXECUTABLE_PATH)
-            .map_err(|_| launch_error("could not resolve the ChatGPT executable"))?;
+    pub(super) fn app_is_running(app: &ValidatedAppIdentity) -> Result<bool, CodexRefitError> {
         let output = Command::new("/usr/bin/pgrep")
             .args([
                 "-f",
@@ -186,13 +228,13 @@ mod imp {
             .lines()
             .filter_map(|line| line.trim().parse::<u32>().ok())
         {
-            if process_number(pid, "uid").ok() != Some(current_uid) {
+            if process_number(pid, "uid").ok() != Some(app.user_id) {
                 continue;
             }
             if process_executable(pid)
                 .and_then(|path| fs::canonicalize(path).ok())
                 .as_deref()
-                == Some(expected_executable.as_path())
+                == Some(app.executable.as_path())
             {
                 return Ok(true);
             }
@@ -217,22 +259,31 @@ mod imp {
         Err(port_error(port))
     }
 
-    pub(super) fn launch_app(port: u16) -> Result<u32, CodexRefitError> {
-        validate_app()?;
-        let mut command = launch_command(port);
+    pub(super) fn launch_app(
+        port: u16,
+        app: &ValidatedAppIdentity,
+    ) -> Result<LaunchedProcess, CodexRefitError> {
+        let mut command = launch_command(port, app);
         let mut child = command
             .spawn()
             .map_err(|_| launch_error("could not start the validated ChatGPT executable"))?;
         let pid = child.id();
+        let (exit_tx, exit) = watch::channel(false);
         std::thread::spawn(move || {
             let _ = child.wait();
+            let _ = exit_tx.send(true);
         });
-        Ok(pid)
+        Ok(LaunchedProcess {
+            pid,
+            exit,
+            #[cfg(test)]
+            _test_guard: None,
+        })
     }
 
-    fn launch_command(port: u16) -> Command {
+    fn launch_command(port: u16, app: &ValidatedAppIdentity) -> Command {
         let port_argument = format!("--remote-debugging-port={port}");
-        let mut command = Command::new(APP_EXECUTABLE_PATH);
+        let mut command = Command::new(&app.executable);
         command
             .args(["--remote-debugging-address=127.0.0.1", &port_argument])
             .stdin(Stdio::null())
@@ -244,18 +295,14 @@ mod imp {
 
     pub(super) fn validate_launched_runtime(
         identity: &RuntimeIdentity,
+        app: &ValidatedAppIdentity,
         launched_pid: u32,
     ) -> Result<(), CodexRefitError> {
-        let current_uid = command_text("/usr/bin/id", &["-u"])?
-            .parse::<u32>()
-            .map_err(|_| validation_error("could not determine the current user"))?;
-        let expected_executable = fs::canonicalize(APP_EXECUTABLE_PATH)
-            .map_err(|_| validation_error("could not resolve the ChatGPT executable"))?;
-        if process_number(launched_pid, "uid")? != current_uid
+        if process_number(launched_pid, "uid")? != app.user_id
             || process_executable(launched_pid)
                 .and_then(|path| fs::canonicalize(path).ok())
                 .as_deref()
-                != Some(expected_executable.as_path())
+                != Some(app.executable.as_path())
         {
             return Err(validation_error(
                 "the launched ChatGPT process identity changed before CDP validation",
@@ -516,7 +563,11 @@ mod imp {
 
         #[test]
         fn launch_command_uses_the_validated_executable_and_loopback_flags() {
-            let command = launch_command(55321);
+            let app = ValidatedAppIdentity {
+                executable: PathBuf::from(APP_EXECUTABLE_PATH),
+                user_id: 501,
+            };
+            let command = launch_command(55321, &app);
             assert_eq!(command.get_program(), APP_EXECUTABLE_PATH);
             assert_eq!(
                 command.get_args().collect::<Vec<_>>(),
@@ -537,15 +588,18 @@ mod imp {
         Err(unsupported())
     }
 
-    pub(super) fn validate_app() -> Result<(), CodexRefitError> {
+    pub(super) fn validate_app() -> Result<ValidatedAppIdentity, CodexRefitError> {
         Err(unsupported())
     }
 
-    pub(super) fn validate_runtime(_port: u16) -> Result<RuntimeIdentity, CodexRefitError> {
+    pub(super) fn validate_runtime(
+        _port: u16,
+        _app: &ValidatedAppIdentity,
+    ) -> Result<RuntimeIdentity, CodexRefitError> {
         Err(unsupported())
     }
 
-    pub(super) fn app_is_running() -> Result<bool, CodexRefitError> {
+    pub(super) fn app_is_running(_app: &ValidatedAppIdentity) -> Result<bool, CodexRefitError> {
         Err(unsupported())
     }
 
@@ -553,12 +607,16 @@ mod imp {
         Ok(false)
     }
 
-    pub(super) fn launch_app(_port: u16) -> Result<u32, CodexRefitError> {
+    pub(super) fn launch_app(
+        _port: u16,
+        _app: &ValidatedAppIdentity,
+    ) -> Result<LaunchedProcess, CodexRefitError> {
         Err(unsupported())
     }
 
     pub(super) fn validate_launched_runtime(
         _identity: &RuntimeIdentity,
+        _app: &ValidatedAppIdentity,
         _launched_pid: u32,
     ) -> Result<(), CodexRefitError> {
         Err(unsupported())
@@ -584,27 +642,34 @@ pub(crate) const fn is_supported() -> bool {
     cfg!(target_os = "macos")
 }
 
-pub(crate) fn validate_app() -> Result<(), CodexRefitError> {
+pub(crate) fn validate_app() -> Result<ValidatedAppIdentity, CodexRefitError> {
     imp::validate_app()
 }
 
-pub(crate) fn validate_runtime(port: u16) -> Result<RuntimeIdentity, CodexRefitError> {
-    imp::validate_runtime(port)
+pub(crate) fn validate_runtime(
+    port: u16,
+    app: &ValidatedAppIdentity,
+) -> Result<RuntimeIdentity, CodexRefitError> {
+    imp::validate_runtime(port, app)
 }
 
-pub(crate) fn app_is_running() -> Result<bool, CodexRefitError> {
-    imp::app_is_running()
+pub(crate) fn app_is_running(app: &ValidatedAppIdentity) -> Result<bool, CodexRefitError> {
+    imp::app_is_running(app)
 }
 
-pub(crate) fn launch_app(port: u16) -> Result<u32, CodexRefitError> {
-    imp::launch_app(port)
+pub(crate) fn launch_app(
+    port: u16,
+    app: &ValidatedAppIdentity,
+) -> Result<LaunchedProcess, CodexRefitError> {
+    imp::launch_app(port, app)
 }
 
 pub(crate) fn validate_launched_runtime(
     identity: &RuntimeIdentity,
+    app: &ValidatedAppIdentity,
     launched_pid: u32,
 ) -> Result<(), CodexRefitError> {
-    imp::validate_launched_runtime(identity, launched_pid)
+    imp::validate_launched_runtime(identity, app, launched_pid)
 }
 
 pub(crate) fn stop_managed_process(pid: u32) -> Result<(), CodexRefitError> {
@@ -631,11 +696,16 @@ pub(crate) fn loopback_port_available(port: u16) -> Result<bool, CodexRefitError
     }
 }
 
+pub(crate) fn debug_listener_present(port: u16) -> Result<bool, CodexRefitError> {
+    imp::port_has_listener(port)
+}
+
 pub(crate) fn revalidate_runtime(
     port: u16,
+    app: &ValidatedAppIdentity,
     previous: &RuntimeIdentity,
 ) -> Result<(), CodexRefitError> {
-    let current = validate_runtime(port)?;
+    let current = validate_runtime(port, app)?;
     if current.listener_pids != previous.listener_pids {
         return Err(platform_error(
             CodexRefitErrorCode::TargetValidationFailed,

@@ -63,6 +63,13 @@
     };
   }
 
+  if (operation === "launch-notice") {
+    const runtime = window.__OPSAIL_REFIT_CODEX_STATE__;
+    let shown = false;
+    try { shown = Boolean(runtime?.showLaunchNotice?.()); } catch {}
+    return { shown };
+  }
+
   if (operation === "disable") {
     window.__OPSAIL_REFIT_CODEX_DISABLED__ = true;
     window.__OPSAIL_REFIT_CODEX_EARLY_GENERATION__ = `disabled:${Date.now()}`;
@@ -71,6 +78,7 @@
     document.getElementById("opsail-refit-codex-usage")?.remove();
     document.getElementById("opsail-refit-codex-usage-details")?.remove();
     document.getElementById("opsail-refit-codex-usage-style")?.remove();
+    document.getElementById("opsail-refit-codex-launch-notice")?.remove();
     document.documentElement?.classList.remove("opsail-refit-codex-usage-enabled");
     delete window.__OPSAIL_REFIT_CODEX_STATE__;
     delete window.__OPSAIL_REFIT_CODEX_EARLY_STATE__;
@@ -78,6 +86,7 @@
       clean: !document.getElementById("opsail-refit-codex-usage")
         && !document.getElementById("opsail-refit-codex-usage-details")
         && !document.getElementById("opsail-refit-codex-usage-style")
+        && !document.getElementById("opsail-refit-codex-launch-notice")
         && !window.__OPSAIL_REFIT_CODEX_STATE__,
     };
   }

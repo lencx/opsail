@@ -61,6 +61,7 @@ npm run pack:check --prefix packages/node
 - Add or update the narrowest test that proves a behavior change.
 - Keep extraction fixtures self-contained. Review full Markdown golden changes manually; tests must never update them automatically.
 - Keep default tests offline. HTTP behavior belongs in local mock-server tests.
+- Keep an explicit version in each Rust crate. Crates version independently; bump only a crate whose release contract changes, then update dependent version requirements deliberately.
 - Preserve stdout as the data channel and stderr as the diagnostics channel.
 - Keep JSON schema evolution additive unless `schemaVersion` changes.
 - Treat acquired HTML, metadata, links, and extracted text as untrusted input.

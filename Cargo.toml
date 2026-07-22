@@ -8,11 +8,10 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
-authors = ["Opsail contributors"]
+authors = ["lencx <lencx.me@gmail.com>"]
 readme = "README.md"
 repository = "https://github.com/lencx/opsail"
 
@@ -24,6 +23,7 @@ dom_query = { version = "0.28.0", default-features = false, features = ["markdow
 dom_smoothie = { version = "0.18.0", features = ["serde"] }
 encoding_rs = "0.8.35"
 futures-util = { version = "0.3.32", default-features = false, features = ["std"] }
+indicatif = "0.18.6"
 miette = { version = "7.6.0", features = ["fancy-no-backtrace"] }
 libc = "0.2.183"
 predicates = "3.1.4"

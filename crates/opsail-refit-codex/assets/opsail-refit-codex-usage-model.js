@@ -178,7 +178,7 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     return labels.generic;
   };
 
-  const formatReset = (resetsAt, _copy, displayLocale) => {
+  const formatReset = (resetsAt, copy, displayLocale, nowMs = Date.now()) => {
     if (resetsAt === null) return null;
     const value = new Date(resetsAt * 1000);
     if (!Number.isFinite(value.getTime())) return null;
@@ -188,31 +188,41 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
         dateStyle: "full",
         timeStyle: "long",
       }).format(value), locale);
-      const display = formatLocaleTypography(new Intl.DateTimeFormat(locale, {
-        weekday: "short",
-        month: "short",
-        day: "numeric",
-        hour: "numeric",
-        minute: "2-digit",
-      }).format(value), locale);
-      return { display, full };
+      const dateTime = formatLocalDateTime(value);
+      const countdown = formatResetCreditCountdown(
+        value.getTime() - (Number.isFinite(nowMs) ? nowMs : Date.now()),
+        copy,
+      );
+      return { dateTime, display: dateTime, full, ...(countdown || {}) };
     } catch {
       try {
         const full = formatLocaleTypography(value.toLocaleString(locale), locale);
-        return { display: full, full };
+        const dateTime = formatLocalDateTime(value);
+        const countdown = formatResetCreditCountdown(
+          value.getTime() - (Number.isFinite(nowMs) ? nowMs : Date.now()),
+          copy,
+        );
+        return { dateTime, display: dateTime, full, ...(countdown || {}) };
       } catch {
         return null;
       }
     }
   };
 
-  const presentWindows = (snapshot, copy, displayLocale) => [
+  const isPresentableWindow = (windowValue) => windowValue
+    && typeof windowValue.usedPercent === "number"
+    && Number.isFinite(windowValue.usedPercent);
+
+  const hasPresentableWindows = (snapshot) => [
+    snapshot?.primary,
+    snapshot?.secondary,
+  ].some(isPresentableWindow);
+
+  const presentWindows = (snapshot, copy, displayLocale, nowMs = Date.now()) => [
     snapshot?.primary,
     snapshot?.secondary,
   ]
-    .filter((windowValue) => windowValue
-      && typeof windowValue.usedPercent === "number"
-      && Number.isFinite(windowValue.usedPercent))
+    .filter(isPresentableWindow)
     .sort((left, right) =>
       (left.windowDurationMins ?? Number.MAX_SAFE_INTEGER)
       - (right.windowDurationMins ?? Number.MAX_SAFE_INTEGER))
@@ -228,7 +238,7 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
         ),
         used,
         remaining,
-        reset: formatReset(windowValue.resetsAt, copy, displayLocale),
+        reset: formatReset(windowValue.resetsAt, copy, displayLocale, nowMs),
       };
     });
 
@@ -244,6 +254,12 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
       .map((credit) => ({ expiresAt: credit.expiresAt }))
       .sort((left, right) => left.expiresAt - right.expiresAt);
   };
+
+  const normalizeResetCreditsUpdate = (value) => (
+    value && typeof value === "object" && Array.isArray(value.credits)
+      ? normalizeResetCredits(value)
+      : null
+  );
 
   const formatResetCreditCountdown = (remainingMilliseconds, copy) => {
     const units = copy?.resetCreditCountdownUnits;
@@ -483,7 +499,10 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
       return true;
     };
 
-    const scheduleCalibration = () => {
+    const scheduleCalibration = (delayMs = NOTIFICATION_CALIBRATION_MS) => {
+      const delay = typeof delayMs === "number" && Number.isFinite(delayMs) && delayMs >= 0
+        ? delayMs
+        : NOTIFICATION_CALIBRATION_MS;
       calibrationPending = true;
       calibrationReady = false;
       if (calibrationTimer !== null) clearTimer(calibrationTimer);
@@ -491,7 +510,7 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
         calibrationTimer = null;
         calibrationReady = true;
         requestCalibration();
-      }, NOTIFICATION_CALIBRATION_MS);
+      }, delay);
     };
 
     const focus = () => now() - lastRequestedAt >= FOCUS_REFRESH_MIN_MS ? request() : null;
@@ -528,9 +547,11 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     computeTooltipPlacement,
     createReadCoordinator,
     formatMessage,
+    hasPresentableWindows,
     isSafeInlineCapsuleLayout,
     mergeSnapshot,
     normalizeResetCredits,
+    normalizeResetCreditsUpdate,
     normalizeSnapshot,
     presentResetCredits,
     presentWindows,

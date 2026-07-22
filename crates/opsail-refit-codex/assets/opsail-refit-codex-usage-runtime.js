@@ -7,8 +7,12 @@
   const STYLE_ID = "opsail-refit-codex-usage-style";
   const USAGE_ID = "opsail-refit-codex-usage";
   const DETAILS_ID = "opsail-refit-codex-usage-details";
+  const NOTICE_ID = "opsail-refit-codex-launch-notice";
   const ROOT_CLASS = "opsail-refit-codex-usage-enabled";
   const HOST_ID = "local";
+  const CONFIG_READ_METHOD = "config/read";
+  const CONFIG_READ_STALE_MS = 15_000;
+  const CONFIG_READ_GATE_MS = 1_000;
   const VERSION = __OPSAIL_REFIT_CODEX_VERSION_JSON__;
   const REVISION = __OPSAIL_REFIT_CODEX_REVISION_JSON__;
   const SESSION_MODE = __OPSAIL_REFIT_CODEX_SESSION_MODE_JSON__;
@@ -17,8 +21,17 @@
   const LOCALE_BUNDLE = __OPSAIL_REFIT_CODEX_LOCALES_JSON__;
   const installToken = {};
   const usageModel = createOpsailRefitCodexUsageModel(LOCALE_BUNDLE);
+  const RESET_CREDIT_CALIBRATION_DELAYS_MS = [
+    usageModel.NOTIFICATION_CALIBRATION_MS,
+    3_000,
+    8_000,
+  ];
   const codexDom = createOpsailRefitCodexDomAdapter();
-  const resolveCopy = () => usageModel.selectLocale(...codexDom.languageCandidates());
+  let configuredLocale = null;
+  const resolveCopy = () => usageModel.selectLocale(
+    configuredLocale,
+    ...codexDom.languageCandidates(),
+  );
   let copy = resolveCopy();
   const syncLocale = () => {
     const nextCopy = resolveCopy();
@@ -31,6 +44,7 @@
   document.getElementById(USAGE_ID)?.remove();
   document.getElementById(DETAILS_ID)?.remove();
   document.getElementById(STYLE_ID)?.remove();
+  document.getElementById(NOTICE_ID)?.remove();
   document.documentElement?.classList.remove(ROOT_CLASS);
   window[DISABLED_KEY] = false;
 
@@ -38,7 +52,10 @@
     disposed: false,
     status: "loading",
     snapshot: null,
+    startupCalibrationAttempted: false,
     resetCredits: [],
+    resetCreditsResolved: false,
+    resetCreditCalibrationAttempts: 0,
     host: null,
     details: null,
     parts: null,
@@ -49,19 +66,30 @@
     closeTimer: null,
     resetCountdownTimer: null,
     refreshTimer: null,
+    notice: null,
+    noticeTimer: null,
+    localeRefreshOnAccountRecovery: false,
   };
   const metrics = {
     ensureCalls: 0,
     layoutCalls: 0,
+    localeRequests: 0,
     usageRequests: 0,
     usageUpdates: 0,
   };
   const listeners = [];
   let mutationObserver = null;
-  let observedMutationSidebar;
+  let observedMutationAnchor;
+  let observedMutationTargets = [];
+  let accountRecoveryPath = [];
   let resizeObserver = null;
   let observedSidebar = null;
   let observedRow = null;
+  let documentReadyListener = null;
+  let configRequestId = null;
+  let configRequestStartedAt = 0;
+  let lastConfigReadAt = 0;
+  let configRequestSequence = 0;
   const scheduler = {
     ensureTimeout: null,
     frame: null,
@@ -90,6 +118,84 @@
     const element = document.createElement(tagName);
     if (className) element.className = className;
     return element;
+  };
+
+  const normalizeConfiguredLocale = (value) => {
+    if (typeof value !== "string") return null;
+    const locale = value.trim();
+    if (locale.length === 0 || locale.length > 64) return null;
+    return /^[A-Za-z0-9]+(?:[-_][A-Za-z0-9]+)*$/.test(locale) ? locale : null;
+  };
+
+  const requestConfiguredLocale = (force = false) => {
+    if (state.disposed || window[DISABLED_KEY]) return false;
+    const now = Date.now();
+    if (configRequestId && now - configRequestStartedAt < CONFIG_READ_STALE_MS) {
+      return false;
+    }
+    if (configRequestId) {
+      configRequestId = null;
+      configRequestStartedAt = 0;
+    }
+    if (!force && now - lastConfigReadAt < CONFIG_READ_GATE_MS) return false;
+    const bridge = window.electronBridge;
+    if (!bridge || typeof bridge.sendMessageFromView !== "function") return false;
+    const requestId = `opsail-refit-codex-config:${now}:${++configRequestSequence}`;
+    configRequestId = requestId;
+    configRequestStartedAt = now;
+    lastConfigReadAt = now;
+    try {
+      bridge.sendMessageFromView({
+        type: "mcp-request",
+        hostId: HOST_ID,
+        request: {
+          id: requestId,
+          method: CONFIG_READ_METHOD,
+          params: { includeLayers: false, cwd: null },
+        },
+      });
+      metrics.localeRequests += 1;
+      return true;
+    } catch {
+      if (configRequestId === requestId) {
+        configRequestId = null;
+        configRequestStartedAt = 0;
+      }
+      return false;
+    }
+  };
+
+  const refreshConfiguredLocaleAfterRecovery = () => {
+    if (!state.localeRefreshOnAccountRecovery || !state.row?.isConnected) return;
+    if (requestConfiguredLocale(true)) state.localeRefreshOnAccountRecovery = false;
+  };
+
+  const removeLaunchNotice = () => {
+    if (state.noticeTimer !== null) clearTimeout(state.noticeTimer);
+    state.noticeTimer = null;
+    state.notice?.remove();
+    document.getElementById(NOTICE_ID)?.remove();
+    state.notice = null;
+  };
+
+  const showLaunchNotice = () => {
+    if (state.disposed || window[DISABLED_KEY]) return false;
+    syncLocale();
+    removeLaunchNotice();
+    const notice = createElement("section", "opsail-refit-codex-launch-notice");
+    notice.id = NOTICE_ID;
+    notice.setAttribute("role", "status");
+    notice.setAttribute("aria-live", "polite");
+    notice.setAttribute("aria-atomic", "true");
+    const title = createElement("strong", "opsail-refit-codex-launch-notice-title");
+    const message = createElement("span", "opsail-refit-codex-launch-notice-message");
+    setText(title, copy.launchNoticeTitle);
+    setText(message, copy.launchNoticeMessage);
+    notice.append(title, message);
+    (document.body || document.documentElement).append(notice);
+    state.notice = notice;
+    state.noticeTimer = setTimeout(removeLaunchNotice, 2800);
+    return true;
   };
 
   const createRow = (index) => {
@@ -168,14 +274,12 @@
 
   const openDetails = () => {
     if (!state.hasWindows || state.host?.hidden || !state.details) return;
-    syncLocale();
-    const resetCredits = renderResetCredits();
-    scheduleResetCreditCountdown(resetCredits);
     if (state.closeTimer !== null) clearTimeout(state.closeTimer);
     state.closeTimer = null;
     state.detailsOpen = true;
     state.details.dataset.opsailRefitCodexOpen = "true";
     state.details.setAttribute("aria-hidden", "false");
+    render();
     scheduleTooltipPosition();
   };
 
@@ -183,6 +287,7 @@
     if (state.closeTimer !== null) clearTimeout(state.closeTimer);
     state.closeTimer = null;
     state.detailsOpen = false;
+    clearResetCreditCountdown();
     if (state.details) {
       state.details.dataset.opsailRefitCodexOpen = "false";
       state.details.setAttribute("aria-hidden", "true");
@@ -229,7 +334,13 @@
     const resetCreditBody = createElement("tbody");
     resetCreditTable.append(resetCreditBody);
     resetCreditSection.append(resetCreditTitle, resetCreditTable);
-    details.append(stale, ...rows.map((row) => row.row), resetCreditSection);
+    const timeFormatNote = createElement("p", "opsail-refit-codex-time-format-note");
+    details.append(
+      stale,
+      ...rows.map((row) => row.row),
+      resetCreditSection,
+      timeFormatNote,
+    );
     (document.body || document.documentElement).append(details);
 
     addListener(host, "pointerenter", openDetails);
@@ -252,6 +363,7 @@
       resetCreditTitle,
       resetCreditTable,
       resetCreditBody,
+      timeFormatNote,
     };
   };
 
@@ -271,17 +383,36 @@
     closeDetails();
   };
 
+  const rememberAccountRow = (row) => {
+    if (!row?.isConnected) return;
+    const path = [];
+    for (let current = row.parentElement; current; current = current.parentElement) {
+      path.push(current);
+    }
+    accountRecoveryPath = path;
+  };
+
   const layout = () => {
     metrics.layoutCalls += 1;
     const host = state.host;
     const sidebar = state.sidebar;
     const previousRow = state.row;
+    if (previousRow && !previousRow.isConnected) {
+      state.localeRefreshOnAccountRecovery = true;
+    }
     const wasInline = host?.dataset.opsailRefitCodexLayout === "inline"
       && previousRow?.isConnected
       && host.parentElement === previousRow;
     state.row = null;
     if (!host || !sidebar || !state.hasWindows) {
+      if (host && sidebar) {
+        const measured = codexDom.measureNativeLayout(sidebar, previousRow);
+        state.row = measured?.row?.isConnected ? measured.row : null;
+        rememberAccountRow(state.row);
+        refreshConfiguredLocaleAfterRecovery();
+      }
       hideHost();
+      observeMutations();
       observeGeometry();
       return;
     }
@@ -295,7 +426,10 @@
     host.style.removeProperty("--opsail-refit-usage-top");
     host.style.removeProperty("--opsail-refit-usage-inline-max-width");
 
-    const measured = codexDom.measureNativeLayout(sidebar);
+    const measured = codexDom.measureNativeLayout(sidebar, previousRow);
+    state.row = measured?.row?.isConnected ? measured.row : null;
+    rememberAccountRow(state.row);
+    refreshConfiguredLocaleAfterRecovery();
     const hostRect = codexDom.elementRect(host);
     const capsuleWidth = Math.max(
       hostRect?.width || 0,
@@ -325,7 +459,6 @@
         sidebar: measured.sidebarRect,
         viewportBottom: Number(window.innerHeight) || measured.sidebarRect.bottom,
       });
-      if (mounted) state.row = measured.row;
     }
 
     if (!mounted && !measured?.row
@@ -369,7 +502,6 @@
           && fallbackRect.top >= minimumTop
           && fallbackRect.bottom <= maximumBottom,
         );
-        state.row = null;
       }
     }
 
@@ -377,6 +509,7 @@
     host.hidden = !mounted;
     if (!mounted) closeDetails();
     if (mounted) scheduleTooltipPosition();
+    observeMutations();
     observeGeometry();
   };
 
@@ -418,15 +551,20 @@
     state.resetCountdownTimer = null;
   };
 
-  const scheduleResetCreditCountdown = (resetCredits) => {
+  const scheduleDetailCountdown = (windows, resetCredits) => {
     clearResetCreditCountdown();
     if (state.disposed
+      || !state.detailsOpen
       || document.visibilityState === "hidden"
-      || !Array.isArray(resetCredits)
-      || resetCredits.length === 0) return;
-    const delay = Math.max(1000, Math.min(
-      ...resetCredits.map((credit) => credit.nextUpdateMs),
-    ));
+    ) return;
+    const updates = [
+      ...(Array.isArray(windows) ? windows : [])
+        .map((windowValue) => windowValue.reset?.nextUpdateMs),
+      ...(Array.isArray(resetCredits) ? resetCredits : [])
+        .map((credit) => credit.nextUpdateMs),
+    ].filter(Number.isFinite);
+    if (updates.length === 0) return;
+    const delay = Math.max(1000, Math.min(...updates));
     if (!Number.isFinite(delay)) return;
     state.resetCountdownTimer = setTimeout(() => {
       state.resetCountdownTimer = null;
@@ -498,6 +636,7 @@
     state.host.dataset.opsailRefitCodexState = state.status;
     state.parts.stale.hidden = !stale;
     setText(state.parts.stale, stale ? copy.stale : "");
+    setText(state.parts.timeFormatNote, copy.timeFormatNote);
     if (windows.length === 0) {
       clearResetCreditCountdown();
       setText(state.parts.summary, "");
@@ -507,7 +646,6 @@
     }
 
     const summary = usageModel.summaryFor(windows, copy);
-    scheduleResetCreditCountdown(resetCredits);
     setText(state.parts.summary, summary);
     state.host.setAttribute("aria-label", usageModel.formatMessage(copy.ariaSummary, { summary }));
     for (let index = 0; index < state.parts.rows.length; index += 1) {
@@ -520,11 +658,15 @@
       row.row.hidden = false;
       setText(row.label, windowValue.label);
       setText(row.value, usageModel.formatMessage(copy.remaining, windowValue));
+      const resetCountdownLine = windowValue.reset?.countdown
+        ? usageModel.formatMessage(copy.windowResetCountdown, windowValue.reset)
+        : null;
       const resetLine = windowValue.reset
         ? usageModel.formatMessage(copy.windowReset, windowValue.reset)
         : null;
       setText(row.meta, [
         usageModel.formatMessage(copy.used, windowValue),
+        resetCountdownLine,
         resetLine,
       ].filter(Boolean).join("\n"));
       if (windowValue.reset) {
@@ -541,11 +683,23 @@
       row.track.setAttribute("aria-valuemax", "100");
       row.track.setAttribute("aria-valuenow", String(windowValue.remaining));
     }
+    scheduleDetailCountdown(windows, resetCredits);
     scheduleLayout();
   };
 
+  const hasPresentableSnapshot = () => usageModel.hasPresentableWindows(state.snapshot);
+
+  const scheduleStartupCalibration = () => {
+    if (hasPresentableSnapshot() || state.startupCalibrationAttempted) return false;
+    state.startupCalibrationAttempted = true;
+    coordinator.scheduleCalibration();
+    return true;
+  };
+
   const markReadFailure = () => {
-    state.status = state.snapshot ? "stale" : "unavailable";
+    const hasSnapshot = hasPresentableSnapshot();
+    if (!hasSnapshot) scheduleStartupCalibration();
+    state.status = hasSnapshot ? "stale" : "unavailable";
     render();
   };
 
@@ -567,54 +721,130 @@
     onFailure: markReadFailure,
   });
 
+  const mergeResetCredits = (value, scheduleIfUnresolved) => {
+    const resetCredits = usageModel.normalizeResetCreditsUpdate(value);
+    if (resetCredits !== null) {
+      state.resetCreditsResolved = true;
+      state.resetCredits = resetCredits;
+      return true;
+    }
+    if (!scheduleIfUnresolved || state.resetCreditsResolved) return false;
+    const delay = RESET_CREDIT_CALIBRATION_DELAYS_MS[
+      state.resetCreditCalibrationAttempts
+    ];
+    if (delay === undefined) return false;
+    state.resetCreditCalibrationAttempts += 1;
+    coordinator.scheduleCalibration(delay);
+    return false;
+  };
+
+  const mergeUsagePayload = (result, {
+    mergeWindows = false,
+    scheduleUnresolvedResetCredits = false,
+  } = {}) => {
+    const snapshot = usageModel.normalizeSnapshot(result?.rateLimits);
+    const resetCreditsAccepted = mergeResetCredits(
+      result?.rateLimitResetCredits,
+      scheduleUnresolvedResetCredits,
+    );
+    if (snapshot) {
+      state.snapshot = mergeWindows
+        ? usageModel.mergeSnapshot(state.snapshot, snapshot)
+        : snapshot;
+    }
+    const hasSnapshot = hasPresentableSnapshot();
+    if (hasSnapshot) state.startupCalibrationAttempted = true;
+    else if (snapshot && !mergeWindows) scheduleStartupCalibration();
+    const accepted = Boolean(snapshot) || resetCreditsAccepted;
+    if (accepted) {
+      state.status = hasSnapshot ? "ready" : "unavailable";
+      metrics.usageUpdates += 1;
+      render();
+    }
+    return accepted;
+  };
+
   const handleMessage = (event) => {
     try {
       const payload = event?.data;
       if (!payload || payload.hostId !== HOST_ID) return;
       if (payload.type === "mcp-response") {
         const message = payload.message;
-        if (!coordinator.finish(String(message?.id || ""))) return;
-        const snapshot = usageModel.normalizeSnapshot(message?.result?.rateLimits);
-        if (message?.error || !snapshot) {
+        const messageId = String(message?.id || "");
+        if (messageId === configRequestId) {
+          configRequestId = null;
+          configRequestStartedAt = 0;
+          if (!message?.error) {
+            const nextLocale = normalizeConfiguredLocale(
+              message?.result?.config?.desktop?.localeOverride,
+            );
+            if (configuredLocale !== nextLocale) {
+              configuredLocale = nextLocale;
+              render();
+            }
+          }
+          refreshConfiguredLocaleAfterRecovery();
+          return;
+        }
+        if (!coordinator.finish(messageId)) return;
+        if (message?.error) {
           markReadFailure();
           return;
         }
-        state.snapshot = snapshot;
-        state.resetCredits = usageModel.normalizeResetCredits(
-          message?.result?.rateLimitResetCredits,
-        );
-        state.status = "ready";
-        metrics.usageUpdates += 1;
-        render();
+        if (!mergeUsagePayload(message?.result, {
+          scheduleUnresolvedResetCredits: true,
+        })) {
+          markReadFailure();
+        }
         return;
       }
       if (payload.type !== "mcp-notification" || payload.method !== "account/rateLimits/updated") return;
-      const snapshot = usageModel.normalizeSnapshot(payload.params?.rateLimits);
-      if (snapshot) {
-        state.snapshot = usageModel.mergeSnapshot(state.snapshot, snapshot);
-        state.status = "ready";
-        metrics.usageUpdates += 1;
-        render();
-      }
+      mergeUsagePayload(payload.params, { mergeWindows: true });
       coordinator.scheduleCalibration();
     } catch {
       markReadFailure();
     }
   };
 
+  const waitForDocument = () => {
+    if ((document.documentElement && document.readyState === "complete")
+      || documentReadyListener !== null) return;
+    documentReadyListener = () => {
+      if (!document.documentElement) return;
+      window.removeEventListener("load", documentReadyListener);
+      documentReadyListener = null;
+      ensure();
+      requestConfiguredLocale(true);
+      if (!hasPresentableSnapshot()) coordinator.request();
+    };
+    window.addEventListener("load", documentReadyListener);
+  };
+
   const ensure = () => {
     if (state.disposed || window[DISABLED_KEY]) return;
+    if (!document.documentElement) {
+      waitForDocument();
+      return;
+    }
     metrics.ensureCalls += 1;
     ensureStyle();
     document.documentElement?.classList.add(ROOT_CLASS);
     if (!state.host || !state.details) createUi();
+    if (!mutationObserver && typeof MutationObserver === "function") {
+      mutationObserver = new MutationObserver(handleMutations);
+      observeMutations();
+    }
     const sidebar = codexDom.findSidebar(document);
     if (!sidebar) {
       const sidebarChanged = state.sidebar !== null;
+      if (state.row || accountRecoveryPath.length > 0) {
+        state.localeRefreshOnAccountRecovery = true;
+      }
       state.sidebar = null;
       state.row = null;
       if (sidebarChanged) {
-        observedMutationSidebar = undefined;
+        observedMutationAnchor = undefined;
+        observedMutationTargets = [];
         observeMutations();
       }
       observeGeometry();
@@ -624,7 +854,8 @@
     if (state.sidebar !== sidebar) {
       state.sidebar = sidebar;
       state.row = null;
-      observedMutationSidebar = undefined;
+      observedMutationAnchor = undefined;
+      observedMutationTargets = [];
       observeMutations();
       observeGeometry();
     }
@@ -642,29 +873,57 @@
   const observeMutations = () => {
     if (!mutationObserver || !document.documentElement) return;
     const nextSidebar = state.sidebar?.isConnected ? state.sidebar : null;
-    if (observedMutationSidebar === nextSidebar) return;
-    mutationObserver.disconnect();
-    observedMutationSidebar = nextSidebar;
-    if (!nextSidebar) {
-      mutationObserver.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ["lang"],
-        childList: true,
-        subtree: true,
-      });
-      return;
+    const nextRow = state.row?.isConnected ? state.row : null;
+    const sidebarMissing = !nextSidebar;
+    const recoveryAnchor = (sidebarMissing ? document.body : null)
+      || accountRecoveryPath.find((element) => (
+        element?.isConnected
+        && (element === nextSidebar || nextSidebar?.contains?.(element))
+      ))
+      || nextSidebar
+      || accountRecoveryPath.find((element) => element?.isConnected)
+      || document.body
+      || document.documentElement;
+    const nextAnchor = nextRow || recoveryAnchor;
+    const nextTargets = [];
+    if (nextRow) nextTargets.push({ subtree: true, target: nextRow });
+    const bootstrapping = !nextRow && accountRecoveryPath.length === 0;
+    if ((sidebarMissing || bootstrapping) && recoveryAnchor) {
+      nextTargets.push({ subtree: true, target: recoveryAnchor });
     }
-    mutationObserver.observe(nextSidebar, { childList: true, subtree: true });
-    for (let ancestor = nextSidebar.parentElement; ancestor; ancestor = ancestor.parentElement) {
-      if (ancestor !== document.documentElement) {
-        mutationObserver.observe(ancestor, { childList: true });
+    for (
+      let current = sidebarMissing || bootstrapping
+        ? recoveryAnchor?.parentElement
+        : nextRow?.parentElement || recoveryAnchor;
+      current && current !== document.documentElement;
+      current = current.parentElement
+    ) {
+      if (!nextTargets.some((entry) => entry.target === current)) {
+        nextTargets.push({ subtree: false, target: current });
       }
     }
-    mutationObserver.observe(document.documentElement, {
-      attributes: true,
-      attributeFilter: ["lang"],
-      childList: true,
-    });
+    nextTargets.push({ subtree: false, target: document.documentElement });
+    const unchanged = observedMutationAnchor === nextAnchor
+      && observedMutationTargets.length === nextTargets.length
+      && observedMutationTargets.every((entry, index) => (
+        entry.target === nextTargets[index].target
+        && entry.subtree === nextTargets[index].subtree
+      ));
+    if (unchanged) return;
+    mutationObserver.disconnect();
+    observedMutationAnchor = nextAnchor;
+    observedMutationTargets = nextTargets;
+    for (const { subtree, target } of nextTargets) {
+      if (target === document.documentElement) {
+        mutationObserver.observe(target, {
+          attributes: true,
+          attributeFilter: ["lang"],
+          childList: true,
+        });
+      } else {
+        mutationObserver.observe(target, { childList: true, subtree });
+      }
+    }
   };
 
   const handleMutations = (records) => {
@@ -674,10 +933,31 @@
       render();
       return;
     }
+    const mutationNodes = [...(records || [])].flatMap((record) => [
+      ...(record.addedNodes || []),
+      ...(record.removedNodes || []),
+    ]);
     if (!state.sidebar?.isConnected) {
-      observedMutationSidebar = undefined;
+      if (state.row || accountRecoveryPath.length > 0) {
+        state.localeRefreshOnAccountRecovery = true;
+      }
+      state.sidebar = null;
+      state.row = null;
+      observeMutations();
+      if (mutationNodes.some(codexDom.nodeMayContainSidebar)) {
+        scheduleEnsure();
+      }
+      return;
+    }
+    if (state.row && !state.row.isConnected) {
+      state.localeRefreshOnAccountRecovery = true;
+      state.row = null;
       observeMutations();
       scheduleEnsure();
+      return;
+    }
+    if (!state.row?.isConnected && accountRecoveryPath.length === 0) {
+      if (mutationNodes.some(codexDom.nodeMayAffectLayout)) scheduleEnsure();
       return;
     }
     if (state.hasWindows && !state.host?.isConnected) {
@@ -686,14 +966,22 @@
     }
     for (const record of records || []) {
       const changedNodes = [...(record.addedNodes || []), ...(record.removedNodes || [])];
-      if (changedNodes.some((node) => node === state.sidebar || node?.contains?.(state.sidebar))) {
-        observedMutationSidebar = undefined;
-        observeMutations();
-        scheduleLayout();
-        return;
+      if (!state.row?.isConnected) {
+        const touchesRecoveryAnchor = record.target === observedMutationAnchor
+          || changedNodes.some((node) => (
+            node === observedMutationAnchor
+            || node?.contains?.(observedMutationAnchor)
+            || node === state.sidebar
+            || node?.contains?.(state.sidebar)
+          ));
+        if (touchesRecoveryAnchor) {
+          scheduleEnsure();
+          return;
+        }
+        continue;
       }
-      const inSidebar = record.target === state.sidebar || state.sidebar?.contains?.(record.target);
-      if (!inSidebar) continue;
+      const inAccountRow = record.target === state.row || state.row.contains?.(record.target);
+      if (!inAccountRow) continue;
       for (const node of changedNodes) {
         if (codexDom.nodeMayAffectLayout(node)) {
           scheduleLayout();
@@ -707,9 +995,17 @@
     if (window[STATE_KEY]?.installToken !== installToken) return false;
     window[DISABLED_KEY] = true;
     state.disposed = true;
+    configRequestId = null;
+    configRequestStartedAt = 0;
+    if (documentReadyListener !== null) {
+      window.removeEventListener("load", documentReadyListener);
+      documentReadyListener = null;
+    }
     coordinator.dispose();
     mutationObserver?.disconnect();
-    observedMutationSidebar = undefined;
+    observedMutationAnchor = undefined;
+    observedMutationTargets = [];
+    accountRecoveryPath = [];
     resizeObserver?.disconnect();
     observedSidebar = null;
     observedRow = null;
@@ -717,6 +1013,7 @@
     if (state.refreshTimer !== null) clearInterval(state.refreshTimer);
     if (state.closeTimer !== null) clearTimeout(state.closeTimer);
     clearResetCreditCountdown();
+    removeLaunchNotice();
     if (scheduler.ensureTimeout !== null) clearTimeout(scheduler.ensureTimeout);
     if (scheduler.timeout !== null) clearTimeout(scheduler.timeout);
     if (scheduler.frame !== null && typeof cancelAnimationFrame === "function") {
@@ -742,6 +1039,7 @@
 
   addListener(window, "message", handleMessage);
   addListener(window, "focus", () => {
+    requestConfiguredLocale();
     coordinator.focus();
     render();
   });
@@ -750,10 +1048,6 @@
     scheduleTooltipPosition();
   });
   addListener(window, "scroll", scheduleTooltipPosition, { capture: true, passive: true });
-  if (typeof MutationObserver === "function" && document.documentElement) {
-    mutationObserver = new MutationObserver(handleMutations);
-    observeMutations();
-  }
   state.refreshTimer = setInterval(
     () => coordinator.visibleTick(document.visibilityState !== "hidden"),
     usageModel.VISIBLE_REFRESH_MS,
@@ -765,6 +1059,7 @@
     mode: "usage",
     sessionMode: SESSION_MODE,
     managerToken: MANAGER_TOKEN,
+    showLaunchNotice,
     revision: REVISION,
     version: VERSION,
     diagnostics: () => ({
@@ -785,13 +1080,16 @@
       resetCountdownTimer: state.resetCountdownTimer !== null,
       bridgeAvailable: typeof window.electronBridge?.sendMessageFromView === "function",
       dataState: state.status,
-      visible: Boolean(state.hasWindows && !state.host?.hidden),
+      visible: Boolean(state.hasWindows && state.host?.isConnected && !state.host.hidden),
       stale: state.status === "stale",
       resetCreditCount: state.resetCredits.length,
+      resetCreditsResolved: state.resetCreditsResolved,
     }),
     metrics,
   };
+  waitForDocument();
   ensure();
+  requestConfiguredLocale(true);
   coordinator.request();
   return window[STATE_KEY].diagnostics();
 })();

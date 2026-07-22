@@ -45,6 +45,8 @@ opsail refit codex enable usage --launch
 
 默认 persistent 模式会启动经过校验的后台 manager，并在输出健康报告后返回；`--once` 仍是单次注入，诊断时可显式使用 `--foreground`。
 
+交互式等待会在 `stderr` 中显示当前经过校验的生命周期阶段，最终供程序读取的 JSON 仍只写入 `stdout`。
+
 支持目标、附加与启动模式、生命周期语义、renderer 更新、多语言、安全校验和库 API 请参阅 [`opsail-refit-codex`](crates/opsail-refit-codex/README.md)。
 
 ## 包结构

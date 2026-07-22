@@ -2,6 +2,8 @@ use std::fs;
 #[cfg(unix)]
 use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(unix)]
+use std::sync::Mutex;
+#[cfg(unix)]
 use std::thread;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
@@ -9,6 +11,9 @@ use std::time::{Duration, Instant};
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
 use tempfile::tempdir;
+
+#[cfg(unix)]
+static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 fn sample_html() -> String {
     let words = (0..140)
@@ -38,7 +43,9 @@ fn run_blocked_cli_until_signal(signal: &str) -> Option<i32> {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    thread::sleep(Duration::from_secs(1));
+    // The integration suite starts many short-lived CLI processes in parallel.
+    // Give this long-lived child time to install all Tokio signal handlers first.
+    thread::sleep(Duration::from_secs(3));
     assert!(child.try_wait().unwrap().is_none());
 
     let pid = child.id().to_string();
@@ -49,7 +56,7 @@ fn run_blocked_cli_until_signal(signal: &str) -> Option<i32> {
             .unwrap()
             .success()
     );
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Some(status) = child.try_wait().unwrap() {
             return status.code();
@@ -66,12 +73,18 @@ fn run_blocked_cli_until_signal(signal: &str) -> Option<i32> {
 #[cfg(unix)]
 #[test]
 fn foreground_cli_exits_on_interrupt() {
+    let _guard = SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(run_blocked_cli_until_signal("-INT"), Some(130));
 }
 
 #[cfg(unix)]
 #[test]
 fn foreground_cli_treats_terminal_stop_as_shutdown() {
+    let _guard = SIGNAL_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(run_blocked_cli_until_signal("-TSTP"), Some(130));
 }
 

@@ -105,11 +105,13 @@ function fakeClock() {
 
 function createRuntimeHarness({
   bridgeAvailable = true,
+  documentInitiallyUnavailable = false,
   nativeAccountRow = false,
   sidebarAvailable = true,
 } = {}) {
   const eventRegistry = { count: 0 };
   let runtimeNow = Date.now();
+  let runtimeSidebarAvailable = sidebarAvailable;
 
   class HarnessDate extends Date {
     constructor(...arguments_) {
@@ -230,8 +232,9 @@ function createRuntimeHarness({
       return null;
     }
 
-    matches() {
-      return false;
+    matches(selector) {
+      return this === this.ownerDocument.sidebar
+        && selector.startsWith("aside.app-shell-left-panel");
     }
 
     querySelectorAll(selector) {
@@ -285,8 +288,9 @@ function createRuntimeHarness({
         height: 800,
       };
       this.documentElement.append(this.head, this.body);
-      if (sidebarAvailable) this.body.append(this.sidebar);
+      if (runtimeSidebarAvailable) this.body.append(this.sidebar);
       if (nativeAccountRow) {
+        this.nativeLayoutQueryRoots = [];
         const row = new FakeElement("div", this);
         const accountSlot = new FakeElement("div", this);
         const accountControl = new FakeElement("button", this);
@@ -314,17 +318,27 @@ function createRuntimeHarness({
         accountSlot.append(accountControl);
         row.append(accountSlot, trailingAction);
         this.sidebar.append(row);
-        const querySelectorAll = this.sidebar.querySelectorAll.bind(this.sidebar);
-        this.sidebar.querySelectorAll = (selector) => {
-          if (selector === "img, [data-testid*='avatar' i], [class*='avatar' i]") {
-            return [avatar];
-          }
-          if (selector === "button, [role='button']") return [accountControl, trailingAction];
-          return querySelectorAll(selector);
+        const installNativeQueries = (root) => {
+          const querySelectorAll = root.querySelectorAll.bind(root);
+          root.querySelectorAll = (selector) => {
+            if (selector === "img, [data-testid*='avatar' i], [class*='avatar' i]") {
+              this.nativeLayoutQueryRoots.push(root);
+              return root.contains(avatar) ? [avatar] : [];
+            }
+            if (selector === "button, [role='button']") {
+              this.nativeLayoutQueryRoots.push(root);
+              return [accountControl, trailingAction]
+                .filter((element) => root.contains(element));
+            }
+            return querySelectorAll(selector);
+          };
         };
+        installNativeQueries(this.sidebar);
+        installNativeQueries(row);
         this.nativeLayout = { accountControl, accountSlot, avatar, row, trailingAction };
       }
       this.visibilityState = "visible";
+      this.readyState = documentInitiallyUnavailable ? "loading" : "complete";
     }
 
     createElement(tagName) {
@@ -337,15 +351,15 @@ function createRuntimeHarness({
 
     querySelector(selector) {
       if (selector.startsWith("aside.app-shell-left-panel")) {
-        return sidebarAvailable ? this.sidebar : null;
+        return runtimeSidebarAvailable && this.sidebar.isConnected ? this.sidebar : null;
       }
-      if (this.documentElement.id === selector.slice(1)) return this.documentElement;
-      return this.documentElement.querySelector(selector);
+      if (this.documentElement?.id === selector.slice(1)) return this.documentElement;
+      return this.documentElement?.querySelector(selector) || null;
     }
 
     querySelectorAll(selector) {
-      const values = this.documentElement.querySelectorAll(selector);
-      if (selector.startsWith("#") && this.documentElement.id === selector.slice(1)) {
+      const values = this.documentElement?.querySelectorAll(selector) || [];
+      if (selector.startsWith("#") && this.documentElement?.id === selector.slice(1)) {
         values.unshift(this.documentElement);
       }
       return values;
@@ -377,13 +391,16 @@ function createRuntimeHarness({
   class FakeMutationObserver {
     constructor(callback) {
       this.callback = callback;
+      this.observations = [];
     }
 
-    observe() {
+    observe(target, options) {
+      this.observations.push({ options, target });
       activeMutationObservers.add(this);
     }
 
     disconnect() {
+      this.observations = [];
       activeMutationObservers.delete(this);
     }
   }
@@ -398,6 +415,16 @@ function createRuntimeHarness({
   }
 
   const document = new FakeDocument();
+  const mountedDocument = {
+    body: document.body,
+    documentElement: document.documentElement,
+    head: document.head,
+  };
+  if (documentInitiallyUnavailable) {
+    document.body = null;
+    document.documentElement = null;
+    document.head = null;
+  }
   if (document.nativeLayout) {
     const originalCreateElement = document.createElement.bind(document);
     document.createElement = (tagName) => {
@@ -411,11 +438,16 @@ function createRuntimeHarness({
     };
   }
   const window = new FakeEventTarget();
+  const bridgeMessages = [];
   const sent = [];
+  const sendBridgeMessage = (message) => {
+    bridgeMessages.push(message);
+    if (message?.request?.method === "account/rateLimits/read") sent.push(message);
+  };
   Object.assign(window, {
     document,
     electronBridge: bridgeAvailable
-      ? { sendMessageFromView: (message) => sent.push(message) }
+      ? { sendMessageFromView: sendBridgeMessage }
       : undefined,
     innerHeight: 800,
     innerWidth: 1200,
@@ -447,6 +479,11 @@ function createRuntimeHarness({
 
   return {
     advanceNow: (milliseconds) => { runtimeNow += milliseconds; },
+    attachSidebar(parent = document.body) {
+      parent.append(document.sidebar);
+      runtimeSidebarAvailable = true;
+    },
+    bridgeMessages,
     activeCounts: () => ({
       animationFrames: animationFrames.size,
       eventListeners: eventRegistry.count,
@@ -457,8 +494,20 @@ function createRuntimeHarness({
     }),
     context,
     document,
+    mountDocument() {
+      document.body = mountedDocument.body;
+      document.documentElement = mountedDocument.documentElement;
+      document.head = mountedDocument.head;
+      document.readyState = "complete";
+    },
     nativeLayout: document.nativeLayout || null,
     now: () => runtimeNow,
+    runPendingTimeouts() {
+      const pending = [...timeouts.entries()];
+      for (const [id] of pending) timeouts.delete(id);
+      for (const [, callback] of pending) callback();
+      flushAnimationFrames();
+    },
     respondWithWeekly({ resetsAt, resetCredits } = {}) {
       const requestId = sent.at(-1)?.request?.id;
       assert.ok(requestId);
@@ -483,6 +532,30 @@ function createRuntimeHarness({
       flushAnimationFrames();
     },
     sent,
+    setBridgeAvailable(available) {
+      window.electronBridge = available
+        ? { sendMessageFromView: sendBridgeMessage }
+        : undefined;
+    },
+    mutationObservations: () => [...activeMutationObservers]
+      .flatMap((observer) => observer.observations),
+    triggerMutations(records) {
+      for (const observer of [...activeMutationObservers]) observer.callback(records);
+      flushAnimationFrames();
+    },
+    triggerObservedMutations(records) {
+      for (const observer of [...activeMutationObservers]) {
+        const matching = records.filter((record) => observer.observations.some((observation) => (
+          record.type === "childList"
+          && observation.options.childList === true
+          && (observation.target === record.target
+            || (observation.options.subtree === true
+              && observation.target.contains(record.target)))
+        )));
+        if (matching.length > 0) observer.callback(matching);
+      }
+      flushAnimationFrames();
+    },
     triggerResize() {
       for (const observer of activeResizeObservers) observer.callback([]);
       flushAnimationFrames();
@@ -572,7 +645,7 @@ test("partial notifications merge by field presence", async () => {
   );
 });
 
-test("window reset uses one complete localized line without duplicate relative text", async () => {
+test("window reset exposes a conservative countdown and exact local timestamp", async () => {
   const model = await loadModel();
   const english = model.selectLocale("en-US");
   const chinese = model.selectLocale("zh-CN");
@@ -588,25 +661,32 @@ test("window reset uses one complete localized line without duplicate relative t
   const englishReset = model.presentWindows(snapshot, english, "en-US", now)[0].reset;
   const chineseReset = model.presentWindows(snapshot, chinese, "zh-CN", now)[0].reset;
   const resetDate = new Date(resetsAt * 1000);
-  const expectedDisplay = new Intl.DateTimeFormat("en-US", {
-    weekday: "short",
-    month: "short",
-    day: "numeric",
-    hour: "numeric",
-    minute: "2-digit",
-  }).format(resetDate);
+  const part = (number, width = 2) => String(number).padStart(width, "0");
+  const expectedDisplay = `${part(resetDate.getFullYear(), 4)}-${part(resetDate.getMonth() + 1)}`
+    + `-${part(resetDate.getDate())} ${part(resetDate.getHours())}`
+    + `:${part(resetDate.getMinutes())}:${part(resetDate.getSeconds())}`;
   const expectedFull = new Intl.DateTimeFormat("en-US", {
     dateStyle: "full",
     timeStyle: "long",
   }).format(resetDate);
   assert.equal(
     model.formatMessage(english.windowReset, englishReset),
-    `Resets ${expectedDisplay}`,
+    expectedDisplay,
+  );
+  assert.equal(
+    model.formatMessage(english.windowResetCountdown, englishReset),
+    "Resets in 6d 16h",
   );
   assert.equal(englishReset.display, expectedDisplay);
   assert.equal(englishReset.full, expectedFull);
-  assert.match(model.formatMessage(chinese.windowReset, chineseReset), /^额度重置：/);
-  assert.doesNotMatch(model.formatMessage(chinese.windowReset, chineseReset), /本地时间/);
+  assert.equal(
+    model.formatMessage(chinese.windowResetCountdown, chineseReset),
+    "距重置还有 6 天 16 小时",
+  );
+  assert.equal(
+    model.formatMessage(chinese.windowReset, chineseReset),
+    expectedDisplay,
+  );
   assert.doesNotMatch(englishReset.full, /…|\.\.\./);
 
   const empty = model.normalizeSnapshot({ primary: null, secondary: { usedPercent: null } });
@@ -614,13 +694,13 @@ test("window reset uses one complete localized line without duplicate relative t
   assert.equal(model.summaryFor(model.presentWindows(empty, english), english), "");
 });
 
-test("available reset credits become a sorted localized expiry list only", async () => {
+test("available reset credits become a sorted 24-hour local expiry list", async () => {
   const model = await loadModel();
   const english = model.selectLocale("en-US");
   const chinese = model.selectLocale("zh-CN");
   const now = new Date(2030, 6, 22, 0, 3, 4).getTime();
-  const first = new Date(2030, 7, 1, 12, 43, 44).getTime() / 1000;
-  const second = new Date(2030, 7, 12, 12, 3, 4).getTime() / 1000;
+  const first = new Date(2030, 7, 1, 14, 43, 44).getTime() / 1000;
+  const second = new Date(2030, 7, 12, 18, 3, 4).getTime() / 1000;
   const normalized = model.normalizeResetCredits({
     availableCount: 5,
     credits: [
@@ -634,23 +714,24 @@ test("available reset credits become a sorted localized expiry list only", async
   });
   const englishItems = model.presentResetCredits(normalized, english, "en-US", now);
   const chineseItems = model.presentResetCredits(normalized, chinese, "zh-CN", now);
-  const expectedDateTime = "2030-08-01 12:43:44";
+  const expectedDateTime = "2030-08-01 14:43:44";
 
   assert.equal(englishItems.length, 2);
   assert.equal(englishItems[0].expiresAt, first);
   assert.equal(englishItems[1].expiresAt, second);
   assert.equal(englishItems[0].dateTime, expectedDateTime);
+  assert.doesNotMatch(englishItems[0].dateTime, /\b(?:AM|PM)\b/i);
   assert.equal(
     model.formatMessage(english.resetCreditExpires, englishItems[0]),
     `Expires ${expectedDateTime}`,
   );
   assert.equal(
     model.formatMessage(english.resetCreditCountdown, englishItems[0]),
-    "10d 12h remaining",
+    "10d 14h remaining",
   );
   assert.equal(
     model.formatMessage(chinese.resetCreditCountdown, chineseItems[0]),
-    "剩余 10 天 12 小时",
+    "剩余 10 天 14 小时",
   );
   assert.match(model.formatMessage(chinese.resetCreditExpires, chineseItems[0]), /过期$/);
   assert.ok(englishItems[0].nextUpdateMs > 0);
@@ -676,6 +757,11 @@ test("available reset credits become a sorted localized expiry list only", async
     JSON.parse(JSON.stringify(model.normalizeResetCredits(null))),
     [],
   );
+  assert.equal(model.normalizeResetCreditsUpdate(null), null);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(model.normalizeResetCreditsUpdate({ credits: [] }))),
+    [],
+  );
 });
 
 test("locale JSON selects an exact locale, then language family, then English", async () => {
@@ -686,7 +772,9 @@ test("locale JSON selects an exact locale, then language family, then English", 
   assert.equal(localeBundle.supportedLocales.length, 65);
   assert.equal(new Set(localeBundle.supportedLocales).size, 65);
   for (const locale of localeBundle.supportedLocales) {
-    assert.equal(model.selectLocale(locale).locale.toLowerCase(), locale.toLowerCase());
+    const copy = model.selectLocale(locale);
+    assert.equal(copy.locale.toLowerCase(), locale.toLowerCase());
+    assert.match(copy.timeFormatNote, /24/);
   }
   assert.equal(model.selectLocale("zh-Hans-CN").locale, "zh-Hans-CN");
   assert.equal(model.selectLocale("fr-CA").usageTitle, "Limites d’utilisation");
@@ -757,6 +845,13 @@ test("notification calibration is debounced and waits for an active read", async
   coordinator.finish(initial);
   assert.equal(sent.length, 2);
   assert.equal(model.NOTIFICATION_CALIBRATION_MS, 1200);
+
+  coordinator.finish(sent[1]);
+  coordinator.scheduleCalibration(3000);
+  clock.advance(2999);
+  assert.equal(sent.length, 2);
+  clock.advance(1);
+  assert.equal(sent.length, 3);
   coordinator.dispose();
 });
 
@@ -891,6 +986,33 @@ test("runtime and CSS enforce cleanup, quiet failure, theme colors, and complete
   assert.match(css, /--opsail-refit-usage-details-width,\s*240px/);
   assert.match(css, /\.opsail-refit-codex-reset-credits-table/);
   assert.match(css, /\.opsail-refit-codex-reset-credits-row\s*\+\s*\.opsail-refit-codex-reset-credits-row/);
+  assert.match(css, /\.opsail-refit-codex-time-format-note/);
+  const noticeCss = css.match(/#opsail-refit-codex-launch-notice\s*\{[\s\S]*?\n\}/)?.[0];
+  assert.ok(noticeCss);
+  const noticeDeclaration = (property) => noticeCss
+    .match(new RegExp(`\\n\\s*${property}:\\s*([^;]+);`))?.[1];
+  const noticeBackground = noticeDeclaration("background");
+  const noticeForeground = noticeDeclaration("color");
+  assert.equal(noticeDeclaration("top"), "30%");
+  assert.match(noticeBackground, /--color-token-activity-bar-badge-background/);
+  assert.match(noticeForeground, /--color-token-activity-bar-badge-foreground/);
+  const codexThemeFixture = new Map([
+    ["--color-token-button-background", "same-button-color"],
+    ["--color-token-button-foreground", "same-button-color"],
+    ["--color-token-activity-bar-badge-background", "accent-background"],
+    ["--color-token-activity-bar-badge-foreground", "accent-foreground"],
+  ]);
+  const resolveFixtureToken = (declaration) => [...declaration.matchAll(/var\((--[\w-]+)/g)]
+    .map(([, token]) => codexThemeFixture.get(token))
+    .find(Boolean);
+  assert.notEqual(
+    resolveFixtureToken(noticeBackground),
+    resolveFixtureToken(noticeForeground),
+  );
+  assert.match(
+    css,
+    /\.opsail-refit-codex-launch-notice-message\s*\{[\s\S]*?color:\s*inherit/,
+  );
   assert.match(css, /prefers-reduced-motion/);
   assert.doesNotMatch(css, /(?:rgb|rgba|hsl|hsla)\s*\(/i);
   assert.doesNotMatch(css, /#[0-9a-f]{3,8}\b/i);
@@ -1123,6 +1245,7 @@ test("the Rust-assembled renderer payload is valid JavaScript", async () => {
     assembleControlSource("probe"),
     assembleControlSource("early", { currentPayload: source }),
     assembleControlSource("status"),
+    assembleControlSource("launch-notice"),
     assembleControlSource("disable"),
   ]);
 
@@ -1136,11 +1259,100 @@ test("the Rust-assembled renderer payload is valid JavaScript", async () => {
   }
 });
 
+test("persistent bootstrap waits for document initialization before installing observers", async () => {
+  const { source } = await assembleRuntimeSource({ sessionMode: "persistent" });
+  const harness = createRuntimeHarness({
+    documentInitiallyUnavailable: true,
+    nativeAccountRow: true,
+  });
+
+  assert.doesNotThrow(() => new vm.Script(source).runInContext(harness.context));
+  let diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.hostCount, 0);
+  assert.equal(diagnostics.mutationObserver, false);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+
+  harness.mountDocument();
+  harness.window.dispatch("load", {});
+  harness.runPendingTimeouts();
+
+  diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.hostCount, 1);
+  assert.equal(diagnostics.mutationObserver, true);
+  assert.equal(diagnostics.visible, true);
+  assert.equal(
+    harness.document.getElementById("opsail-refit-codex-usage").children[0].textContent,
+    "weekly 28%",
+  );
+});
+
+test("persistent bootstrap retries local reads when the preload bridge becomes ready", async () => {
+  const { source } = await assembleRuntimeSource({ sessionMode: "persistent" });
+  const harness = createRuntimeHarness({
+    bridgeAvailable: false,
+    documentInitiallyUnavailable: true,
+    nativeAccountRow: true,
+  });
+  new vm.Script(source).runInContext(harness.context);
+  assert.equal(harness.sent.length, 0);
+
+  harness.setBridgeAvailable(true);
+  harness.mountDocument();
+  harness.window.dispatch("load", {});
+
+  assert.equal(harness.sent.length, 1);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().visible,
+    true,
+  );
+  harness.window.__OPSAIL_REFIT_CODEX_STATE__.cleanup();
+  assert.equal(harness.activeCounts().timeouts, 0);
+});
+
+test("bootstrap observes a nested app shell only until the account row is discovered", async () => {
+  const { source } = await assembleRuntimeSource({ sessionMode: "persistent" });
+  const harness = createRuntimeHarness({
+    nativeAccountRow: true,
+    sidebarAvailable: false,
+  });
+  const shellRoot = harness.document.createElement("main");
+  harness.document.body.append(shellRoot);
+  new vm.Script(source).runInContext(harness.context);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+
+  assert.ok(harness.mutationObservations().some(({ options, target }) => (
+    target === harness.document.body
+    && options.childList === true
+    && options.subtree === true
+  )));
+
+  harness.attachSidebar(shellRoot);
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: shellRoot,
+    addedNodes: [harness.document.sidebar],
+    removedNodes: [],
+  }]);
+  harness.runPendingTimeouts();
+
+  const diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.visible, true);
+  assert.ok(harness.mutationObservations().some(({ options, target }) => (
+    target === harness.nativeLayout.row
+    && options.childList === true
+    && options.subtree === true
+  )));
+  assert.equal(harness.mutationObservations().some(({ options, target }) => (
+    target === harness.document.sidebar && options.subtree === true
+  )), false);
+});
+
 test("runtime mounts one inline capsule and keeps it stable across remeasurement", async () => {
   const { source } = await assembleRuntimeSource();
   const harness = createRuntimeHarness({ nativeAccountRow: true });
   new vm.Script(source).runInContext(harness.context);
-  harness.respondWithWeekly();
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
 
   const host = harness.document.getElementById("opsail-refit-codex-usage");
   let diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
@@ -1155,6 +1367,7 @@ test("runtime mounts one inline capsule and keeps it stable across remeasurement
     "100px",
   );
 
+  harness.document.nativeLayoutQueryRoots.length = 0;
   harness.triggerResize();
   diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
   assert.equal(diagnostics.visible, true);
@@ -1164,6 +1377,107 @@ test("runtime mounts one inline capsule and keeps it stable across remeasurement
     harness.nativeLayout.row.children.filter((child) => child === host).length,
     1,
   );
+  assert.ok(harness.document.nativeLayoutQueryRoots.length > 0);
+  assert.equal(
+    harness.document.nativeLayoutQueryRoots.some((root) => root === harness.document.sidebar),
+    false,
+  );
+  assert.ok(
+    harness.document.nativeLayoutQueryRoots.every((root) => root === harness.nativeLayout.row),
+  );
+});
+
+test("stable runtime observes the account row without reacting to chat-list mutations", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+
+  const observations = harness.mutationObservations();
+  assert.ok(observations.some(({ options, target }) => (
+    target === harness.nativeLayout.row
+    && options.childList === true
+    && options.subtree === true
+  )));
+  assert.equal(observations.some(({ options, target }) => (
+    target === harness.document.sidebar && options.subtree === true
+  )), false);
+
+  const state = harness.window.__OPSAIL_REFIT_CODEX_STATE__;
+  const layoutsBefore = state.metrics.layoutCalls;
+  const chatAction = harness.document.createElement("button");
+  chatAction.matches = (selector) => selector === "button, [role='button']";
+  harness.document.sidebar.append(chatAction);
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: harness.document.sidebar,
+    addedNodes: [chatAction],
+    removedNodes: [],
+  }]);
+
+  assert.equal(state.metrics.layoutCalls, layoutsBefore);
+});
+
+test("settings removal widens only to structural ancestors and narrows after account recovery", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  const sessionList = harness.document.createElement("div");
+  harness.document.sidebar.append(sessionList);
+  new vm.Script(source).runInContext(harness.context);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+
+  const state = harness.window.__OPSAIL_REFIT_CODEX_STATE__;
+  const host = harness.document.getElementById("opsail-refit-codex-usage");
+  const row = harness.nativeLayout.row;
+  row.remove();
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: harness.document.sidebar,
+    addedNodes: [],
+    removedNodes: [row],
+  }]);
+  harness.runPendingTimeouts();
+
+  assert.equal(state.diagnostics().visible, false);
+  assert.ok(harness.mutationObservations().some(({ options, target }) => (
+    target === harness.document.sidebar
+    && options.childList === true
+    && options.subtree === false
+  )));
+  assert.equal(harness.mutationObservations().some(({ options, target }) => (
+    target === harness.document.sidebar && options.subtree === true
+  )), false);
+
+  const ensuresBeforeLoading = state.metrics.ensureCalls;
+  const layoutsBeforeLoading = state.metrics.layoutCalls;
+  const loadingNode = harness.document.createElement("div");
+  sessionList.append(loadingNode);
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: sessionList,
+    addedNodes: [loadingNode],
+    removedNodes: [],
+  }]);
+  assert.equal(state.metrics.ensureCalls, ensuresBeforeLoading);
+  assert.equal(state.metrics.layoutCalls, layoutsBeforeLoading);
+
+  harness.document.sidebar.append(row);
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: harness.document.sidebar,
+    addedNodes: [row],
+    removedNodes: [],
+  }]);
+  harness.runPendingTimeouts();
+
+  assert.equal(state.diagnostics().visible, true);
+  assert.equal(host.parentElement, row);
+  assert.ok(harness.mutationObservations().some(({ options, target }) => (
+    target === row && options.childList === true && options.subtree === true
+  )));
+  assert.equal(harness.mutationObservations().some(({ options, target }) => (
+    target === harness.document.sidebar && options.subtree === true
+  )), false);
 });
 
 test("runtime follows Codex language changes instead of the system language", async () => {
@@ -1202,14 +1516,19 @@ test("runtime follows Codex language changes instead of the system language", as
   const resetCreditTitle = resetCredits.children[0];
   const resetCreditTable = resetCredits.children[1];
   const resetCreditBody = resetCreditTable.children[0];
+  const timeFormatNote = details.children[4];
   assert.equal(details.parentElement, harness.document.body);
   assert.equal(details.attributes.get("role"), "tooltip");
   host.dispatch("pointerenter", {});
+  harness.triggerResize();
   assert.equal(details.dataset.opsailRefitCodexOpen, "true");
   assert.equal(details.attributes.get("aria-hidden"), "false");
   assert.equal(host.children[0].textContent, "weekly 28%");
   assert.match(meta.textContent, /^72% used\nResets /);
-  assert.doesNotMatch(meta.textContent, /Resets in|local time/);
+  assert.match(
+    meta.textContent,
+    /^72% used\nResets in \d+d \d+h\n\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
+  );
   assert.equal(resetCredits.hidden, false);
   assert.equal(resetCreditTitle.textContent, "Usage limit resets");
   assert.equal(resetCreditTable.tagName, "TABLE");
@@ -1221,6 +1540,7 @@ test("runtime follows Codex language changes instead of the system language", as
     /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
   );
   assert.match(resetCreditBody.children[0].children[1].textContent, /^\d+d \d+h$/);
+  assert.equal(timeFormatNote.textContent, "Times use local time (24-hour clock).");
   assert.equal(harness.activeCounts().timeouts, 1);
   assert.doesNotMatch(
     resetCreditBody.children
@@ -1230,8 +1550,10 @@ test("runtime follows Codex language changes instead of the system language", as
   );
   harness.triggerLanguage("zh-CN");
   assert.equal(host.children[0].textContent, "周剩余 28%");
-  assert.match(meta.textContent, /^已用 72%\n额度重置： /);
-  assert.doesNotMatch(meta.textContent, /本地时间/);
+  assert.match(
+    meta.textContent,
+    /^已用 72%\n距重置还有 \d+ 天 \d+ 小时\n\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
+  );
   assert.match(meta.attributes.get("aria-label"), /^已用 72%。.*重置$/);
   assert.equal(resetCreditTitle.textContent, "可用重置");
   assert.match(
@@ -1239,12 +1561,88 @@ test("runtime follows Codex language changes instead of the system language", as
     /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
   );
   assert.match(resetCreditBody.children[0].children[1].textContent, /^\d+ 天/);
+  assert.equal(timeFormatNote.textContent, "时间均为本地时间（24 小时制）");
   assert.equal(
     details.attributes.get("aria-label"),
     "使用额度",
   );
   harness.window.__OPSAIL_REFIT_CODEX_STATE__.cleanup();
   assert.equal(harness.activeCounts().timeouts, 0);
+});
+
+test("runtime reads localeOverride and recalibrates it after Settings restores the account row", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+
+  const localeRequests = () => harness.bridgeMessages.filter(
+    (message) => message?.request?.method === "config/read",
+  );
+  const respondWithLocale = (request, localeOverride) => {
+    harness.window.dispatch("message", {
+      data: {
+        hostId: "local",
+        type: "mcp-response",
+        message: {
+          id: request.request.id,
+          result: {
+            config: {
+              desktop: {
+                localeOverride,
+                unrelatedSensitiveValue: "must-not-be-retained",
+              },
+            },
+          },
+        },
+      },
+    });
+  };
+
+  assert.equal(localeRequests().length, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(localeRequests()[0].request.params)),
+    { cwd: null, includeLayers: false },
+  );
+  respondWithLocale(localeRequests()[0], "en-US");
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+
+  const state = harness.window.__OPSAIL_REFIT_CODEX_STATE__;
+  const host = harness.document.getElementById("opsail-refit-codex-usage");
+  const row = harness.nativeLayout.row;
+  assert.equal(host.children[0].textContent, "weekly 28%");
+  assert.equal(state.diagnostics().language, "en-US");
+  assert.equal(Object.hasOwn(state, "config"), false);
+
+  row.remove();
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: harness.document.sidebar,
+    addedNodes: [],
+    removedNodes: [row],
+  }]);
+  harness.runPendingTimeouts();
+  harness.document.sidebar.append(row);
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: harness.document.sidebar,
+    addedNodes: [row],
+    removedNodes: [],
+  }]);
+  harness.runPendingTimeouts();
+
+  assert.equal(localeRequests().length, 2);
+  respondWithLocale(localeRequests()[1], "zh-CN");
+  assert.equal(host.children[0].textContent, "周剩余 28%");
+  assert.equal(state.diagnostics().language, "zh-CN");
+  assert.doesNotMatch(JSON.stringify(state.diagnostics()), /must-not-be-retained/);
+
+  harness.window.dispatch("focus", {});
+  assert.equal(localeRequests().length, 2);
+  harness.advanceNow(1_001);
+  harness.window.dispatch("focus", {});
+  assert.equal(localeRequests().length, 3);
+  respondWithLocale(localeRequests()[2], "zh-CN");
+  assert.equal(state.metrics.localeRequests, 3);
 });
 
 test("opening usage details recalibrates reset countdowns from the current time", async () => {
@@ -1279,6 +1677,244 @@ test("opening usage details recalibrates reset countdowns from the current time"
   assert.equal(countdownText(), "1h");
 });
 
+test("an initially omitted reset-credit field gets one bounded calibration and preserves later data", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+
+  assert.equal(harness.sent.length, 1);
+  harness.respondWithWeekly();
+  assert.equal(harness.activeCounts().timeouts, 1);
+
+  harness.runPendingTimeouts();
+  assert.equal(harness.sent.length, 2);
+  harness.respondWithWeekly({
+    resetCredits: {
+      credits: [{
+        status: "available",
+        expiresAt: (harness.now() + 10 * 24 * 60 * 60 * 1000) / 1000,
+      }],
+    },
+  });
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
+    1,
+  );
+  assert.equal(harness.activeCounts().timeouts, 0);
+
+  harness.advanceNow(60 * 1000);
+  harness.window.dispatch("focus", {});
+  assert.equal(harness.sent.length, 3);
+  harness.respondWithWeekly();
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
+    1,
+  );
+  assert.equal(harness.activeCounts().timeouts, 0);
+});
+
+test("null reset-credit snapshots stay provisional and cannot erase a valid list", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+
+  harness.respondWithWeekly({ resetCredits: null });
+  assert.equal(harness.activeCounts().timeouts, 1);
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditsResolved,
+    false,
+  );
+
+  harness.runPendingTimeouts();
+  assert.equal(harness.sent.length, 2);
+  harness.respondWithWeekly({
+    resetCredits: {
+      credits: [{
+        status: "available",
+        expiresAt: (harness.now() + 10 * 24 * 60 * 60 * 1000) / 1000,
+      }],
+    },
+  });
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
+    1,
+  );
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditsResolved,
+    true,
+  );
+
+  harness.advanceNow(60 * 1000);
+  harness.window.dispatch("focus", {});
+  harness.respondWithWeekly({ resetCredits: null });
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
+    1,
+  );
+
+  harness.advanceNow(60 * 1000);
+  harness.window.dispatch("focus", {});
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
+    0,
+  );
+});
+
+test("quota windows and delayed reset credits merge through the same payload path", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+
+  harness.respondWithWeekly({ resetCredits: null });
+  let diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.visible, true);
+  assert.equal(diagnostics.resetCreditCount, 0);
+
+  harness.runPendingTimeouts();
+  const requestId = harness.sent.at(-1)?.request?.id;
+  assert.ok(requestId);
+  harness.window.dispatch("message", {
+    data: {
+      hostId: "local",
+      type: "mcp-response",
+      message: {
+        id: requestId,
+        result: {
+          rateLimitResetCredits: {
+            credits: [{
+              status: "available",
+              expiresAt: (harness.now() + 10 * 24 * 60 * 60 * 1000) / 1000,
+            }],
+          },
+        },
+      },
+    },
+  });
+
+  diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.visible, true);
+  assert.equal(diagnostics.stale, false);
+  assert.equal(diagnostics.resetCreditCount, 1);
+  assert.equal(diagnostics.resetCreditsResolved, true);
+
+  harness.window.dispatch("message", {
+    data: {
+      hostId: "local",
+      type: "mcp-notification",
+      method: "account/rateLimits/updated",
+      params: { rateLimitResetCredits: { credits: [] } },
+    },
+  });
+  diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.visible, true);
+  assert.equal(diagnostics.resetCreditCount, 0);
+});
+
+test("unresolved reset credits use bounded startup calibration delays", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+
+  for (let response = 0; response < 4; response += 1) {
+    harness.respondWithWeekly({ resetCredits: null });
+    const expectedPending = response < 3 ? 1 : 0;
+    assert.equal(harness.activeCounts().timeouts, expectedPending);
+    if (expectedPending) harness.runPendingTimeouts();
+  }
+
+  assert.equal(harness.sent.length, 4);
+  assert.equal(
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditsResolved,
+    false,
+  );
+});
+
+test("an unusable startup snapshot gets one bounded calibration before the capsule stays hidden", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+
+  const requestId = harness.sent.at(-1)?.request?.id;
+  assert.ok(requestId);
+  harness.window.dispatch("message", {
+    data: {
+      hostId: "local",
+      type: "mcp-response",
+      message: {
+        id: requestId,
+        result: {
+          rateLimits: {
+            primary: null,
+            secondary: {
+              usedPercent: null,
+              windowDurationMins: 10080,
+            },
+          },
+          rateLimitResetCredits: null,
+        },
+      },
+    },
+  });
+  assert.equal(harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().visible, false);
+  assert.equal(harness.activeCounts().timeouts, 1);
+
+  harness.runPendingTimeouts();
+  assert.equal(harness.sent.length, 2);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+  assert.equal(harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().visible, true);
+  assert.equal(harness.activeCounts().timeouts, 0);
+});
+
+test("runtime restores the capsule when a routed sidebar returns under a new wrapper", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+
+  const host = harness.document.getElementById("opsail-refit-codex-usage");
+  const sidebar = harness.document.sidebar;
+  const steadyCounts = harness.activeCounts();
+  for (let cycle = 0; cycle < 3; cycle += 1) {
+    const previousParent = sidebar.parentElement;
+    sidebar.remove();
+    harness.triggerObservedMutations([{
+      type: "childList",
+      target: previousParent,
+      addedNodes: [],
+      removedNodes: [sidebar],
+    }]);
+    harness.runPendingTimeouts();
+    assert.equal(harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().visible, false);
+
+    const routeWrapper = harness.document.createElement("div");
+    harness.document.body.append(routeWrapper);
+    harness.triggerObservedMutations([{
+      type: "childList",
+      target: harness.document.body,
+      addedNodes: [routeWrapper],
+      removedNodes: [],
+    }]);
+    host.remove();
+    routeWrapper.append(sidebar);
+    harness.triggerObservedMutations([{
+      type: "childList",
+      target: routeWrapper,
+      addedNodes: [sidebar],
+      removedNodes: [],
+    }]);
+    harness.runPendingTimeouts();
+
+    const restored = harness.document.getElementById("opsail-refit-codex-usage");
+    assert.ok(restored);
+    assert.equal(restored === host, true);
+    assert.equal(restored.hidden, false);
+    assert.equal(restored.parentElement, harness.nativeLayout.row);
+    assert.equal(harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().visible, true);
+    assert.deepEqual(harness.activeCounts(), steadyCounts);
+  }
+});
+
 test("repeated renderer installation stays singular and cleanup releases every resource", async () => {
   const { source } = await assembleRuntimeSource();
   const script = new vm.Script(source);
@@ -1288,7 +1924,7 @@ test("repeated renderer installation stays singular and cleanup releases every r
   let diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
   assert.equal(diagnostics.hostCount, 0);
   assert.equal(diagnostics.visible, false);
-  harness.respondWithWeekly();
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
   diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
   assert.equal(diagnostics.hostCount, 1);
   assert.equal(diagnostics.styleCount, 1);
@@ -1313,7 +1949,7 @@ test("repeated renderer installation stays singular and cleanup releases every r
   );
 
   script.runInContext(harness.context);
-  harness.respondWithWeekly();
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
   diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
   assert.equal(diagnostics.hostCount, 1);
   assert.equal(diagnostics.styleCount, 1);
@@ -1350,7 +1986,7 @@ test("shared renderer control routes status and disable without leaking resource
   ]);
   const harness = createRuntimeHarness();
   new vm.Script(runtime).runInContext(harness.context);
-  harness.respondWithWeekly();
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
 
   const statusResult = new vm.Script(status).runInContext(harness.context);
   assert.equal(statusResult.installed, true);
@@ -1371,6 +2007,49 @@ test("shared renderer control routes status and disable without leaking resource
   });
 });
 
+test("launch success notice is localized, centered, singular, and cleaned up", async () => {
+  const [
+    { source: runtime },
+    { source: launchNotice },
+    { source: disable },
+  ] = await Promise.all([
+    assembleRuntimeSource(),
+    assembleControlSource("launch-notice"),
+    assembleControlSource("disable"),
+  ]);
+  const harness = createRuntimeHarness();
+  new vm.Script(runtime).runInContext(harness.context);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+
+  const first = new vm.Script(launchNotice).runInContext(harness.context);
+  assert.equal(first.shown, true);
+  let notice = harness.document.getElementById("opsail-refit-codex-launch-notice");
+  assert.ok(notice);
+  assert.equal(notice.parentElement, harness.document.body);
+  assert.equal(notice.attributes.get("role"), "status");
+  assert.equal(notice.attributes.get("aria-live"), "polite");
+  assert.equal(notice.children[0].textContent, "Opsail mode enabled");
+  assert.equal(notice.children[1].textContent, "Usage display is ready.");
+  assert.equal(harness.activeCounts().timeouts, 1);
+
+  harness.triggerLanguage("zh-CN");
+  const second = new vm.Script(launchNotice).runInContext(harness.context);
+  assert.equal(second.shown, true);
+  assert.equal(
+    harness.document.querySelectorAll("#opsail-refit-codex-launch-notice").length,
+    1,
+  );
+  notice = harness.document.getElementById("opsail-refit-codex-launch-notice");
+  assert.equal(notice.children[0].textContent, "已进入 Opsail 模式");
+  assert.equal(notice.children[1].textContent, "额度显示已成功注入");
+  assert.equal(harness.activeCounts().timeouts, 1);
+
+  const result = new vm.Script(disable).runInContext(harness.context);
+  assert.equal(result.clean, true);
+  assert.equal(harness.document.getElementById("opsail-refit-codex-launch-notice"), null);
+  assert.equal(harness.activeCounts().timeouts, 0);
+});
+
 test("missing bridge and sidebar fail quietly without renderer control side effects", async () => {
   const { source } = await assembleRuntimeSource();
   const harness = createRuntimeHarness({
@@ -1385,5 +2064,22 @@ test("missing bridge and sidebar fail quietly without renderer control side effe
   assert.equal(diagnostics.hostCount, 0);
   assert.equal(diagnostics.visible, false);
   assert.equal(harness.sent.length, 0);
+  const bodyObservation = harness.mutationObservations()
+    .find(({ target }) => target === harness.document.body);
+  assert.ok(bodyObservation);
+  assert.equal(bodyObservation.options.childList, true);
+  assert.equal(bodyObservation.options.subtree, true);
+  const ensureCalls = state.metrics.ensureCalls;
+  const unrelatedContainer = harness.document.createElement("div");
+  const unrelatedContent = harness.document.createElement("article");
+  harness.document.body.append(unrelatedContainer);
+  unrelatedContainer.append(unrelatedContent);
+  harness.triggerObservedMutations([{
+    type: "childList",
+    target: unrelatedContainer,
+    addedNodes: [unrelatedContent],
+    removedNodes: [],
+  }]);
+  assert.equal(state.metrics.ensureCalls, ensureCalls);
   assert.equal(state.cleanup(), true);
 });
