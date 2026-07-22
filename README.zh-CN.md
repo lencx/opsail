@@ -10,7 +10,7 @@
   <a href="https://github.com/lencx/opsail/blob/main/README.md">English</a> | 简体中文
 </p>
 
-<a href="https://www.buymeacoffee.com/lencx" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" alt="Buy Me A Coffee" style="height: 40px !important;width: 145px !important;" ></a>
+<a href="https://www.buymeacoffee.com/lencx" target="_blank"><img height="40" width="145" src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" alt="Buy Me A Coffee"></a>
 
 Opsail 是一个模块化原生工具集，通过统一的命令行入口，为软件 Agent 提供小而可组合、行为可靠的能力。它使用职责清晰的 Rust crate 隔离内容获取、浏览器控制、正文提取和应用适配，并通过 Node.js 包方便地嵌入同一套原生运行时。
 
@@ -33,13 +33,13 @@ opsail read https://example.com/article
 opsail read https://example.com/app --launch
 ```
 
-内容获取、正文提取、结果契约和 Rust API 请参阅 [`opsail-read`](crates/opsail-read/README.md)；Chrome 发现、自有启动、借用 CDP、页面导航和渲染 DOM 捕获请参阅 [`opsail-chrome`](crates/opsail-chrome/README.md)。
+内容获取、正文提取、结果契约和 Rust API 请参阅 [`opsail-read`](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md)；Chrome 发现、自有启动、借用 CDP、页面导航和渲染 DOM 捕获请参阅 [`opsail-chrome`](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md)。
 
 ### Codex Refit
 
 `opsail refit codex` 提供可逆且经过目标校验的 Codex 适配器。它的首个功能通过 renderer 已有的本地 bridge，在 Codex 左侧栏显示本地化的剩余额度信息，不调用模型，也不修改应用包。
 
-![refit-codex](assets/refit-codex.png)
+![refit-codex](https://raw.githubusercontent.com/lencx/opsail/main/assets/refit-codex.png)
 
 Refit 目标已实现对签名 macOS 应用和 Windows 当前用户 Microsoft Store 应用的支持；Linux 不支持。Windows 发布目标为 x64 和 ARM64，不提供 32 位 x86/ia32 产物。Windows 实现使用精确的包家族名和 AUMID 定位应用，从已安装的签名 manifest 中解析可执行文件（当前为 `app\ChatGPT.exe`），并使用仅授权当前用户和 SYSTEM 的显式 DACL 保护 Local AppData 状态。Windows x64 和 ARM64 都已配置原生 CI 与 npm 打包目标；已在 Windows 11 ARM64 的 Store 应用上完成包激活、端口归属、renderer 发现、bridge 注入、持久模式与清理的端到端验证，真实 x64 Store 应用 canary 仍待完成，托管 CI 覆盖未安装目标包的路径。
 
@@ -51,17 +51,17 @@ opsail refit codex enable usage --launch
 
 交互式等待会在 `stderr` 中显示当前经过校验的生命周期阶段，最终供程序读取的 JSON 仍只写入 `stdout`。
 
-支持目标、附加与启动模式、生命周期语义、renderer 更新、多语言、安全校验和库 API 请参阅 [`opsail-refit-codex`](crates/opsail-refit-codex/README.md)。
+支持目标、附加与启动模式、生命周期语义、renderer 更新、多语言、安全校验和库 API 请参阅 [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)。
 
 ## 包结构
 
 | 包 | 职责 | 文档 |
 | --- | --- | --- |
 | [`opsail`](https://crates.io/crates/opsail) | 原生 CLI 与统一命令入口 | 运行 `opsail --help` |
-| [`opsail-read`](https://crates.io/crates/opsail-read) | 内容获取、正文提取、清理和结果契约 | [README](crates/opsail-read/README.md) |
-| [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | 跨平台 Chrome 生命周期、CDP 传输和渲染捕获 | [README](crates/opsail-chrome/README.md) |
-| [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Codex 适配生命周期、额度语义、多语言和 UI payload | [README](crates/opsail-refit-codex/README.md) |
-| Node.js [`opsail`](https://www.npmjs.com/package/opsail) | ESM API 与原生二进制分发 | [README](packages/node/README.md) |
+| [`opsail-read`](https://crates.io/crates/opsail-read) | 内容获取、正文提取、清理和结果契约 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
+| [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | 跨平台 Chrome 生命周期、CDP 传输和渲染捕获 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
+| [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Codex 适配生命周期、额度语义、多语言和 UI payload | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) |
+| Node.js [`opsail`](https://www.npmjs.com/package/opsail) | ESM API 与原生二进制分发 | [README](https://github.com/lencx/opsail/blob/main/packages/node/README.md) |
 
 ## 安装
 
@@ -77,15 +77,15 @@ cargo install opsail
 npm install opsail
 ```
 
-预编译原生二进制可从 [GitHub Releases](https://github.com/lencx/opsail/releases/latest) 下载。Agent 宿主可以在明确授权后，使用经过审阅的 [`bootstrap-opsail` Skill](skills/bootstrap-opsail/SKILL.md) 同步 CLI 和运行时 Skill。
+预编译原生二进制可从 [GitHub Releases](https://github.com/lencx/opsail/releases/latest) 下载。Agent 宿主可以在明确授权后，使用经过审阅的 [`bootstrap-opsail` Skill](https://github.com/lencx/opsail/blob/main/skills/bootstrap-opsail/SKILL.md) 同步 CLI 和运行时 Skill。
 
 ## 项目文档
 
-- [内容提取与结果模型](crates/opsail-read/README.md)
-- [Chrome 与 CDP 集成](crates/opsail-chrome/README.md)
-- [Codex 左侧栏 Refit](crates/opsail-refit-codex/README.md)
-- [Node.js API 与打包](packages/node/README.md)
-- [开发与贡献指南](CONTRIBUTING.md)
+- [内容提取与结果模型](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md)
+- [Chrome 与 CDP 集成](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md)
+- [Codex 左侧栏 Refit](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)
+- [Node.js API 与打包](https://github.com/lencx/opsail/blob/main/packages/node/README.md)
+- [开发与贡献指南](https://github.com/lencx/opsail/blob/main/CONTRIBUTING.md)
 
 ## 许可证
 

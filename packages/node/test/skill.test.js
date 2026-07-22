@@ -20,6 +20,7 @@ const opsailSkillPath = path.join(
   "SKILL.md",
 );
 const readmePath = path.join(repositoryRoot, "README.md");
+const readmeZhPath = path.join(repositoryRoot, "README.zh-CN.md");
 const releaseWorkflowPath = path.join(
   repositoryRoot,
   ".github",
@@ -120,16 +121,31 @@ test("bootstrap is independently versioned and runtime matches the public packag
 });
 
 test("root README stays concise and release workflow keeps one installer source", async () => {
-  const [readme, releaseWorkflow] = await Promise.all([
+  const [readme, readmeZh, releaseWorkflow] = await Promise.all([
     readFile(readmePath, "utf8"),
+    readFile(readmeZhPath, "utf8"),
     readFile(releaseWorkflowPath, "utf8"),
   ]);
 
   assert.match(readme, /## Core characteristics/);
-  assert.match(readme, /See \[`opsail-read`\]\(crates\/opsail-read\/README\.md\)/);
-  assert.match(readme, /See \[`opsail-refit-codex`\]\(crates\/opsail-refit-codex\/README\.md\)/);
+  assert.match(
+    readme,
+    /See \[`opsail-read`\]\(https:\/\/github\.com\/lencx\/opsail\/blob\/main\/crates\/opsail-read\/README\.md\)/,
+  );
+  assert.match(
+    readme,
+    /See \[`opsail-refit-codex`\]\(https:\/\/github\.com\/lencx\/opsail\/blob\/main\/crates\/opsail-refit-codex\/README\.md\)/,
+  );
   assert.match(readme, /\[GitHub Releases\]\(https:\/\/github\.com\/lencx\/opsail\/releases\/latest\)/);
-  assert.match(readme, /\[`bootstrap-opsail` Skill\]\(skills\/bootstrap-opsail\/SKILL\.md\)/);
+  assert.match(
+    readme,
+    /\[`bootstrap-opsail` Skill\]\(https:\/\/github\.com\/lencx\/opsail\/blob\/main\/skills\/bootstrap-opsail\/SKILL\.md\)/,
+  );
+  for (const source of [readme, readmeZh]) {
+    assert.doesNotMatch(source, /!?\[[^\]]*\]\((?!https:\/\/|#)[^)]+\)/);
+    assert.doesNotMatch(source, /(?:href|src)="(?!https:\/\/|#)[^"]+"/);
+    assert.doesNotMatch(source, /^\s*\[[^\]]+\]:\s*(?!https:\/\/|#)\S+/m);
+  }
   assert.ok(readme.split("\n").length <= 100);
   assert.doesNotMatch(
     readme,
