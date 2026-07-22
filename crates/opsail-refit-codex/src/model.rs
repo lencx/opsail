@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum SessionMode {
     /// Inject only the current document and close the CDP connection.
     Once,
-    /// Keep a foreground CDP manager attached and recover renderer reloads.
+    /// Keep a managed CDP session attached and recover renderer reloads.
     #[default]
     Persistent,
 }
@@ -84,6 +84,56 @@ pub enum CodexRefitOperation {
     Enable,
     Disable,
     Status,
+    Update,
+}
+
+/// Origin of the renderer JavaScript selected for a refit session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RendererAssetSource {
+    /// JavaScript compiled into the Opsail binary.
+    Embedded,
+    /// A versioned bundle explicitly installed from the official GitHub repository.
+    Github,
+}
+
+/// Version and provenance of one validated renderer JavaScript bundle.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RendererAssetInfo {
+    pub version: String,
+    pub source: RendererAssetSource,
+}
+
+/// When an installed renderer asset version becomes active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RendererAssetActivation {
+    Current,
+    NextSession,
+}
+
+/// Whether an update may activate renderer JavaScript whose content hash changed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum RendererAssetUpdatePolicy {
+    /// Validate the latest release, but require explicit confirmation for changed JavaScript.
+    #[default]
+    RequireUnchanged,
+    /// Allow a verified, non-downgrade bundle with changed JavaScript to be installed.
+    Force,
+}
+
+/// Result of an explicit renderer JavaScript update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexUpdateReport {
+    pub operation: CodexRefitOperation,
+    pub previous: RendererAssetInfo,
+    pub installed: RendererAssetInfo,
+    pub changed: bool,
+    pub forced: bool,
+    pub activation: RendererAssetActivation,
+    pub files: usize,
 }
 
 /// Aggregate result for a Codex refit lifecycle operation.
@@ -98,6 +148,8 @@ pub struct CodexRefitReport {
     pub launch_policy: Option<LaunchPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub launched: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renderer_assets: Option<RendererAssetInfo>,
     pub targets: Vec<CodexTargetHealth>,
 }
 
@@ -128,5 +180,6 @@ pub struct CodexDoctorReport {
     pub port: u16,
     pub default_session_mode: SessionMode,
     pub detected_session_modes: Vec<SessionMode>,
+    pub renderer_assets: RendererAssetInfo,
     pub checks: Vec<DoctorCheck>,
 }

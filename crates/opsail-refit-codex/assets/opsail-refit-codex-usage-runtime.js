@@ -38,6 +38,7 @@
     disposed: false,
     status: "loading",
     snapshot: null,
+    resetCredits: [],
     host: null,
     details: null,
     parts: null,
@@ -46,6 +47,7 @@
     hasWindows: false,
     detailsOpen: false,
     closeTimer: null,
+    resetCountdownTimer: null,
     refreshTimer: null,
   };
   const metrics = {
@@ -166,6 +168,9 @@
 
   const openDetails = () => {
     if (!state.hasWindows || state.host?.hidden || !state.details) return;
+    syncLocale();
+    const resetCredits = renderResetCredits();
+    scheduleResetCreditCountdown(resetCredits);
     if (state.closeTimer !== null) clearTimeout(state.closeTimer);
     state.closeTimer = null;
     state.detailsOpen = true;
@@ -208,7 +213,23 @@
     const stale = createElement("div", "opsail-refit-codex-usage-stale");
     stale.hidden = true;
     const rows = [createRow(0), createRow(1)];
-    details.append(stale, ...rows.map((row) => row.row));
+    const resetCreditSection = createElement(
+      "section",
+      "opsail-refit-codex-reset-credits",
+    );
+    resetCreditSection.hidden = true;
+    const resetCreditTitle = createElement(
+      "div",
+      "opsail-refit-codex-reset-credits-title",
+    );
+    const resetCreditTable = createElement(
+      "table",
+      "opsail-refit-codex-reset-credits-table",
+    );
+    const resetCreditBody = createElement("tbody");
+    resetCreditTable.append(resetCreditBody);
+    resetCreditSection.append(resetCreditTitle, resetCreditTable);
+    details.append(stale, ...rows.map((row) => row.row), resetCreditSection);
     (document.body || document.documentElement).append(details);
 
     addListener(host, "pointerenter", openDetails);
@@ -223,7 +244,15 @@
 
     state.host = host;
     state.details = details;
-    state.parts = { summary, stale, rows };
+    state.parts = {
+      summary,
+      stale,
+      rows,
+      resetCreditSection,
+      resetCreditTitle,
+      resetCreditTable,
+      resetCreditBody,
+    };
   };
 
   const ensureStyle = () => {
@@ -384,10 +413,84 @@
     if (observedRow) resizeObserver.observe(observedRow);
   };
 
+  const clearResetCreditCountdown = () => {
+    if (state.resetCountdownTimer !== null) clearTimeout(state.resetCountdownTimer);
+    state.resetCountdownTimer = null;
+  };
+
+  const scheduleResetCreditCountdown = (resetCredits) => {
+    clearResetCreditCountdown();
+    if (state.disposed
+      || document.visibilityState === "hidden"
+      || !Array.isArray(resetCredits)
+      || resetCredits.length === 0) return;
+    const delay = Math.max(1000, Math.min(
+      ...resetCredits.map((credit) => credit.nextUpdateMs),
+    ));
+    if (!Number.isFinite(delay)) return;
+    state.resetCountdownTimer = setTimeout(() => {
+      state.resetCountdownTimer = null;
+      if (document.visibilityState !== "hidden") render();
+    }, delay);
+  };
+
+  const renderResetCredits = () => {
+    if (!state.parts) return [];
+    const resetCredits = usageModel.presentResetCredits(
+      state.resetCredits,
+      copy,
+      copy.locale,
+    );
+    state.parts.resetCreditSection.hidden = resetCredits.length === 0;
+    state.parts.resetCreditSection.setAttribute("aria-label", copy.resetCreditsTitle);
+    state.parts.resetCreditTable.setAttribute("aria-label", copy.resetCreditsTitle);
+    setText(state.parts.resetCreditTitle, copy.resetCreditsTitle);
+    const resetCreditRows = resetCredits.map((credit) => ({
+      ariaCountdown: usageModel.formatMessage(copy.resetCreditCountdown, credit),
+      ariaExpiry: usageModel.formatMessage(copy.resetCreditExpires, {
+        ...credit,
+        dateTime: credit.full,
+      }),
+      credit,
+    }));
+    const resetCreditsKey = `${copy.locale}:${resetCreditRows
+      .map(({ ariaCountdown, ariaExpiry, credit }) => (
+        `${credit.expiresAt}:${credit.dateTime}:${credit.countdown}:${ariaExpiry}:${ariaCountdown}`
+      ))
+      .join("|")}`;
+    if (state.parts.resetCreditBody.dataset.opsailRefitCodexCredits !== resetCreditsKey) {
+      while (state.parts.resetCreditBody.children.length > 0) {
+        state.parts.resetCreditBody.children[0].remove();
+      }
+      for (const { ariaCountdown, ariaExpiry, credit } of resetCreditRows) {
+        const item = createElement("tr", "opsail-refit-codex-reset-credits-row");
+        const expiryCell = createElement(
+          "td",
+          "opsail-refit-codex-reset-credits-expiry",
+        );
+        const countdownCell = createElement(
+          "td",
+          "opsail-refit-codex-reset-credits-countdown",
+        );
+        setText(expiryCell, credit.dateTime);
+        setText(countdownCell, credit.countdown);
+        item.append(expiryCell, countdownCell);
+        item.setAttribute("aria-label", usageModel.formatMessage(copy.resetCreditAria, {
+          countdown: ariaCountdown,
+          expiry: ariaExpiry,
+        }));
+        state.parts.resetCreditBody.append(item);
+      }
+      state.parts.resetCreditBody.dataset.opsailRefitCodexCredits = resetCreditsKey;
+    }
+    return resetCredits;
+  };
+
   const render = () => {
     syncLocale();
     if (!state.parts || !state.host || !state.details) return;
     const windows = usageModel.presentWindows(state.snapshot, copy, copy.locale);
+    const resetCredits = renderResetCredits();
     const stale = state.status === "stale" && windows.length > 0;
     state.hasWindows = windows.length > 0;
     state.details.setAttribute("aria-label", copy.usageTitle);
@@ -395,8 +498,8 @@
     state.host.dataset.opsailRefitCodexState = state.status;
     state.parts.stale.hidden = !stale;
     setText(state.parts.stale, stale ? copy.stale : "");
-
     if (windows.length === 0) {
+      clearResetCreditCountdown();
       setText(state.parts.summary, "");
       for (const row of state.parts.rows) row.row.hidden = true;
       hideHost();
@@ -404,6 +507,7 @@
     }
 
     const summary = usageModel.summaryFor(windows, copy);
+    scheduleResetCreditCountdown(resetCredits);
     setText(state.parts.summary, summary);
     state.host.setAttribute("aria-label", usageModel.formatMessage(copy.ariaSummary, { summary }));
     for (let index = 0; index < state.parts.rows.length; index += 1) {
@@ -416,15 +520,12 @@
       row.row.hidden = false;
       setText(row.label, windowValue.label);
       setText(row.value, usageModel.formatMessage(copy.remaining, windowValue));
-      const resetLines = windowValue.reset ? [
-        windowValue.reset.soon || !windowValue.reset.relative
-          ? copy.resetSoon
-          : usageModel.formatMessage(copy.resetRelative, windowValue.reset),
-        usageModel.formatMessage(copy.resetAbsolute, windowValue.reset),
-      ] : [];
+      const resetLine = windowValue.reset
+        ? usageModel.formatMessage(copy.windowReset, windowValue.reset)
+        : null;
       setText(row.meta, [
         usageModel.formatMessage(copy.used, windowValue),
-        ...resetLines,
+        resetLine,
       ].filter(Boolean).join("\n"));
       if (windowValue.reset) {
         row.meta.setAttribute("aria-label", usageModel.formatMessage(copy.ariaMeta, {
@@ -479,6 +580,9 @@
           return;
         }
         state.snapshot = snapshot;
+        state.resetCredits = usageModel.normalizeResetCredits(
+          message?.result?.rateLimitResetCredits,
+        );
         state.status = "ready";
         metrics.usageUpdates += 1;
         render();
@@ -612,6 +716,7 @@
     removeListeners();
     if (state.refreshTimer !== null) clearInterval(state.refreshTimer);
     if (state.closeTimer !== null) clearTimeout(state.closeTimer);
+    clearResetCreditCountdown();
     if (scheduler.ensureTimeout !== null) clearTimeout(scheduler.ensureTimeout);
     if (scheduler.timeout !== null) clearTimeout(scheduler.timeout);
     if (scheduler.frame !== null && typeof cancelAnimationFrame === "function") {
@@ -636,7 +741,10 @@
   };
 
   addListener(window, "message", handleMessage);
-  addListener(window, "focus", () => coordinator.focus());
+  addListener(window, "focus", () => {
+    coordinator.focus();
+    render();
+  });
   addListener(window, "resize", () => {
     scheduleLayout();
     scheduleTooltipPosition();
@@ -674,10 +782,12 @@
       mutationObserver: Boolean(mutationObserver),
       resizeObserver: Boolean(resizeObserver),
       refreshTimer: state.refreshTimer !== null,
+      resetCountdownTimer: state.resetCountdownTimer !== null,
       bridgeAvailable: typeof window.electronBridge?.sendMessageFromView === "function",
       dataState: state.status,
       visible: Boolean(state.hasWindows && !state.host?.hidden),
       stale: state.status === "stale",
+      resetCreditCount: state.resetCredits.length,
     }),
     metrics,
   };

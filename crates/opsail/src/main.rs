@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::io::{self, ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{ExitCode, Stdio};
 use std::time::Duration;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -9,22 +9,26 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use opsail_read::{CdpSource, CdpWaitUntil, ChromeSource, Input, ReadOptions, ReadResult, read};
 use opsail_refit_codex::{
     CodexRefit, CodexRefitConfig, CodexRefitError, DEFAULT_CODEX_DEBUG_PORT, LaunchPolicy,
-    SessionMode,
+    RendererAssetUpdatePolicy, SessionMode,
 };
-use serde_json::Value;
-use tokio::io::AsyncReadExt;
+use serde::Deserialize;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tracing_subscriber::{EnvFilter, util::SubscriberInitExt};
 use url::Url;
 
 mod machine;
 
 const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction";
+const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_BACKGROUND_START_MESSAGE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "opsail",
     version,
     about = "Native tools that agents can rely on",
+    before_help = "GitHub repository: https://github.com/lencx/opsail",
     subcommand_required = true,
     arg_required_else_help = true
 )]
@@ -60,12 +64,11 @@ enum RefitTarget {
 }
 
 #[derive(Debug, Args)]
-#[command(arg_required_else_help = true)]
+#[command(
+    arg_required_else_help = true,
+    after_help = "CDP lifecycle commands accept -p, --port <PORT> for 127.0.0.1 (default: 55321). The update command does not use CDP."
+)]
 struct CodexRefitArgs {
-    /// 127.0.0.1 CDP port; defaults to 55321 and may be explicitly overridden.
-    #[arg(long, global = true, default_value_t = DEFAULT_CODEX_DEBUG_PORT)]
-    port: u16,
-
     #[command(subcommand)]
     command: CodexRefitCommand,
 }
@@ -77,15 +80,20 @@ enum CodexRefitCommand {
     /// Disable a refit feature and remove all of its renderer artifacts.
     Disable(CodexFeatureArgs),
     /// Inspect the current renderer refit state.
-    Status,
+    Status(CodexPortArgs),
     /// Run read-only target, bridge, and state diagnostics.
-    Doctor,
+    Doctor(CodexPortArgs),
+    /// Check and install the latest verified renderer JavaScript from GitHub.
+    Update(CodexUpdateArgs),
 }
 
 #[derive(Debug, Args)]
 struct CodexFeatureArgs {
     #[arg(value_enum)]
     feature: CodexRefitFeature,
+
+    #[command(flatten)]
+    endpoint: CodexPortArgs,
 }
 
 #[derive(Debug, Args)]
@@ -94,12 +102,50 @@ struct CodexEnableArgs {
     feature: CodexRefitFeature,
 
     /// Inject only the current document, confirm health, close CDP, and exit; persistent managed mode is the default.
-    #[arg(long)]
+    #[arg(short = 'o', long)]
     once: bool,
 
     /// Start a validated, stopped ChatGPT app once; otherwise enable is attach-only.
-    #[arg(long)]
+    #[arg(short = 'l', long)]
     launch: bool,
+
+    /// Keep the persistent manager attached to this terminal for diagnostics; background managed mode is the default.
+    #[arg(short = 'F', long, conflicts_with = "once")]
+    foreground: bool,
+
+    #[arg(
+        long,
+        hide = true,
+        conflicts_with_all = ["once", "foreground"]
+    )]
+    background_child: bool,
+
+    #[command(flatten)]
+    endpoint: CodexPortArgs,
+}
+
+#[derive(Debug, Args)]
+struct CodexPortArgs {
+    /// 127.0.0.1 CDP port; defaults to 55321 and may be explicitly overridden.
+    #[arg(short = 'p', long, default_value_t = DEFAULT_CODEX_DEBUG_PORT)]
+    port: u16,
+}
+
+#[derive(Debug, Args)]
+struct CodexUpdateArgs {
+    /// Install verified JavaScript even when its SHA-256 differs from the active bundle.
+    #[arg(short = 'f', long)]
+    force: bool,
+}
+
+impl CodexUpdateArgs {
+    fn policy(&self) -> RendererAssetUpdatePolicy {
+        if self.force {
+            RendererAssetUpdatePolicy::Force
+        } else {
+            RendererAssetUpdatePolicy::RequireUnchanged
+        }
+    }
 }
 
 impl CodexEnableArgs {
@@ -117,6 +163,10 @@ impl CodexEnableArgs {
         } else {
             LaunchPolicy::AttachOnly
         }
+    }
+
+    fn should_spawn_background(&self) -> bool {
+        self.session_mode() == SessionMode::Persistent && !self.foreground && !self.background_child
     }
 }
 
@@ -253,8 +303,26 @@ impl From<CdpWaitArg> for CdpWaitUntil {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            let _ = writeln!(
+                io::stderr().lock(),
+                "failed to initialize async runtime: {error}"
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let exit_code = runtime.block_on(async_main());
+    runtime.shutdown_timeout(Duration::from_millis(500));
+    exit_code
+}
+
+async fn async_main() -> ExitCode {
     let cli = Cli::parse();
     init_tracing(cli.verbose);
 
@@ -302,18 +370,25 @@ fn init_tracing(verbosity: u8) {
 async fn shutdown_signal() {
     use tokio::signal::unix::{SignalKind, signal};
 
-    let (Ok(mut interrupt), Ok(mut terminate), Ok(mut hangup)) = (
-        signal(SignalKind::interrupt()),
-        signal(SignalKind::terminate()),
-        signal(SignalKind::hangup()),
-    ) else {
-        std::future::pending::<()>().await;
-        return;
-    };
+    let mut interrupt = signal(SignalKind::interrupt()).ok();
+    let mut terminate = signal(SignalKind::terminate()).ok();
+    let mut hangup = signal(SignalKind::hangup()).ok();
+    let mut terminal_stop = signal(SignalKind::from_raw(libc::SIGTSTP)).ok();
     tokio::select! {
-        _ = interrupt.recv() => {}
-        _ = terminate.recv() => {}
-        _ = hangup.recv() => {}
+        () = receive_optional_signal(&mut interrupt) => {}
+        () = receive_optional_signal(&mut terminate) => {}
+        () = receive_optional_signal(&mut hangup) => {}
+        () = receive_optional_signal(&mut terminal_stop) => {}
+    }
+}
+
+#[cfg(unix)]
+async fn receive_optional_signal(signal: &mut Option<tokio::signal::unix::Signal>) {
+    match signal {
+        Some(signal) => {
+            let _ = signal.recv().await;
+        }
+        None => std::future::pending::<()>().await,
     }
 }
 
@@ -365,9 +440,16 @@ async fn run_refit(args: RefitArgs) -> Result<()> {
 }
 
 async fn run_codex_refit(args: CodexRefitArgs) -> Result<()> {
-    let adapter = CodexRefit::new(CodexRefitConfig::new(args.port)).map_err(codex_diagnostic)?;
     match args.command {
         CodexRefitCommand::Enable(enable) => {
+            if enable.should_spawn_background() {
+                return spawn_background_codex_manager(&enable).await;
+            }
+            if enable.background_child {
+                return run_background_codex_manager(enable).await;
+            }
+            let adapter = CodexRefit::new(CodexRefitConfig::new(enable.endpoint.port))
+                .map_err(codex_diagnostic)?;
             let mode = enable.session_mode();
             let launch_policy = enable.launch_policy();
             let session = match enable.feature {
@@ -379,24 +461,224 @@ async fn run_codex_refit(args: CodexRefitArgs) -> Result<()> {
             write_codex_json(session.report())?;
             session.run().await.map_err(codex_diagnostic)
         }
-        command => {
-            let value = match command {
-                CodexRefitCommand::Disable(CodexFeatureArgs {
-                    feature: CodexRefitFeature::Usage,
-                }) => {
-                    serde_json::to_value(adapter.disable_usage().await.map_err(codex_diagnostic)?)
-                }
-                CodexRefitCommand::Status => {
-                    serde_json::to_value(adapter.status().await.map_err(codex_diagnostic)?)
-                }
-                CodexRefitCommand::Doctor => serde_json::to_value(adapter.doctor().await),
-                CodexRefitCommand::Enable(_) => unreachable!("enable handled by its match arm"),
-            }
-            .into_diagnostic()
-            .wrap_err("failed to serialize Codex refit result")?;
-            write_codex_json(&value)
+        CodexRefitCommand::Update(update) => {
+            let adapter = CodexRefit::new(CodexRefitConfig::default()).map_err(codex_diagnostic)?;
+            let report = adapter
+                .update_renderer_assets(update.policy())
+                .await
+                .map_err(codex_diagnostic)?;
+            write_codex_json(&report)
+        }
+        CodexRefitCommand::Disable(CodexFeatureArgs {
+            feature: CodexRefitFeature::Usage,
+            endpoint,
+        }) => {
+            let adapter =
+                CodexRefit::new(CodexRefitConfig::new(endpoint.port)).map_err(codex_diagnostic)?;
+            write_codex_json(&adapter.disable_usage().await.map_err(codex_diagnostic)?)
+        }
+        CodexRefitCommand::Status(endpoint) => {
+            let adapter =
+                CodexRefit::new(CodexRefitConfig::new(endpoint.port)).map_err(codex_diagnostic)?;
+            write_codex_json(&adapter.status().await.map_err(codex_diagnostic)?)
+        }
+        CodexRefitCommand::Doctor(endpoint) => {
+            let adapter =
+                CodexRefit::new(CodexRefitConfig::new(endpoint.port)).map_err(codex_diagnostic)?;
+            write_codex_json(&adapter.doctor().await)
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "status", rename_all = "kebab-case")]
+enum BackgroundStartupMessage {
+    Ready { report: Value },
+    Error { code: String, message: String },
+}
+
+struct BackgroundChildGuard {
+    child: Option<tokio::process::Child>,
+    armed: bool,
+}
+
+impl BackgroundChildGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self {
+            child: Some(child),
+            armed: true,
+        }
+    }
+
+    fn child_mut(&mut self) -> &mut tokio::process::Child {
+        self.child
+            .as_mut()
+            .expect("background child remains available during startup")
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+
+    async fn terminate(mut self) {
+        self.armed = false;
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+        }
+    }
+}
+
+impl Drop for BackgroundChildGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Some(child) = &mut self.child
+        {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+fn background_codex_command(enable: &CodexEnableArgs) -> Result<tokio::process::Command> {
+    let executable = std::env::current_exe()
+        .into_diagnostic()
+        .wrap_err("failed to resolve the current Opsail executable")?;
+    let mut command = tokio::process::Command::new(executable);
+    let port = enable.endpoint.port.to_string();
+    command.args([
+        "refit",
+        "codex",
+        "enable",
+        "usage",
+        "--background-child",
+        "--port",
+        &port,
+    ]);
+    if enable.launch {
+        command.arg("--launch");
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
+    Ok(command)
+}
+
+async fn spawn_background_codex_manager(enable: &CodexEnableArgs) -> Result<()> {
+    let child = background_codex_command(enable)?
+        .spawn()
+        .into_diagnostic()
+        .wrap_err("failed to start the background Codex refit manager")?;
+    let mut child = BackgroundChildGuard::new(child);
+    let stdout = child
+        .child_mut()
+        .stdout
+        .take()
+        .ok_or_else(|| miette!("background Codex refit manager has no startup channel"))?;
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    let read = tokio::time::timeout(BACKGROUND_START_TIMEOUT, reader.read_line(&mut line)).await;
+    let bytes = match read {
+        Ok(Ok(bytes)) => bytes,
+        Ok(Err(error)) => {
+            child.terminate().await;
+            return Err(error)
+                .into_diagnostic()
+                .wrap_err("failed to read the background manager startup report");
+        }
+        Err(_) => {
+            child.terminate().await;
+            return Err(miette!(
+                "background Codex refit manager did not report readiness within {} seconds",
+                BACKGROUND_START_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    if bytes == 0 {
+        let status = child.child_mut().wait().await.into_diagnostic()?;
+        child.armed = false;
+        return Err(miette!(
+            "background Codex refit manager exited before reporting readiness ({status})"
+        ));
+    }
+    if line.len() > MAX_BACKGROUND_START_MESSAGE_BYTES {
+        child.terminate().await;
+        return Err(miette!(
+            "background manager startup report exceeded its size limit"
+        ));
+    }
+    let message: BackgroundStartupMessage = match serde_json::from_str(&line) {
+        Ok(message) => message,
+        Err(error) => {
+            child.terminate().await;
+            return Err(error)
+                .into_diagnostic()
+                .wrap_err("background manager returned an invalid startup report");
+        }
+    };
+    match message {
+        BackgroundStartupMessage::Ready { report } => {
+            validate_background_report(&report, enable.endpoint.port)?;
+            write_codex_json(&report)?;
+            child.disarm();
+            Ok(())
+        }
+        BackgroundStartupMessage::Error { code, message } => {
+            child.terminate().await;
+            Err(miette!("[opsail-refit-codex:{code}] {message}"))
+        }
+    }
+}
+
+fn validate_background_report(report: &Value, port: u16) -> Result<()> {
+    let valid = report.get("operation").and_then(Value::as_str) == Some("enable")
+        && report.get("port").and_then(Value::as_u64) == Some(u64::from(port))
+        && report.get("sessionMode").and_then(Value::as_str) == Some("persistent")
+        && report.get("targets").is_some_and(Value::is_array);
+    if valid {
+        Ok(())
+    } else {
+        Err(miette!(
+            "background manager returned a mismatched startup report"
+        ))
+    }
+}
+
+async fn run_background_codex_manager(enable: CodexEnableArgs) -> Result<()> {
+    let result = async {
+        let adapter = CodexRefit::new(CodexRefitConfig::new(enable.endpoint.port))?;
+        adapter
+            .enable_usage(SessionMode::Persistent, enable.launch_policy())
+            .await
+    }
+    .await;
+    let session = match result {
+        Ok(session) => session,
+        Err(error) => {
+            write_background_startup(&json!({
+                "status": "error",
+                "code": error.code().as_str(),
+                "message": error.to_string(),
+            }))?;
+            return Err(codex_diagnostic(error));
+        }
+    };
+    write_background_startup(&json!({
+        "status": "ready",
+        "report": session.report(),
+    }))?;
+    session.run().await.map_err(codex_diagnostic)
+}
+
+fn write_background_startup(value: &Value) -> Result<()> {
+    let output = with_trailing_newline(
+        serde_json::to_string(value)
+            .into_diagnostic()
+            .wrap_err("failed to serialize background manager startup report")?,
+    );
+    write_stdout(output.as_bytes())
 }
 
 fn write_codex_json(value: &impl serde::Serialize) -> Result<()> {
@@ -682,8 +964,7 @@ mod tests {
         for (arguments, expected_mode, expected_launch, expected_port) in [
             (
                 vec![
-                    "opsail", "refit", "codex", "enable", "usage", "--once", "--launch", "--port",
-                    "55400",
+                    "opsail", "refit", "codex", "enable", "usage", "-o", "-l", "-p", "55400",
                 ],
                 SessionMode::Once,
                 LaunchPolicy::LaunchIfStopped,
@@ -700,7 +981,6 @@ mod tests {
             let Command::Refit(RefitArgs {
                 target:
                     RefitTarget::Codex(CodexRefitArgs {
-                        port,
                         command: CodexRefitCommand::Enable(enable),
                     }),
             }) = cli.command
@@ -709,7 +989,86 @@ mod tests {
             };
             assert_eq!(enable.session_mode(), expected_mode);
             assert_eq!(enable.launch_policy(), expected_launch);
-            assert_eq!(port, expected_port);
+            assert_eq!(enable.endpoint.port, expected_port);
+            assert_eq!(
+                enable.should_spawn_background(),
+                expected_mode == SessionMode::Persistent
+            );
         }
+    }
+
+    #[test]
+    fn codex_foreground_mode_is_explicit_and_background_child_command_is_bounded() {
+        let cli = Cli::try_parse_from([
+            "opsail",
+            "refit",
+            "codex",
+            "enable",
+            "usage",
+            "--launch",
+            "--foreground",
+            "--port",
+            "55400",
+        ])
+        .unwrap();
+        let Command::Refit(RefitArgs {
+            target:
+                RefitTarget::Codex(CodexRefitArgs {
+                    command: CodexRefitCommand::Enable(mut enable),
+                }),
+        }) = cli.command
+        else {
+            panic!("expected Codex enable arguments");
+        };
+        assert!(!enable.should_spawn_background());
+
+        enable.foreground = false;
+        let command = background_codex_command(&enable).unwrap();
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            [
+                "refit",
+                "codex",
+                "enable",
+                "usage",
+                "--background-child",
+                "--port",
+                "55400",
+                "--launch",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_update_parses_as_an_independent_operation() {
+        let cli = Cli::try_parse_from(["opsail", "refit", "codex", "update"]).unwrap();
+        let Command::Refit(RefitArgs {
+            target:
+                RefitTarget::Codex(CodexRefitArgs {
+                    command: CodexRefitCommand::Update(update),
+                }),
+        }) = cli.command
+        else {
+            panic!("expected Codex update arguments");
+        };
+        assert_eq!(update.policy(), RendererAssetUpdatePolicy::RequireUnchanged);
+
+        let cli = Cli::try_parse_from(["opsail", "refit", "codex", "update", "-f"]).unwrap();
+        let Command::Refit(RefitArgs {
+            target:
+                RefitTarget::Codex(CodexRefitArgs {
+                    command: CodexRefitCommand::Update(update),
+                    ..
+                }),
+        }) = cli.command
+        else {
+            panic!("expected forced Codex update arguments");
+        };
+        assert_eq!(update.policy(), RendererAssetUpdatePolicy::Force);
     }
 }

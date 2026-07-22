@@ -111,47 +111,26 @@ test("bootstrap is independently versioned and runtime matches the public packag
   assert.match(opsailSkill, /opsail refit codex enable usage/);
   assert.match(opsailSkill, /opsail refit codex enable usage --launch/);
   assert.match(opsailSkill, /opsail refit codex disable usage/);
+  assert.match(opsailSkill, /opsail refit codex update/);
+  assert.match(opsailSkill, /--force/);
   assert.match(opsailSkill, /never quit, kill, restart, reload, modify, or re-sign ChatGPT/);
   assert.match(opsailSkill, /public default port is `55321`/);
-  assert.match(opsailSkill, /repair the DOM adapter/i);
-  assert.match(opsailSkill, /opsail-refit-codex-dom-adapter\.js/);
-  assert.match(opsailSkill, /Require evidence from the current UI/);
-  assert.match(opsailSkill, /Installed binaries cannot be hot-patched/);
-  assert.match(
-    opsailSkill,
-    /Never launch, quit, kill, restart, or reload ChatGPT to collect evidence/,
-  );
-  assert.match(
-    opsailSkill,
-    /node --test packages\/node\/test\/opsail-refit-codex-usage\.test\.js/,
-  );
-  assert.match(opsailSkill, /cargo build --locked --release -p opsail/);
+  assert.doesNotMatch(opsailSkill, /repair the DOM adapter/i);
+  assert.doesNotMatch(opsailSkill, /opsail-refit-codex-dom-adapter\.js/);
 });
 
-test("README and release workflow keep one installer source", async () => {
+test("root README stays concise and release workflow keeps one installer source", async () => {
   const [readme, releaseWorkflow] = await Promise.all([
     readFile(readmePath, "utf8"),
     readFile(releaseWorkflowPath, "utf8"),
   ]);
 
-  assert.match(readme, /READ_RESULT --> CLI_USERS\["Opsail CLI \/ CLI users"\]/);
-  assert.match(readme, /READ_RESULT --> AGENT_HOSTS\[/);
-  assert.match(
-    readme,
-    /BOOTSTRAP_SKILL\["bootstrap-opsail Skill"\] -\.->\|"installs \/ registers runtime skill"\| AGENT_HOSTS/,
-  );
-  assert.match(
-    readme,
-    /Read and follow https:\/\/raw\.githubusercontent\.com\/lencx\/opsail\/refs\/heads\/main\/skills\/bootstrap-opsail\/SKILL\.md/,
-  );
-  assert.match(
-    readme,
-    /refs\/heads\/main\/skills\/bootstrap-opsail\/scripts\/install\.sh/,
-  );
-  assert.match(
-    readme,
-    /refs\/heads\/main\/skills\/bootstrap-opsail\/scripts\/install\.ps1/,
-  );
+  assert.match(readme, /## Core characteristics/);
+  assert.match(readme, /See \[`opsail-read`\]\(crates\/opsail-read\/README\.md\)/);
+  assert.match(readme, /See \[`opsail-refit-codex`\]\(crates\/opsail-refit-codex\/README\.md\)/);
+  assert.match(readme, /\[GitHub Releases\]\(https:\/\/github\.com\/lencx\/opsail\/releases\/latest\)/);
+  assert.match(readme, /\[`bootstrap-opsail` Skill\]\(skills\/bootstrap-opsail\/SKILL\.md\)/);
+  assert.ok(readme.split("\n").length <= 100);
   assert.doesNotMatch(
     readme,
     /raw\.githubusercontent\.com\/lencx\/opsail\/(?:main|refs\/heads\/main)\/scripts\/install\.(?:sh|ps1)/,

@@ -12,7 +12,9 @@ repository.workspace = true
 [dependencies]
 futures-util.workspace = true
 reqwest.workspace = true
+ring.workspace = true
 rustls.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

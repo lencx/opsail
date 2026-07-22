@@ -1,4 +1,10 @@
 use std::fs;
+#[cfg(unix)]
+use std::process::{Command as ProcessCommand, Stdio};
+#[cfg(unix)]
+use std::thread;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use assert_cmd::cargo::cargo_bin_cmd;
 use predicates::prelude::*;
@@ -12,6 +18,61 @@ fn sample_html() -> String {
     format!(
         "<!doctype html><html dir=\"ltr\"><head><title>Example document</title></head><body><main><article><p>{words}</p><p><a href=\"/guide\">Read the guide</a></p></article></main></body></html>"
     )
+}
+
+#[cfg(unix)]
+fn run_blocked_cli_until_signal(signal: &str) -> Option<i32> {
+    // libtest worker threads may block terminal signals. A fixed shell wrapper
+    // normalizes the inherited dispositions before replacing itself with Opsail.
+    let mut child = ProcessCommand::new("/bin/sh")
+        .args([
+            "-c",
+            "trap - INT TERM HUP TSTP; exec \"$@\"",
+            "opsail-signal-harness",
+            env!("CARGO_BIN_EXE_opsail"),
+            "read",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    thread::sleep(Duration::from_secs(1));
+    assert!(child.try_wait().unwrap().is_none());
+
+    let pid = child.id().to_string();
+    assert!(
+        ProcessCommand::new("kill")
+            .args([signal, &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status.code();
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let _ = ProcessCommand::new("kill").args(["-CONT", &pid]).status();
+    let _ = ProcessCommand::new("kill").args(["-KILL", &pid]).status();
+    let _ = child.wait();
+    None
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_cli_exits_on_interrupt() {
+    assert_eq!(run_blocked_cli_until_signal("-INT"), Some(130));
+}
+
+#[cfg(unix)]
+#[test]
+fn foreground_cli_treats_terminal_stop_as_shutdown() {
+    assert_eq!(run_blocked_cli_until_signal("-TSTP"), Some(130));
 }
 
 #[test]
@@ -212,6 +273,16 @@ fn read_help_is_successful_and_stays_on_stdout() {
 }
 
 #[test]
+fn top_level_help_places_the_github_repository_before_usage() {
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command.arg("--help").assert().success().stderr("");
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let repository = stdout.find("https://github.com/lencx/opsail").unwrap();
+    let usage = stdout.find("Usage: opsail").unwrap();
+    assert!(repository < usage);
+}
+
+#[test]
 fn read_without_arguments_shows_help_instead_of_reading_stdin() {
     let mut command = cargo_bin_cmd!("opsail");
     command.arg("read").assert().code(2).stdout("").stderr(
@@ -232,9 +303,27 @@ fn refit_codex_help_exposes_the_usage_lifecycle_and_default_port() {
                 .and(predicate::str::contains("disable"))
                 .and(predicate::str::contains("status"))
                 .and(predicate::str::contains("doctor"))
-                .and(predicate::str::contains("--port"))
+                .and(predicate::str::contains("update"))
+                .and(predicate::str::contains("-p, --port"))
                 .and(predicate::str::contains("127.0.0.1"))
                 .and(predicate::str::contains("55321")),
+        )
+        .stderr("");
+}
+
+#[test]
+fn refit_codex_update_help_describes_the_offline_activation_boundary() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["refit", "codex", "update", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("GitHub")
+                .and(predicate::str::contains("renderer JavaScript"))
+                .and(predicate::str::contains("-f, --force"))
+                .and(predicate::str::contains("SHA-256"))
+                .and(predicate::str::contains("--port").not()),
         )
         .stderr("");
 }
@@ -263,12 +352,16 @@ fn refit_codex_enable_help_documents_launch_once_and_persistent_default() {
         .stdout(
             predicate::str::contains("--once")
                 .and(predicate::str::contains("--launch"))
+                .and(predicate::str::contains("--foreground"))
+                .and(predicate::str::contains("-o, --once"))
+                .and(predicate::str::contains("-l, --launch"))
+                .and(predicate::str::contains("-F, --foreground"))
                 .and(predicate::str::contains("current document"))
                 .and(predicate::str::contains("close CDP"))
                 .and(predicate::str::contains("attach-only"))
                 .and(predicate::str::contains("stopped ChatGPT app once"))
                 .and(predicate::str::contains(
-                    "persistent managed mode is the default",
+                    "background managed mode is the default",
                 )),
         )
         .stderr("");
@@ -283,6 +376,42 @@ fn refit_codex_enable_help_documents_launch_once_and_persistent_default() {
     .stderr(predicate::str::contains(
         "[opsail-refit-codex:target-validation-failed]",
     ));
+}
+
+#[test]
+fn persistent_enable_uses_background_startup_and_forwards_structured_errors() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["refit", "codex", "enable", "usage", "--port", "80"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("[opsail-refit-codex:target-validation-failed]")
+                .and(predicate::str::contains("between 1024 and 65535")),
+        );
+}
+
+#[test]
+fn once_and_foreground_are_explicitly_incompatible() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args([
+            "refit",
+            "codex",
+            "enable",
+            "usage",
+            "--once",
+            "--foreground",
+        ])
+        .assert()
+        .code(2)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("cannot be used with")
+                .and(predicate::str::contains("--once"))
+                .and(predicate::str::contains("--foreground")),
+        );
 }
 
 #[test]

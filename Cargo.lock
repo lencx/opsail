@@ -1321,6 +1321,7 @@ version = "0.1.0"
 dependencies = [
  "assert_cmd",
  "clap",
+ "libc",
  "miette",
  "opsail-read",
  "opsail-refit-codex",
@@ -1381,7 +1382,9 @@ version = "0.1.0"
 dependencies = [
  "futures-util",
  "reqwest",
+ "ring",
  "rustls",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",

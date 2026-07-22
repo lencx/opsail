@@ -7,11 +7,13 @@
 
 mod cdp;
 mod error;
+mod github_update;
 mod launch;
 mod lifecycle;
 mod model;
 mod payload;
 mod platform;
+mod renderer_assets;
 mod state;
 
 use std::path::PathBuf;
@@ -21,17 +23,22 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::stream::{FuturesUnordered, StreamExt as _};
 use serde::Deserialize;
-use tokio::time::sleep;
+use tokio::time::{Instant, sleep};
 
 use cdp::{CdpSession, discover_targets, wait_for_termination};
 pub use error::{CodexRefitError, CodexRefitErrorCode};
+use github_update::{GithubRendererAssetClient, RendererAssetUpdateClient};
 use launch::{LaunchBackend, SystemLaunchBackend};
 use lifecycle::{ManagedSession, SessionFuture};
 pub use model::{
     CodexDoctorReport, CodexRefitOperation, CodexRefitReport, CodexRefitState, CodexTargetHealth,
-    DoctorCheck, DoctorCheckState, LaunchPolicy, SessionMode,
+    CodexUpdateReport, DoctorCheck, DoctorCheckState, LaunchPolicy, RendererAssetActivation,
+    RendererAssetInfo, RendererAssetSource, RendererAssetUpdatePolicy, SessionMode,
 };
-use payload::{UsagePayload, disable_expression, usage_payload};
+#[cfg(test)]
+use payload::usage_payload;
+use payload::{UsagePayload, build_usage_payload};
+use renderer_assets::{RendererAssetStore, embedded_bundle};
 use state::{StateManagedSessionLock, StateStore, TargetRecord};
 
 pub const DEFAULT_CODEX_DEBUG_PORT: u16 = 55321;
@@ -39,6 +46,7 @@ const USAGE_RUNTIME_LISTENER_COUNT: usize = 10;
 const DOM_ADAPTER_API_VERSION: u64 = 1;
 const APP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
+const APP_EXIT_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Configuration for the verified Codex renderer adapter.
 #[derive(Debug, Clone)]
@@ -81,6 +89,10 @@ pub struct CodexRefit {
     port: u16,
     state: StateStore,
     payload: Arc<UsagePayload>,
+    renderer_assets: RendererAssetStore,
+    renderer_asset_warning: Option<String>,
+    renderer_asset_content_identity: String,
+    update_client: Arc<dyn RendererAssetUpdateClient>,
     launch_backend: Arc<dyn LaunchBackend>,
 }
 
@@ -155,11 +167,121 @@ impl CodexRefit {
             Some(path) => path,
             None => platform::default_state_dir()?,
         };
+        let renderer_assets = RendererAssetStore::new(state_dir.clone());
+        let selection = renderer_assets.load_or_embedded()?;
+        let selected_identity = selection.bundle.content_identity();
+        let selected_payload =
+            build_usage_payload(selection.bundle.sources(), selection.info.clone());
+        let (payload, renderer_asset_warning, renderer_asset_content_identity) =
+            match selected_payload {
+                Ok(payload) => (payload, selection.warning, selected_identity),
+                Err(error) if selection.info.source == RendererAssetSource::Github => {
+                    let embedded = embedded_bundle()?;
+                    let embedded_info = embedded.info(RendererAssetSource::Embedded);
+                    let identity = embedded.content_identity();
+                    let payload = build_usage_payload(embedded.sources(), embedded_info)?;
+                    (
+                        payload,
+                        Some(format!(
+                            "installed renderer assets failed payload validation: {error}; using embedded renderer assets"
+                        )),
+                        identity,
+                    )
+                }
+                Err(error) => return Err(error),
+            };
         Ok(Self {
             port: config.port,
             state: StateStore::new(state_dir),
-            payload: Arc::new(usage_payload()?),
+            payload: Arc::new(payload),
+            renderer_assets,
+            renderer_asset_warning,
+            renderer_asset_content_identity,
+            update_client: Arc::new(GithubRendererAssetClient),
             launch_backend: Arc::new(SystemLaunchBackend),
+        })
+    }
+
+    /// Check the official GitHub repository and install a validated renderer bundle.
+    ///
+    /// This operation never discovers, connects to, launches, or stops ChatGPT. Changed
+    /// JavaScript requires [`RendererAssetUpdatePolicy::Force`]; all integrity and
+    /// compatibility checks remain mandatory in forced mode.
+    pub async fn update_renderer_assets(
+        &self,
+        policy: RendererAssetUpdatePolicy,
+    ) -> Result<CodexUpdateReport, CodexRefitError> {
+        let manifest = self.update_client.fetch_latest_manifest().await?;
+        let candidate_info = manifest.info(RendererAssetSource::Github);
+        let candidate_version = semver::Version::parse(&candidate_info.version)
+            .expect("validated candidate asset version remains valid");
+        let current_version = semver::Version::parse(&self.payload.asset_info.version)
+            .expect("validated current asset version remains valid");
+        if candidate_version < current_version {
+            return Err(CodexRefitError::new(
+                CodexRefitErrorCode::UpdateFailed,
+                "renderer asset downgrade was rejected by version policy",
+            ));
+        }
+        let content_changed = manifest.content_identity() != self.renderer_asset_content_identity;
+        if content_changed && candidate_version == current_version {
+            return Err(CodexRefitError::new(
+                CodexRefitErrorCode::UpdateFailed,
+                "renderer JavaScript changed without a new asset version; publish a higher assetVersion before updating",
+            ));
+        }
+        if content_changed && policy == RendererAssetUpdatePolicy::RequireUnchanged {
+            return Err(CodexRefitError::new(
+                CodexRefitErrorCode::UpdateFailed,
+                "renderer JavaScript SHA-256 values changed; rerun `opsail refit codex update --force` (or `-f`) to install the verified bundle",
+            ));
+        }
+        let files = manifest.file_count();
+        let allow_content_change = policy == RendererAssetUpdatePolicy::Force;
+        if candidate_version == current_version
+            && !content_changed
+            && self.renderer_asset_warning.is_none()
+        {
+            return Ok(CodexUpdateReport {
+                operation: CodexRefitOperation::Update,
+                previous: self.payload.asset_info.clone(),
+                installed: self.payload.asset_info.clone(),
+                changed: false,
+                forced: allow_content_change,
+                activation: RendererAssetActivation::Current,
+                files,
+            });
+        }
+
+        let bundle = self.update_client.fetch_bundle(manifest).await?;
+        build_usage_payload(bundle.sources(), candidate_info).map_err(|error| {
+            CodexRefitError::new(
+                CodexRefitErrorCode::UpdateFailed,
+                format!("downloaded renderer assets failed payload validation: {error}"),
+            )
+        })?;
+        let previous = self.payload.asset_info.clone();
+        let store = self.renderer_assets.clone();
+        let install = tokio::task::spawn_blocking(move || store.install(&bundle))
+            .await
+            .map_err(|_| {
+                CodexRefitError::new(
+                    CodexRefitErrorCode::UpdateFailed,
+                    "renderer asset installation task did not complete",
+                )
+            })??;
+        Ok(CodexUpdateReport {
+            operation: CodexRefitOperation::Update,
+            previous,
+            installed: install.installed,
+            changed: install.changed,
+            forced: allow_content_change,
+            activation: if install.changed {
+                RendererAssetActivation::NextSession
+            } else {
+                RendererAssetActivation::Current
+            },
+            files,
         })
     }
 
@@ -174,7 +296,7 @@ impl CodexRefit {
                 if self.state.managed_session_active()? {
                     return Err(CodexRefitError::new(
                         CodexRefitErrorCode::SessionUnavailable,
-                        "a persistent foreground manager is active; stop it before using once mode",
+                        "a persistent manager is active; stop it before using once mode",
                     ));
                 }
                 let manager_token = new_manager_token();
@@ -248,6 +370,24 @@ impl CodexRefit {
     pub async fn doctor(&self) -> CodexDoctorReport {
         let mut checks = Vec::new();
         let mut detected_session_modes = Vec::new();
+        checks.push(DoctorCheck {
+            name: "renderer-assets",
+            state: if self.renderer_asset_warning.is_some() {
+                DoctorCheckState::Warning
+            } else {
+                DoctorCheckState::Pass
+            },
+            message: self.renderer_asset_warning.clone().unwrap_or_else(|| {
+                format!(
+                    "renderer JavaScript {} ({}) is valid",
+                    self.payload.asset_info.version,
+                    match self.payload.asset_info.source {
+                        RendererAssetSource::Embedded => "embedded",
+                        RendererAssetSource::Github => "github",
+                    }
+                )
+            }),
+        });
         if !platform::is_supported() {
             checks.push(DoctorCheck {
                 name: "platform",
@@ -260,6 +400,7 @@ impl CodexRefit {
                 port: self.port,
                 default_session_mode: SessionMode::Persistent,
                 detected_session_modes,
+                renderer_assets: self.payload.asset_info.clone(),
                 checks,
             };
         }
@@ -271,7 +412,12 @@ impl CodexRefit {
 
         if let Err(error) = run_blocking(platform::validate_app).await {
             checks.push(failed_check("application", &error));
-            return doctor_report(self.port, checks, detected_session_modes);
+            return doctor_report(
+                self.port,
+                self.payload.asset_info.clone(),
+                checks,
+                detected_session_modes,
+            );
         }
         checks.push(DoctorCheck {
             name: "application",
@@ -302,7 +448,12 @@ impl CodexRefit {
             }
             Err(error) => {
                 checks.push(failed_check("listener", &error));
-                return doctor_report(self.port, checks, detected_session_modes);
+                return doctor_report(
+                    self.port,
+                    self.payload.asset_info.clone(),
+                    checks,
+                    detected_session_modes,
+                );
             }
         };
 
@@ -320,7 +471,12 @@ impl CodexRefit {
             }
             Err(error) => {
                 checks.push(failed_check("discovery", &error));
-                return doctor_report(self.port, checks, detected_session_modes);
+                return doctor_report(
+                    self.port,
+                    self.payload.asset_info.clone(),
+                    checks,
+                    detected_session_modes,
+                );
             }
         };
 
@@ -360,7 +516,12 @@ impl CodexRefit {
                     "no renderer matched the expected app shell and sidebar".to_owned()
                 },
             });
-            return doctor_report(self.port, checks, detected_session_modes);
+            return doctor_report(
+                self.port,
+                self.payload.asset_info.clone(),
+                checks,
+                detected_session_modes,
+            );
         }
         checks.push(DoctorCheck {
             name: "renderer",
@@ -377,15 +538,11 @@ impl CodexRefit {
                 DoctorCheckState::Fail,
                 format!("{}: {error}", error.code().as_str()),
             ),
-            Ok(active)
-                if detected_session_modes.contains(&SessionMode::Persistent) && !active =>
-            {
-                (
-                    DoctorCheckState::Warning,
-                    "persistent (managed) renderer artifacts exist without an active foreground manager"
-                        .to_owned(),
-                )
-            }
+            Ok(active) if detected_session_modes.contains(&SessionMode::Persistent) && !active => (
+                DoctorCheckState::Warning,
+                "persistent (managed) renderer artifacts exist without an active manager"
+                    .to_owned(),
+            ),
             Ok(true) => (
                 DoctorCheckState::Pass,
                 "persistent (managed) mode is active".to_owned(),
@@ -415,7 +572,12 @@ impl CodexRefit {
             }),
             Err(error) => checks.push(failed_check("identity-stability", &error)),
         }
-        doctor_report(self.port, checks, detected_session_modes)
+        doctor_report(
+            self.port,
+            self.payload.asset_info.clone(),
+            checks,
+            detected_session_modes,
+        )
     }
 
     async fn connect_sessions(
@@ -588,6 +750,7 @@ impl CodexRefit {
             report.session_mode = Some(SessionMode::Persistent);
             report.launch_policy = Some(launch_policy);
             report.launched = Some(false);
+            report.renderer_assets = Some(self.payload.asset_info.clone());
             Ok(CodexUsageSession {
                 mode: SessionMode::Persistent,
                 report,
@@ -609,6 +772,7 @@ impl CodexRefit {
 
     fn report_with_port(&self, mut report: CodexRefitReport) -> CodexRefitReport {
         report.port = self.port;
+        report.renderer_assets = Some(self.payload.asset_info.clone());
         report
     }
 
@@ -655,7 +819,16 @@ impl PersistentSupervisor {
 
             loop {
                 let delay = backoff.next_delay();
-                sleep(delay).await;
+                if self.wait_for_reconnect_or_app_exit(delay).await == RecoveryDecision::Stop {
+                    self.adapter
+                        .state
+                        .remove_absent_targets(self.adapter.port, &[])?;
+                    tracing::info!(
+                        target: "opsail_refit_codex",
+                        "[opsail-refit-codex] ChatGPT exited; managed session stopped"
+                    );
+                    return Ok(());
+                }
                 let attempt = async {
                     let _operation_lock = self.adapter.state.try_operation_lock()?;
                     self.adapter
@@ -678,6 +851,54 @@ impl PersistentSupervisor {
                 }
             }
         }
+    }
+
+    async fn wait_for_reconnect_or_app_exit(&self, delay: Duration) -> RecoveryDecision {
+        let backend = Arc::clone(&self.adapter.launch_backend);
+        wait_for_reconnect_or_app_exit(delay, || {
+            let backend = Arc::clone(&backend);
+            async move {
+                match run_blocking(move || backend.app_is_running()).await {
+                    Ok(running) => running,
+                    Err(error) => {
+                        tracing::warn!(
+                            target: "opsail_refit_codex",
+                            code = error.code().as_str(),
+                            "[opsail-refit-codex] could not confirm ChatGPT process state"
+                        );
+                        true
+                    }
+                }
+            }
+        })
+        .await
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecoveryDecision {
+    Reconnect,
+    Stop,
+}
+
+async fn wait_for_reconnect_or_app_exit<F, Fut>(
+    delay: Duration,
+    mut app_is_running: F,
+) -> RecoveryDecision
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = Instant::now() + delay;
+    loop {
+        if !app_is_running().await {
+            return RecoveryDecision::Stop;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return RecoveryDecision::Reconnect;
+        }
+        sleep(remaining.min(APP_EXIT_CHECK_INTERVAL)).await;
     }
 }
 
@@ -822,7 +1043,7 @@ impl ManagedSession for CodexSession {
                     if let Err(error) = self.state.replace(record) {
                         let _ = self.cdp.remove_script(&identifier).await;
                         self.owned_script_identifiers.clear();
-                        let _ = self.cdp.evaluate(disable_expression()).await;
+                        let _ = self.cdp.evaluate(self.payload.disable()).await;
                         return Err(error);
                     }
                 }
@@ -836,7 +1057,7 @@ impl ManagedSession for CodexSession {
                     let _ = self.cdp.remove_script(&identifier).await;
                 }
                 let _ = self.state.remove(self.port, &target_id);
-                let _ = self.cdp.evaluate(disable_expression()).await;
+                let _ = self.cdp.evaluate(self.payload.disable()).await;
                 return Err(CodexRefitError::new(
                     CodexRefitErrorCode::InjectionFailed,
                     error.to_string(),
@@ -858,17 +1079,20 @@ impl ManagedSession for CodexSession {
                 }
             }
             let state_error = self.state.remove(self.port, &target_id).err();
-            let cleanup_value = self
-                .cdp
-                .evaluate(disable_expression())
-                .await
-                .map_err(|error| {
-                    if error.code() == CodexRefitErrorCode::InjectionFailed {
-                        CodexRefitError::new(CodexRefitErrorCode::CleanupFailed, error.to_string())
-                    } else {
-                        error
-                    }
-                })?;
+            let cleanup_value =
+                self.cdp
+                    .evaluate(self.payload.disable())
+                    .await
+                    .map_err(|error| {
+                        if error.code() == CodexRefitErrorCode::InjectionFailed {
+                            CodexRefitError::new(
+                                CodexRefitErrorCode::CleanupFailed,
+                                error.to_string(),
+                            )
+                        } else {
+                            error
+                        }
+                    })?;
             let cleanup: CleanupResult = serde_json::from_value(cleanup_value).map_err(|_| {
                 CodexRefitError::new(
                     CodexRefitErrorCode::CleanupFailed,
@@ -1013,6 +1237,7 @@ fn failed_check(name: &'static str, error: &CodexRefitError) -> DoctorCheck {
 
 fn doctor_report(
     port: u16,
+    renderer_assets: RendererAssetInfo,
     checks: Vec<DoctorCheck>,
     detected_session_modes: Vec<SessionMode>,
 ) -> CodexDoctorReport {
@@ -1025,6 +1250,7 @@ fn doctor_report(
         port,
         default_session_mode: SessionMode::Persistent,
         detected_session_modes,
+        renderer_assets,
         checks,
     }
 }
@@ -1032,6 +1258,7 @@ fn doctor_report(
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
     use futures_util::{SinkExt as _, StreamExt as _};
     use serde_json::Value;
@@ -1041,6 +1268,48 @@ mod tests {
     use tokio_tungstenite::accept_async;
 
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeUpdateClient {
+        bundle: renderer_assets::RendererAssetBundle,
+        bundle_fetches: Arc<AtomicUsize>,
+    }
+
+    impl RendererAssetUpdateClient for FakeUpdateClient {
+        fn fetch_latest_manifest(&self) -> github_update::ManifestFuture<'_> {
+            let manifest = self.bundle.manifest().clone();
+            Box::pin(async move { Ok(manifest) })
+        }
+
+        fn fetch_bundle(
+            &self,
+            manifest: renderer_assets::RendererAssetManifest,
+        ) -> github_update::BundleFuture<'_> {
+            self.bundle_fetches.fetch_add(1, AtomicOrdering::Relaxed);
+            let bundle = self.bundle.clone();
+            Box::pin(async move {
+                if manifest.content_identity() != bundle.manifest().content_identity() {
+                    return Err(CodexRefitError::new(
+                        CodexRefitErrorCode::UpdateFailed,
+                        "fake update manifest changed",
+                    ));
+                }
+                Ok(bundle)
+            })
+        }
+    }
+
+    fn use_fake_update(
+        adapter: &mut CodexRefit,
+        bundle: renderer_assets::RendererAssetBundle,
+    ) -> Arc<AtomicUsize> {
+        let bundle_fetches = Arc::new(AtomicUsize::new(0));
+        adapter.update_client = Arc::new(FakeUpdateClient {
+            bundle,
+            bundle_fetches: Arc::clone(&bundle_fetches),
+        });
+        bundle_fetches
+    }
 
     async fn test_cdp_session(
         evaluation_value: Value,
@@ -1155,6 +1424,144 @@ mod tests {
         assert_eq!(DEFAULT_CODEX_DEBUG_PORT, 55321);
     }
 
+    #[tokio::test]
+    async fn update_requires_force_before_changed_javascript_is_written() {
+        let directory = tempdir().unwrap();
+        let mut adapter = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        let bundle_fetches = use_fake_update(
+            &mut adapter,
+            renderer_assets::test_bundle_with_change(
+                "1.1.0",
+                Some("opsail-refit-codex-dom-adapter.js"),
+            ),
+        );
+
+        let error = adapter
+            .update_renderer_assets(RendererAssetUpdatePolicy::RequireUnchanged)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), CodexRefitErrorCode::UpdateFailed);
+        assert!(error.to_string().contains("--force"));
+        assert_eq!(bundle_fetches.load(AtomicOrdering::Relaxed), 0);
+        let selection = RendererAssetStore::new(directory.path().to_owned())
+            .load_or_embedded()
+            .unwrap();
+        assert_eq!(selection.info.source, RendererAssetSource::Embedded);
+        assert!(
+            !directory
+                .path()
+                .join("renderer-assets/current.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn forced_update_installs_for_the_next_session_without_a_cdp_target() {
+        let directory = tempdir().unwrap();
+        let mut adapter = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        let bundle_fetches = use_fake_update(
+            &mut adapter,
+            renderer_assets::test_bundle_with_change(
+                "1.1.0",
+                Some("opsail-refit-codex-dom-adapter.js"),
+            ),
+        );
+
+        let report = adapter
+            .update_renderer_assets(RendererAssetUpdatePolicy::Force)
+            .await
+            .unwrap();
+        assert_eq!(report.operation, CodexRefitOperation::Update);
+        assert!(report.changed);
+        assert!(report.forced);
+        assert_eq!(report.activation, RendererAssetActivation::NextSession);
+        assert_eq!(report.previous.source, RendererAssetSource::Embedded);
+        assert_eq!(report.installed.source, RendererAssetSource::Github);
+        assert_eq!(report.installed.version, "1.1.0");
+        assert_eq!(report.files, renderer_assets::RENDERER_ASSET_FILES.len());
+        assert_eq!(bundle_fetches.load(AtomicOrdering::Relaxed), 1);
+
+        let next = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        assert_eq!(next.payload.asset_info, report.installed);
+    }
+
+    #[tokio::test]
+    async fn force_never_allows_changed_javascript_to_reuse_a_version() {
+        let directory = tempdir().unwrap();
+        let mut adapter = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        let bundle_fetches = use_fake_update(
+            &mut adapter,
+            renderer_assets::test_bundle_with_change(
+                "1.0.0",
+                Some("opsail-refit-codex-dom-adapter.js"),
+            ),
+        );
+
+        let error = adapter
+            .update_renderer_assets(RendererAssetUpdatePolicy::Force)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code(), CodexRefitErrorCode::UpdateFailed);
+        assert!(error.to_string().contains("higher assetVersion"));
+        assert_eq!(bundle_fetches.load(AtomicOrdering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn unchanged_javascript_can_advance_manifest_version_without_force() {
+        let directory = tempdir().unwrap();
+        let mut adapter = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        let bundle_fetches = use_fake_update(
+            &mut adapter,
+            renderer_assets::test_bundle_with_change("1.1.0", None),
+        );
+
+        let report = adapter
+            .update_renderer_assets(RendererAssetUpdatePolicy::RequireUnchanged)
+            .await
+            .unwrap();
+        assert!(report.changed);
+        assert!(!report.forced);
+        assert_eq!(report.installed.version, "1.1.0");
+        assert_eq!(bundle_fetches.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unchanged_current_manifest_avoids_javascript_downloads() {
+        let directory = tempdir().unwrap();
+        let mut adapter = CodexRefit::new(
+            CodexRefitConfig::default().with_state_dir(directory.path().to_owned()),
+        )
+        .unwrap();
+        let bundle_fetches = use_fake_update(
+            &mut adapter,
+            renderer_assets::test_bundle_with_change("1.0.0", None),
+        );
+
+        let report = adapter
+            .update_renderer_assets(RendererAssetUpdatePolicy::RequireUnchanged)
+            .await
+            .unwrap();
+        assert!(!report.changed);
+        assert_eq!(report.activation, RendererAssetActivation::Current);
+        assert_eq!(report.installed.source, RendererAssetSource::Embedded);
+        assert_eq!(bundle_fetches.load(AtomicOrdering::Relaxed), 0);
+    }
+
     #[test]
     fn renderer_probe_contains_no_remote_or_model_channel() {
         let payload = usage_payload().unwrap();
@@ -1172,6 +1579,10 @@ mod tests {
             session_mode: Some(SessionMode::Once),
             launch_policy: Some(LaunchPolicy::LaunchIfStopped),
             launched: Some(true),
+            renderer_assets: Some(RendererAssetInfo {
+                version: "1.0.0".to_owned(),
+                source: RendererAssetSource::Embedded,
+            }),
             targets: vec![
                 CodexTargetHealth::new("renderer", CodexRefitState::Stale, false)
                     .with_session_mode(SessionMode::Once),
@@ -1183,8 +1594,31 @@ mod tests {
         assert_eq!(value["sessionMode"], "once");
         assert_eq!(value["launchPolicy"], "launch-if-stopped");
         assert_eq!(value["launched"], true);
+        assert_eq!(value["rendererAssets"]["version"], "1.0.0");
+        assert_eq!(value["rendererAssets"]["source"], "embedded");
         assert_eq!(value["targets"][0]["state"], "stale");
         assert_eq!(value["targets"][0]["sessionMode"], "once");
+
+        let update = CodexUpdateReport {
+            operation: CodexRefitOperation::Update,
+            previous: RendererAssetInfo {
+                version: "1.0.0".to_owned(),
+                source: RendererAssetSource::Embedded,
+            },
+            installed: RendererAssetInfo {
+                version: "1.1.0".to_owned(),
+                source: RendererAssetSource::Github,
+            },
+            changed: true,
+            forced: true,
+            activation: RendererAssetActivation::NextSession,
+            files: renderer_assets::RENDERER_ASSET_FILES.len(),
+        };
+        let value: Value = serde_json::to_value(update).unwrap();
+        assert_eq!(value["operation"], "update");
+        assert_eq!(value["installed"]["source"], "github");
+        assert_eq!(value["activation"], "next-session");
+        assert_eq!(value["forced"], true);
     }
 
     #[test]
@@ -1289,10 +1723,40 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_millis(250));
     }
 
+    #[tokio::test]
+    async fn disconnected_manager_stops_immediately_when_chatgpt_is_gone() {
+        let inspections = AtomicUsize::new(0);
+        let decision = wait_for_reconnect_or_app_exit(Duration::from_secs(30), || {
+            inspections.fetch_add(1, AtomicOrdering::Relaxed);
+            std::future::ready(false)
+        })
+        .await;
+
+        assert_eq!(decision, RecoveryDecision::Stop);
+        assert_eq!(inspections.load(AtomicOrdering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnected_manager_retries_when_chatgpt_is_still_running() {
+        let inspections = AtomicUsize::new(0);
+        let decision = wait_for_reconnect_or_app_exit(Duration::from_millis(1), || {
+            inspections.fetch_add(1, AtomicOrdering::Relaxed);
+            std::future::ready(true)
+        })
+        .await;
+
+        assert_eq!(decision, RecoveryDecision::Reconnect);
+        assert!(inspections.load(AtomicOrdering::Relaxed) >= 1);
+    }
+
     #[test]
     fn doctor_names_default_and_detected_session_lifecycles() {
         let report = doctor_report(
             DEFAULT_CODEX_DEBUG_PORT,
+            RendererAssetInfo {
+                version: "1.0.0".to_owned(),
+                source: RendererAssetSource::Embedded,
+            },
             vec![DoctorCheck {
                 name: "session-mode",
                 state: DoctorCheckState::Pass,
@@ -1415,5 +1879,9 @@ mod tests {
         assert!(GUIDE.contains("application restart"));
         assert!(GUIDE.contains("`persistent` (managed)"));
         assert!(GUIDE.contains("`once` (ephemeral)"));
+        assert!(GUIDE.contains("detached manager"));
+        assert!(GUIDE.contains("ChatGPT has exited"));
+        assert!(GUIDE.contains("there is no steady-state process polling"));
+        assert!(GUIDE.contains("--foreground"));
     }
 }

@@ -15,6 +15,7 @@ pub enum CodexRefitErrorCode {
     LaunchFailed,
     InjectionFailed,
     CleanupFailed,
+    UpdateFailed,
     Stale,
     StateIo,
 }
@@ -32,6 +33,7 @@ impl CodexRefitErrorCode {
             Self::LaunchFailed => "launch-failed",
             Self::InjectionFailed => "injection-failed",
             Self::CleanupFailed => "cleanup-failed",
+            Self::UpdateFailed => "update-failed",
             Self::Stale => "stale",
             Self::StateIo => "state-io",
         }

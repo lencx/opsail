@@ -37,7 +37,8 @@
 }
 
 #opsail-refit-codex-usage[hidden],
-.opsail-refit-codex-usage-row[hidden] {
+.opsail-refit-codex-usage-row[hidden],
+.opsail-refit-codex-reset-credits[hidden] {
   display: none !important;
 }
 
@@ -76,9 +77,9 @@
   top: var(--opsail-refit-usage-details-top, 0);
   left: var(--opsail-refit-usage-details-left, 0);
   display: none;
-  width: var(--opsail-refit-usage-details-width, 208px);
+  width: var(--opsail-refit-usage-details-width, 240px);
   min-width: 0;
-  max-width: calc(100vw - 16px);
+  max-width: calc(100vw - 32px);
   max-height: var(--opsail-refit-usage-details-max-height, calc(100vh - 16px));
   padding: 8px;
   overflow-y: auto;
@@ -163,6 +164,63 @@
   border-radius: inherit;
   background: var(--color-token-interactive-label-accent-default, var(--color-token-primary, currentColor));
   transition: width 180ms ease-out;
+}
+
+.opsail-refit-codex-reset-credits {
+  display: grid;
+  min-width: 0;
+  gap: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--color-token-border-light, var(--color-border-light, currentColor));
+}
+
+.opsail-refit-codex-reset-credits-title {
+  color: var(--color-token-foreground, var(--color-text-foreground, currentColor));
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 14px;
+}
+
+.opsail-refit-codex-reset-credits-table {
+  width: 100%;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-collapse: collapse;
+  color: inherit;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  line-height: 14px;
+}
+
+.opsail-refit-codex-reset-credits-row + .opsail-refit-codex-reset-credits-row > td {
+  border-top: 1px solid var(--color-token-border-light, var(--color-border-light, currentColor));
+}
+
+.opsail-refit-codex-reset-credits-row > td {
+  padding: 3px 0;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.opsail-refit-codex-reset-credits-row:first-child > td {
+  padding-top: 0;
+}
+
+.opsail-refit-codex-reset-credits-row:last-child > td {
+  padding-bottom: 0;
+}
+
+.opsail-refit-codex-reset-credits-expiry {
+  color: var(--color-token-text-secondary, var(--color-text-foreground-secondary, currentColor));
+  text-align: start;
+}
+
+.opsail-refit-codex-reset-credits-row > .opsail-refit-codex-reset-credits-countdown {
+  padding-inline-start: 8px;
+  color: var(--color-token-description-foreground, var(--color-text-foreground-tertiary, currentColor));
+  text-align: end;
 }
 
 .opsail-refit-codex-visually-hidden {

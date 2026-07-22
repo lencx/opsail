@@ -71,6 +71,7 @@ where
         session_mode: Some(mode),
         launch_policy: None,
         launched: None,
+        renderer_assets: None,
         targets: reports,
     })
 }
@@ -142,6 +143,7 @@ where
         session_mode: common_session_mode(&reports),
         launch_policy: None,
         launched: None,
+        renderer_assets: None,
         targets: reports,
     })
 }
@@ -160,6 +162,7 @@ where
         session_mode: common_session_mode(&reports),
         launch_policy: None,
         launched: None,
+        renderer_assets: None,
         targets: reports,
     })
 }

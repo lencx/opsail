@@ -9,29 +9,76 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
 
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
   const normalizedLanguage = (value) => String(value || "").trim().replaceAll("_", "-").toLowerCase();
+  const formatLocaleTypography = (value, locale) => {
+    const text = String(value || "");
+    if (!normalizedLanguage(locale).startsWith("zh")) return text;
+    return text
+      .replace(/(\p{Script=Han})([A-Za-z0-9])/gu, "$1 $2")
+      .replace(/([A-Za-z0-9])(\p{Script=Han})/gu, "$1 $2")
+      .replace(/[ \t]+/g, " ")
+      .trim();
+  };
   const formatMessage = (template, values = {}) => String(template || "").replace(
     /\{([A-Za-z][A-Za-z0-9]*)\}/g,
     (_match, key) => Object.hasOwn(values, key) ? String(values[key]) : "",
   );
 
+  const localeCache = new Map();
   const selectLocale = (...languageCandidates) => {
     const locales = localeBundle?.locales && typeof localeBundle.locales === "object"
       ? localeBundle.locales
       : {};
     const entries = Object.entries(locales);
+    const defaultKey = localeBundle?.defaultLocale && locales[localeBundle.defaultLocale]
+      ? localeBundle.defaultLocale
+      : entries[0]?.[0];
+    const defaultCopy = locales[defaultKey] || {};
+    const supported = new Map(
+      (Array.isArray(localeBundle?.supportedLocales)
+        ? localeBundle.supportedLocales
+        : Object.keys(locales))
+        .map((locale) => [normalizedLanguage(locale), locale]),
+    );
+    const mergedCopy = (entryKey, displayLocale) => {
+      const cacheKey = `${entryKey || defaultKey || ""}:${displayLocale || ""}`;
+      if (localeCache.has(cacheKey)) return localeCache.get(cacheKey);
+      const override = locales[entryKey] || {};
+      const copy = {
+        ...defaultCopy,
+        ...override,
+        locale: displayLocale || override.locale || defaultCopy.locale || defaultKey,
+        resetCreditCountdownUnits: {
+          ...(defaultCopy.resetCreditCountdownUnits || {}),
+          ...(override.resetCreditCountdownUnits || {}),
+        },
+        windowLabels: {
+          ...(defaultCopy.windowLabels || {}),
+          ...(override.windowLabels || {}),
+        },
+        summaryWindowLabels: {
+          ...(defaultCopy.summaryWindowLabels || {}),
+          ...(override.windowLabels || {}),
+          ...(override.summaryWindowLabels || {}),
+        },
+      };
+      localeCache.set(cacheKey, copy);
+      return copy;
+    };
     for (const candidate of languageCandidates) {
       const normalized = normalizedLanguage(candidate);
       if (!normalized) continue;
       const exact = entries.find(([key, value]) =>
         normalizedLanguage(key) === normalized || normalizedLanguage(value?.locale) === normalized);
-      if (exact) return exact[1];
+      const displayLocale = supported.get(normalized) || String(candidate).replaceAll("_", "-");
+      if (exact) return mergedCopy(exact[0], displayLocale);
       const base = normalized.split("-")[0];
       const baseMatch = entries.find(([key, value]) =>
         normalizedLanguage(key).split("-")[0] === base
         || normalizedLanguage(value?.locale).split("-")[0] === base);
-      if (baseMatch) return baseMatch[1];
+      if (baseMatch) return mergedCopy(baseMatch[0], displayLocale);
+      if (supported.has(normalized)) return mergedCopy(defaultKey, displayLocale);
     }
-    return locales[localeBundle?.defaultLocale] || entries[0]?.[1] || {};
+    return mergedCopy(defaultKey, defaultCopy.locale || defaultKey);
   };
 
   const normalizeWindow = (value) => {
@@ -131,78 +178,35 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     return labels.generic;
   };
 
-  const formatRelativeReset = (milliseconds, copy) => {
-    const units = copy?.relativeUnits;
-    if (!units || ![units.day, units.hour, units.minute, units.separator]
-      .every((value) => typeof value === "string")) return null;
-    const totalMinutes = Math.max(1, Math.ceil(milliseconds / (60 * 1000)));
-    const days = Math.floor(totalMinutes / (24 * 60));
-    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
-    const minutes = totalMinutes % 60;
-    const parts = [];
-    if (days > 0) {
-      parts.push(`${days}${units.day}`);
-      if (hours > 0) parts.push(`${hours}${units.hour}`);
-    } else if (hours > 0) {
-      parts.push(`${hours}${units.hour}`);
-      if (minutes > 0) parts.push(`${minutes}${units.minute}`);
-    } else {
-      parts.push(`${minutes || 1}${units.minute}`);
-    }
-    return parts.join(units.separator);
-  };
-
-  const formatReset = (resetsAt, copy, displayLocale, nowMs = Date.now()) => {
+  const formatReset = (resetsAt, _copy, displayLocale) => {
     if (resetsAt === null) return null;
     const value = new Date(resetsAt * 1000);
     if (!Number.isFinite(value.getTime())) return null;
     const locale = normalizedLanguage(displayLocale) ? displayLocale : undefined;
     try {
-      const full = new Intl.DateTimeFormat(locale, {
+      const full = formatLocaleTypography(new Intl.DateTimeFormat(locale, {
         dateStyle: "full",
         timeStyle: "long",
-      }).format(value);
-      const date = new Intl.DateTimeFormat(locale, {
+      }).format(value), locale);
+      const display = formatLocaleTypography(new Intl.DateTimeFormat(locale, {
+        weekday: "short",
         month: "short",
         day: "numeric",
-      }).format(value);
-      const weekday = new Intl.DateTimeFormat(locale, {
-        weekday: "short",
-      }).format(value);
-      const time = new Intl.DateTimeFormat(locale, {
         hour: "numeric",
         minute: "2-digit",
-      }).format(value);
-      const remainingMilliseconds = value.getTime()
-        - (Number.isFinite(nowMs) ? nowMs : Date.now());
-      return {
-        date,
-        full,
-        relative: remainingMilliseconds > 0
-          ? formatRelativeReset(remainingMilliseconds, copy)
-          : null,
-        soon: remainingMilliseconds <= 0,
-        time,
-        weekday,
-      };
+      }).format(value), locale);
+      return { display, full };
     } catch {
       try {
-        const full = value.toLocaleString(locale);
-        return {
-          date: full,
-          full,
-          relative: null,
-          soon: false,
-          time: "",
-          weekday: "",
-        };
+        const full = formatLocaleTypography(value.toLocaleString(locale), locale);
+        return { display: full, full };
       } catch {
         return null;
       }
     }
   };
 
-  const presentWindows = (snapshot, copy, displayLocale, nowMs = Date.now()) => [
+  const presentWindows = (snapshot, copy, displayLocale) => [
     snapshot?.primary,
     snapshot?.secondary,
   ]
@@ -224,9 +228,87 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
         ),
         used,
         remaining,
-        reset: formatReset(windowValue.resetsAt, copy, displayLocale, nowMs),
+        reset: formatReset(windowValue.resetsAt, copy, displayLocale),
       };
     });
+
+  const normalizeResetCredits = (value) => {
+    if (!value || typeof value !== "object" || !Array.isArray(value.credits)) return [];
+    return value.credits
+      .filter((credit) => credit
+        && typeof credit === "object"
+        && credit.status === "available"
+        && typeof credit.expiresAt === "number"
+        && Number.isFinite(credit.expiresAt)
+        && credit.expiresAt > 0)
+      .map((credit) => ({ expiresAt: credit.expiresAt }))
+      .sort((left, right) => left.expiresAt - right.expiresAt);
+  };
+
+  const formatResetCreditCountdown = (remainingMilliseconds, copy) => {
+    const units = copy?.resetCreditCountdownUnits;
+    if (!units || ![units.day, units.hour, units.minute, units.separator]
+      .every((value) => typeof value === "string")) return null;
+    if (!Number.isFinite(remainingMilliseconds) || remainingMilliseconds <= 0) return null;
+    const minuteMilliseconds = 60 * 1000;
+    const hourMilliseconds = 60 * minuteMilliseconds;
+    if (remainingMilliseconds < hourMilliseconds) {
+      const totalMinutes = Math.floor(remainingMilliseconds / minuteMilliseconds);
+      return {
+        countdown: `${totalMinutes}${units.minute}`,
+        nextUpdateMs: totalMinutes === 0
+          ? Math.max(1000, remainingMilliseconds)
+          : Math.max(1000, remainingMilliseconds - totalMinutes * minuteMilliseconds + 1),
+      };
+    }
+    const totalHours = Math.floor(remainingMilliseconds / hourMilliseconds);
+    const days = Math.floor(totalHours / 24);
+    const hours = totalHours % 24;
+    const parts = [];
+    if (days > 0) parts.push(`${days}${units.day}`);
+    if (hours > 0 || days === 0) parts.push(`${hours}${units.hour}`);
+    return {
+      countdown: parts.join(units.separator),
+      nextUpdateMs: Math.max(
+        1000,
+        remainingMilliseconds - totalHours * hourMilliseconds + 1,
+      ),
+    };
+  };
+
+  const formatLocalDateTime = (value) => {
+    const part = (number, width = 2) => String(number).padStart(width, "0");
+    return `${part(value.getFullYear(), 4)}-${part(value.getMonth() + 1)}-${part(value.getDate())}`
+      + ` ${part(value.getHours())}:${part(value.getMinutes())}:${part(value.getSeconds())}`;
+  };
+
+  const presentResetCredits = (credits, copy, displayLocale, nowMs = Date.now()) => {
+    const locale = normalizedLanguage(displayLocale) ? displayLocale : undefined;
+    return (Array.isArray(credits) ? credits : []).flatMap((credit) => {
+      const expiresAt = credit?.expiresAt;
+      if (typeof expiresAt !== "number" || !Number.isFinite(expiresAt) || expiresAt <= 0) return [];
+      const value = new Date(expiresAt * 1000);
+      if (!Number.isFinite(value.getTime())) return [];
+      const countdown = formatResetCreditCountdown(
+        value.getTime() - (Number.isFinite(nowMs) ? nowMs : Date.now()),
+        copy,
+      );
+      if (!countdown) return [];
+      const dateTime = formatLocalDateTime(value);
+      let full = dateTime;
+      try {
+        full = formatLocaleTypography(new Intl.DateTimeFormat(locale, {
+          dateStyle: "full",
+          timeStyle: "long",
+        }).format(value), locale);
+      } catch {
+        try {
+          full = formatLocaleTypography(value.toLocaleString(locale), locale);
+        } catch {}
+      }
+      return [{ expiresAt, dateTime, full, ...countdown }];
+    });
+  };
 
   const summaryFor = (windows, copy) => windows
     .map((windowValue) => formatMessage(copy?.summaryItem, {
@@ -248,10 +330,10 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     const sidebarRect = finiteRect(sidebar);
     const viewportRect = finiteRect(viewport);
     if (!anchorRect || !sidebarRect || !viewportRect) return null;
-    const horizontalInset = 8;
+    const horizontalInset = 16;
+    const verticalInset = 8;
     const maximumWidth = Math.max(1, Math.min(
       240,
-      sidebarRect.width - horizontalInset * 2,
       viewportRect.width - horizontalInset * 2,
     ));
     const requestedWidth = Number.isFinite(tooltip?.width) && tooltip.width > 0
@@ -259,31 +341,39 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
       : maximumWidth;
     const width = Math.max(1, Math.min(requestedWidth, maximumWidth));
     const maximumHeight = Math.max(1, Math.min(
-      sidebarRect.height - horizontalInset * 2,
-      viewportRect.height - horizontalInset * 2,
+      viewportRect.height - verticalInset * 2,
     ));
     const requestedHeight = Number.isFinite(tooltip?.height) && tooltip.height > 0
       ? tooltip.height
       : 1;
     const height = Math.min(requestedHeight, maximumHeight);
-    const minimumLeft = Math.max(sidebarRect.left + horizontalInset, viewportRect.left + horizontalInset);
-    const maximumLeft = Math.min(
-      sidebarRect.right - width - horizontalInset,
+    const viewportMinimumLeft = viewportRect.left + horizontalInset;
+    const viewportMaximumLeft = Math.max(
+      viewportMinimumLeft,
       viewportRect.right - width - horizontalInset,
     );
-    const left = maximumLeft >= minimumLeft
-      ? clamp(anchorRect.left, minimumLeft, maximumLeft)
-      : clamp(anchorRect.left, viewportRect.left, Math.max(viewportRect.left, viewportRect.right - width));
-    const minimumTop = Math.max(sidebarRect.top + horizontalInset, viewportRect.top + horizontalInset);
-    const maximumTop = Math.max(minimumTop, Math.min(
-      sidebarRect.bottom - height - horizontalInset,
-      viewportRect.bottom - height - horizontalInset,
-    ));
+    const sidebarMinimumLeft = Math.max(
+      sidebarRect.left + horizontalInset,
+      viewportMinimumLeft,
+    );
+    const sidebarMaximumLeft = Math.min(
+      sidebarRect.right - width - horizontalInset,
+      viewportMaximumLeft,
+    );
+    const attachedLeft = Math.max(sidebarMinimumLeft, anchorRect.right - width);
+    const left = sidebarMaximumLeft >= sidebarMinimumLeft
+      ? clamp(attachedLeft, sidebarMinimumLeft, sidebarMaximumLeft)
+      : clamp(attachedLeft, viewportMinimumLeft, viewportMaximumLeft);
+    const minimumTop = viewportRect.top + verticalInset;
+    const maximumTop = Math.max(
+      minimumTop,
+      viewportRect.bottom - height - verticalInset,
+    );
     const above = anchorRect.top - height - gap;
     const below = anchorRect.bottom + gap;
     const preferredTop = above >= minimumTop ? above : below;
     return {
-      left: clamp(left, viewportRect.left, viewportRect.right - width),
+      left,
       top: clamp(preferredTop, minimumTop, maximumTop),
       width,
       maximumHeight,
@@ -440,7 +530,9 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     formatMessage,
     isSafeInlineCapsuleLayout,
     mergeSnapshot,
+    normalizeResetCredits,
     normalizeSnapshot,
+    presentResetCredits,
     presentWindows,
     selectLocale,
     summaryFor,

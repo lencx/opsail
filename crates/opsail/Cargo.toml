@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+libc.workspace = true
 miette.workspace = true
 opsail-read = { path = "../opsail-read", version = "0.1.0" }
 opsail-refit-codex = { path = "../opsail-refit-codex", version = "0.1.0" }

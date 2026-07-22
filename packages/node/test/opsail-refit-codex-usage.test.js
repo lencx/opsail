@@ -9,15 +9,10 @@ const assetRoot = new URL(
 );
 
 async function loadModel() {
-  const [source, en, zhCN] = await Promise.all([
+  const [source, localeBundle] = await Promise.all([
     fs.readFile(new URL("opsail-refit-codex-usage-model.js", assetRoot), "utf8"),
-    fs.readFile(new URL("locales/en.json", assetRoot), "utf8").then(JSON.parse),
-    fs.readFile(new URL("locales/zh-CN.json", assetRoot), "utf8").then(JSON.parse),
+    fs.readFile(new URL("locales.json", assetRoot), "utf8").then(JSON.parse),
   ]);
-  const localeBundle = {
-    defaultLocale: "en",
-    locales: { en, "zh-CN": zhCN },
-  };
   return vm.runInNewContext(
     `${source}\ncreateOpsailRefitCodexUsageModel(${JSON.stringify(localeBundle)});`,
     { Date, Intl, Promise, clearTimeout, setTimeout },
@@ -28,13 +23,12 @@ async function assembleRuntimeSource({
   sessionMode = "once",
   managerToken = "opsail-refit-codex:test",
 } = {}) {
-  const [model, domAdapter, runtime, css, en, zhCN] = await Promise.all([
+  const [model, domAdapter, runtime, css, localeBundle] = await Promise.all([
     fs.readFile(new URL("opsail-refit-codex-usage-model.js", assetRoot), "utf8"),
     fs.readFile(new URL("opsail-refit-codex-dom-adapter.js", assetRoot), "utf8"),
     fs.readFile(new URL("opsail-refit-codex-usage-runtime.js", assetRoot), "utf8"),
     fs.readFile(new URL("opsail-refit-codex-usage.css", assetRoot), "utf8"),
-    fs.readFile(new URL("locales/en.json", assetRoot), "utf8").then(JSON.parse),
-    fs.readFile(new URL("locales/zh-CN.json", assetRoot), "utf8").then(JSON.parse),
+    fs.readFile(new URL("locales.json", assetRoot), "utf8").then(JSON.parse),
   ]);
   const replacements = [
     ["__OPSAIL_REFIT_CODEX_MODEL_SOURCE__", model],
@@ -44,14 +38,37 @@ async function assembleRuntimeSource({
     ["__OPSAIL_REFIT_CODEX_SESSION_MODE_JSON__", JSON.stringify(sessionMode)],
     ["__OPSAIL_REFIT_CODEX_MANAGER_TOKEN_JSON__", JSON.stringify(managerToken)],
     ["__OPSAIL_REFIT_CODEX_CSS_JSON__", JSON.stringify(css)],
-    ["__OPSAIL_REFIT_CODEX_LOCALES_JSON__", JSON.stringify({
-      defaultLocale: "en",
-      locales: { en, "zh-CN": zhCN },
-    })],
+    ["__OPSAIL_REFIT_CODEX_LOCALES_JSON__", JSON.stringify(localeBundle)],
   ];
   const source = replacements.reduce(
     (value, [marker, replacement]) => value.split(marker).join(replacement),
     runtime,
+  );
+  return { replacements, source };
+}
+
+async function assembleControlSource(operation, {
+  currentPayload = "void 0",
+  revision = "test-revision",
+} = {}) {
+  const [control, domAdapter] = await Promise.all([
+    fs.readFile(new URL("opsail-refit-codex-renderer-control.js", assetRoot), "utf8"),
+    fs.readFile(new URL("opsail-refit-codex-dom-adapter.js", assetRoot), "utf8"),
+  ]);
+  const replacements = [
+    ["__OPSAIL_REFIT_CODEX_OPERATION_JSON__", JSON.stringify(operation)],
+    ["__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__",
+      operation === "probe" || operation === "early" ? domAdapter : ""],
+    ["__OPSAIL_REFIT_CODEX_EARLY_REVISION_JSON__",
+      operation === "early" ? JSON.stringify(revision) : "null"],
+    ["__OPSAIL_REFIT_CODEX_CURRENT_PAYLOAD__",
+      operation === "early" ? currentPayload : "void 0"],
+    ["__OPSAIL_REFIT_CODEX_STATUS_REVISION_JSON__",
+      operation === "status" ? JSON.stringify(revision) : "null"],
+  ];
+  const source = replacements.reduce(
+    (value, [marker, replacement]) => value.split(marker).join(replacement),
+    control,
   );
   return { replacements, source };
 }
@@ -92,6 +109,18 @@ function createRuntimeHarness({
   sidebarAvailable = true,
 } = {}) {
   const eventRegistry = { count: 0 };
+  let runtimeNow = Date.now();
+
+  class HarnessDate extends Date {
+    constructor(...arguments_) {
+      if (arguments_.length === 0) super(runtimeNow);
+      else super(...arguments_);
+    }
+
+    static now() {
+      return runtimeNow;
+    }
+  }
 
   class FakeEventTarget {
     constructor() {
@@ -392,7 +421,7 @@ function createRuntimeHarness({
     innerWidth: 1200,
   });
   const context = vm.createContext({
-    Date,
+    Date: HarnessDate,
     Intl,
     MutationObserver: FakeMutationObserver,
     Promise,
@@ -417,6 +446,7 @@ function createRuntimeHarness({
   };
 
   return {
+    advanceNow: (milliseconds) => { runtimeNow += milliseconds; },
     activeCounts: () => ({
       animationFrames: animationFrames.size,
       eventListeners: eventRegistry.count,
@@ -428,22 +458,25 @@ function createRuntimeHarness({
     context,
     document,
     nativeLayout: document.nativeLayout || null,
-    respondWithWeekly({ resetsAt } = {}) {
+    now: () => runtimeNow,
+    respondWithWeekly({ resetsAt, resetCredits } = {}) {
       const requestId = sent.at(-1)?.request?.id;
       assert.ok(requestId);
       const secondary = { usedPercent: 72, windowDurationMins: 10080 };
       if (Number.isFinite(resetsAt)) secondary.resetsAt = resetsAt;
+      const result = {
+        rateLimits: {
+          secondary,
+        },
+      };
+      if (resetCredits !== undefined) result.rateLimitResetCredits = resetCredits;
       window.dispatch("message", {
         data: {
           hostId: "local",
           type: "mcp-response",
           message: {
             id: requestId,
-            result: {
-              rateLimits: {
-                secondary,
-              },
-            },
+            result,
           },
         },
       });
@@ -539,7 +572,7 @@ test("partial notifications merge by field presence", async () => {
   );
 });
 
-test("reset time uses readable relative and local forms without losing the exact value", async () => {
+test("window reset uses one complete localized line without duplicate relative text", async () => {
   const model = await loadModel();
   const english = model.selectLocale("en-US");
   const chinese = model.selectLocale("zh-CN");
@@ -555,14 +588,10 @@ test("reset time uses readable relative and local forms without losing the exact
   const englishReset = model.presentWindows(snapshot, english, "en-US", now)[0].reset;
   const chineseReset = model.presentWindows(snapshot, chinese, "zh-CN", now)[0].reset;
   const resetDate = new Date(resetsAt * 1000);
-  const expectedDate = new Intl.DateTimeFormat("en-US", {
+  const expectedDisplay = new Intl.DateTimeFormat("en-US", {
+    weekday: "short",
     month: "short",
     day: "numeric",
-  }).format(resetDate);
-  const expectedWeekday = new Intl.DateTimeFormat("en-US", {
-    weekday: "short",
-  }).format(resetDate);
-  const expectedTime = new Intl.DateTimeFormat("en-US", {
     hour: "numeric",
     minute: "2-digit",
   }).format(resetDate);
@@ -570,22 +599,14 @@ test("reset time uses readable relative and local forms without losing the exact
     dateStyle: "full",
     timeStyle: "long",
   }).format(resetDate);
-  assert.equal(englishReset.relative, "6d 16h");
   assert.equal(
-    model.formatMessage(english.resetRelative, englishReset),
-    "Resets in 6d 16h",
+    model.formatMessage(english.windowReset, englishReset),
+    `Resets ${expectedDisplay}`,
   );
-  assert.equal(
-    model.formatMessage(english.resetAbsolute, englishReset),
-    `${expectedWeekday}, ${expectedDate} · ${expectedTime} (local time)`,
-  );
+  assert.equal(englishReset.display, expectedDisplay);
   assert.equal(englishReset.full, expectedFull);
-  assert.equal(chineseReset.relative, "6天16小时");
-  assert.equal(
-    model.formatMessage(chinese.resetRelative, chineseReset),
-    "6天16小时后重置",
-  );
-  assert.match(model.formatMessage(chinese.resetAbsolute, chineseReset), /本地时间/);
+  assert.match(model.formatMessage(chinese.windowReset, chineseReset), /^额度重置：/);
+  assert.doesNotMatch(model.formatMessage(chinese.windowReset, chineseReset), /本地时间/);
   assert.doesNotMatch(englishReset.full, /…|\.\.\./);
 
   const empty = model.normalizeSnapshot({ primary: null, secondary: { usedPercent: null } });
@@ -593,10 +614,85 @@ test("reset time uses readable relative and local forms without losing the exact
   assert.equal(model.summaryFor(model.presentWindows(empty, english), english), "");
 });
 
+test("available reset credits become a sorted localized expiry list only", async () => {
+  const model = await loadModel();
+  const english = model.selectLocale("en-US");
+  const chinese = model.selectLocale("zh-CN");
+  const now = new Date(2030, 6, 22, 0, 3, 4).getTime();
+  const first = new Date(2030, 7, 1, 12, 43, 44).getTime() / 1000;
+  const second = new Date(2030, 7, 12, 12, 3, 4).getTime() / 1000;
+  const normalized = model.normalizeResetCredits({
+    availableCount: 5,
+    credits: [
+      { id: "opaque-second", status: "available", expiresAt: second, title: "Full reset" },
+      { id: "redeemed", status: "redeemed", expiresAt: first },
+      { id: "missing-expiry", status: "available", expiresAt: null },
+      { id: "invalid-expiry", status: "available", expiresAt: Number.NaN },
+      { id: "expired", status: "available", expiresAt: now / 1000 - 1 },
+      { id: "opaque-first", status: "available", expiresAt: first },
+    ],
+  });
+  const englishItems = model.presentResetCredits(normalized, english, "en-US", now);
+  const chineseItems = model.presentResetCredits(normalized, chinese, "zh-CN", now);
+  const expectedDateTime = "2030-08-01 12:43:44";
+
+  assert.equal(englishItems.length, 2);
+  assert.equal(englishItems[0].expiresAt, first);
+  assert.equal(englishItems[1].expiresAt, second);
+  assert.equal(englishItems[0].dateTime, expectedDateTime);
+  assert.equal(
+    model.formatMessage(english.resetCreditExpires, englishItems[0]),
+    `Expires ${expectedDateTime}`,
+  );
+  assert.equal(
+    model.formatMessage(english.resetCreditCountdown, englishItems[0]),
+    "10d 12h remaining",
+  );
+  assert.equal(
+    model.formatMessage(chinese.resetCreditCountdown, chineseItems[0]),
+    "剩余 10 天 12 小时",
+  );
+  assert.match(model.formatMessage(chinese.resetCreditExpires, chineseItems[0]), /过期$/);
+  assert.ok(englishItems[0].nextUpdateMs > 0);
+  assert.ok(englishItems[0].nextUpdateMs <= 60 * 60 * 1000);
+  const nearExpiry = model.presentResetCredits(
+    [{ expiresAt: (now + 59 * 1000) / 1000 }],
+    english,
+    "en-US",
+    now,
+  )[0];
+  assert.equal(nearExpiry.countdown, "0m");
+  assert.equal(nearExpiry.nextUpdateMs, 59 * 1000);
+  const exactHour = model.presentResetCredits(
+    [{ expiresAt: (now + 60 * 60 * 1000) / 1000 }],
+    english,
+    "en-US",
+    now,
+  )[0];
+  assert.equal(exactHour.countdown, "1h");
+  assert.equal(exactHour.nextUpdateMs, 1000);
+  assert.doesNotMatch(JSON.stringify(englishItems), /opaque|Full reset|Use reset/);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(model.normalizeResetCredits(null))),
+    [],
+  );
+});
+
 test("locale JSON selects an exact locale, then language family, then English", async () => {
   const model = await loadModel();
-  assert.equal(model.selectLocale("zh-Hans-CN").locale, "zh-CN");
-  assert.equal(model.selectLocale("fr-FR").locale, "en");
+  const localeBundle = JSON.parse(
+    await fs.readFile(new URL("locales.json", assetRoot), "utf8"),
+  );
+  assert.equal(localeBundle.supportedLocales.length, 65);
+  assert.equal(new Set(localeBundle.supportedLocales).size, 65);
+  for (const locale of localeBundle.supportedLocales) {
+    assert.equal(model.selectLocale(locale).locale.toLowerCase(), locale.toLowerCase());
+  }
+  assert.equal(model.selectLocale("zh-Hans-CN").locale, "zh-Hans-CN");
+  assert.equal(model.selectLocale("fr-CA").usageTitle, "Limites d’utilisation");
+  assert.equal(model.selectLocale("ja-JP").usageTitle, "使用上限");
+  assert.equal(model.selectLocale("zh-TW").usageTitle, "使用額度");
+  assert.equal(model.selectLocale("unknown").locale, "en-US");
   const chinese = model.selectLocale("zh-CN");
   const weekly = model.normalizeSnapshot({
     secondary: { usedPercent: 72, windowDurationMins: 10080 },
@@ -664,7 +760,7 @@ test("notification calibration is debounced and waits for an active read", async
   coordinator.dispose();
 });
 
-test("tooltip placement clamps to sidebar and viewport and narrow gaps hide the capsule", async () => {
+test("tooltip stays in the sidebar when possible and overflows only while attached", async () => {
   const model = await loadModel();
   const placement = model.computeTooltipPlacement({
     anchor: { left: 132, top: 700, right: 152, bottom: 720, width: 20, height: 20 },
@@ -672,8 +768,9 @@ test("tooltip placement clamps to sidebar and viewport and narrow gaps hide the 
     viewport: { left: 0, top: 0, right: 900, bottom: 800, width: 900, height: 800 },
     tooltip: { width: 240, height: 180 },
   });
-  assert.ok(placement.left >= 8);
-  assert.ok(placement.left + placement.width <= 152);
+  assert.equal(placement.left, 16);
+  assert.ok(placement.left + placement.width > 160);
+  assert.ok(placement.left + placement.width <= 884);
   assert.ok(placement.top >= 8);
   assert.ok(placement.top + 180 <= 792);
   assert.equal(placement.maximumHeight, 784);
@@ -684,9 +781,37 @@ test("tooltip placement clamps to sidebar and viewport and narrow gaps hide the 
     viewport: { left: 0, top: 0, right: 900, bottom: 800, width: 900, height: 800 },
     tooltip: { width: 240, height: 600 },
   });
-  assert.equal(oversized.maximumHeight, 164);
-  assert.ok(oversized.top >= 48);
-  assert.ok(oversized.top + oversized.maximumHeight <= 212);
+  assert.equal(oversized.maximumHeight, 784);
+  assert.ok(oversized.top >= 8);
+  assert.ok(oversized.top + 600 <= 792);
+
+  const leftEdge = model.computeTooltipPlacement({
+    anchor: { left: -24, top: 300, right: 16, bottom: 320, width: 40, height: 20 },
+    sidebar: { left: 0, top: 0, right: 180, bottom: 800, width: 180, height: 800 },
+    viewport: { left: 0, top: 0, right: 900, bottom: 800, width: 900, height: 800 },
+    tooltip: { width: 240, height: 180 },
+  });
+  assert.equal(leftEdge.left, 16);
+
+  const wideSidebar = model.computeTooltipPlacement({
+    anchor: { left: 600, top: 300, right: 720, bottom: 320, width: 120, height: 20 },
+    sidebar: { left: 0, top: 0, right: 760, bottom: 800, width: 760, height: 800 },
+    viewport: { left: 0, top: 0, right: 900, bottom: 800, width: 900, height: 800 },
+    tooltip: { width: 240, height: 180 },
+  });
+  assert.equal(wideSidebar.left, 480);
+  assert.ok(wideSidebar.left <= 600);
+  assert.ok(wideSidebar.left + wideSidebar.width >= 720);
+  assert.ok(wideSidebar.left >= 16);
+  assert.ok(wideSidebar.left + wideSidebar.width <= 744);
+
+  const rightEdge = model.computeTooltipPlacement({
+    anchor: { left: 840, top: 300, right: 880, bottom: 320, width: 40, height: 20 },
+    sidebar: { left: 700, top: 0, right: 900, bottom: 800, width: 200, height: 800 },
+    viewport: { left: 0, top: 0, right: 900, bottom: 800, width: 900, height: 800 },
+    tooltip: { width: 240, height: 180 },
+  });
+  assert.equal(rightEdge.left, 644);
 
   assert.equal(model.canFitCapsule({
     leftBoundary: 72,
@@ -739,6 +864,8 @@ test("runtime and CSS enforce cleanup, quiet failure, theme colors, and complete
   assert.match(runtime, /observedSidebar === nextSidebar && observedRow === nextRow/);
   assert.match(runtime, /scheduler\.tooltipFrameKind === "timeout"/);
   assert.match(runtime, /createOpsailRefitCodexDomAdapter/);
+  assert.match(runtime, /rateLimitResetCredits/);
+  assert.doesNotMatch(runtime, /rateLimitResetCredit\/consume/);
   assert.doesNotMatch(runtime, /main\.main-surface|app-shell-left-panel/);
   assert.doesNotMatch(runtime, /\b(?:alert|confirm|prompt)\s*\(/);
   assert.doesNotMatch(runtime, /\bfetch\s*\(|new\s+WebSocket|location\.reload/);
@@ -761,6 +888,9 @@ test("runtime and CSS enforce cleanup, quiet failure, theme colors, and complete
   );
   assert.match(css, /white-space:\s*pre-line/);
   assert.match(css, /overflow-y:\s*auto/);
+  assert.match(css, /--opsail-refit-usage-details-width,\s*240px/);
+  assert.match(css, /\.opsail-refit-codex-reset-credits-table/);
+  assert.match(css, /\.opsail-refit-codex-reset-credits-row\s*\+\s*\.opsail-refit-codex-reset-credits-row/);
   assert.match(css, /prefers-reduced-motion/);
   assert.doesNotMatch(css, /(?:rgb|rgba|hsl|hsla)\s*\(/i);
   assert.doesNotMatch(css, /#[0-9a-f]{3,8}\b/i);
@@ -989,42 +1119,21 @@ test("DOM adapter prefers the footer action aligned with the account avatar", as
 
 test("the Rust-assembled renderer payload is valid JavaScript", async () => {
   const { replacements, source } = await assembleRuntimeSource();
-  const [domAdapter, probeTemplate, earlyTemplate, statusTemplate, disable] = await Promise.all([
-    fs.readFile(new URL("opsail-refit-codex-dom-adapter.js", assetRoot), "utf8"),
-    fs.readFile(new URL("opsail-refit-codex-renderer-probe.js", assetRoot), "utf8"),
-    fs.readFile(new URL("opsail-refit-codex-usage-early.js", assetRoot), "utf8"),
-    fs.readFile(new URL("opsail-refit-codex-usage-status.js", assetRoot), "utf8"),
-    fs.readFile(new URL("opsail-refit-codex-usage-disable.js", assetRoot), "utf8"),
+  const controls = await Promise.all([
+    assembleControlSource("probe"),
+    assembleControlSource("early", { currentPayload: source }),
+    assembleControlSource("status"),
+    assembleControlSource("disable"),
   ]);
-  const probe = probeTemplate
-    .split("__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__")
-    .join(domAdapter);
-  const early = earlyTemplate
-    .split("__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__")
-    .join(domAdapter)
-    .split("__OPSAIL_REFIT_CODEX_EARLY_REVISION_JSON__")
-    .join(JSON.stringify("test-revision"))
-    .split("__OPSAIL_REFIT_CODEX_CURRENT_PAYLOAD__")
-    .join(source);
-  const status = statusTemplate
-    .split("__OPSAIL_REFIT_CODEX_STATUS_REVISION_JSON__")
-    .join(JSON.stringify("test-revision"));
 
   for (const [marker] of replacements) assert.doesNotMatch(source, new RegExp(marker));
   assert.doesNotThrow(() => new vm.Script(source));
-  for (const marker of [
-    "__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__",
-    "__OPSAIL_REFIT_CODEX_EARLY_REVISION_JSON__",
-    "__OPSAIL_REFIT_CODEX_CURRENT_PAYLOAD__",
-  ]) {
-    assert.doesNotMatch(probe, new RegExp(marker));
-    assert.doesNotMatch(early, new RegExp(marker));
+  for (const control of controls) {
+    for (const [marker] of control.replacements) {
+      assert.doesNotMatch(control.source, new RegExp(marker));
+    }
+    assert.doesNotThrow(() => new vm.Script(control.source));
   }
-  assert.doesNotThrow(() => new vm.Script(probe));
-  assert.doesNotThrow(() => new vm.Script(early));
-  assert.doesNotMatch(status, /__OPSAIL_REFIT_CODEX_STATUS_REVISION_JSON__/);
-  assert.doesNotThrow(() => new vm.Script(status));
-  assert.doesNotThrow(() => new vm.Script(disable));
 });
 
 test("runtime mounts one inline capsule and keeps it stable across remeasurement", async () => {
@@ -1063,21 +1172,111 @@ test("runtime follows Codex language changes instead of the system language", as
   new vm.Script(source).runInContext(harness.context);
   harness.respondWithWeekly({
     resetsAt: Math.floor(Date.now() / 1000) + (6 * 24 + 16) * 60 * 60,
+    resetCredits: {
+      availableCount: 3,
+      credits: [
+        {
+          id: "later",
+          status: "available",
+          expiresAt: Date.UTC(2030, 7, 12, 12, 0, 0) / 1000,
+          title: "Full reset",
+        },
+        {
+          id: "redeemed",
+          status: "redeemed",
+          expiresAt: Date.UTC(2030, 7, 2, 12, 0, 0) / 1000,
+        },
+        {
+          id: "earlier",
+          status: "available",
+          expiresAt: Date.UTC(2030, 7, 1, 12, 0, 0) / 1000,
+        },
+      ],
+    },
   });
 
   const host = harness.document.getElementById("opsail-refit-codex-usage");
   const details = harness.document.getElementById("opsail-refit-codex-usage-details");
   const meta = details.children[1].children[1];
+  const resetCredits = details.children[3];
+  const resetCreditTitle = resetCredits.children[0];
+  const resetCreditTable = resetCredits.children[1];
+  const resetCreditBody = resetCreditTable.children[0];
+  assert.equal(details.parentElement, harness.document.body);
+  assert.equal(details.attributes.get("role"), "tooltip");
+  host.dispatch("pointerenter", {});
+  assert.equal(details.dataset.opsailRefitCodexOpen, "true");
+  assert.equal(details.attributes.get("aria-hidden"), "false");
   assert.equal(host.children[0].textContent, "weekly 28%");
-  assert.match(meta.textContent, /^72% used\nResets in 6d 16h\n.*\(local time\)$/);
+  assert.match(meta.textContent, /^72% used\nResets /);
+  assert.doesNotMatch(meta.textContent, /Resets in|local time/);
+  assert.equal(resetCredits.hidden, false);
+  assert.equal(resetCreditTitle.textContent, "Usage limit resets");
+  assert.equal(resetCreditTable.tagName, "TABLE");
+  assert.equal(resetCreditBody.tagName, "TBODY");
+  assert.equal(resetCreditBody.children.length, 2);
+  assert.equal(resetCreditBody.children[0].children.length, 2);
+  assert.match(
+    resetCreditBody.children[0].children[0].textContent,
+    /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
+  );
+  assert.match(resetCreditBody.children[0].children[1].textContent, /^\d+d \d+h$/);
+  assert.equal(harness.activeCounts().timeouts, 1);
+  assert.doesNotMatch(
+    resetCreditBody.children
+      .flatMap((item) => item.children.map((part) => part.textContent))
+      .join(" "),
+    /Full reset|Use reset|Expires|remaining/,
+  );
   harness.triggerLanguage("zh-CN");
   assert.equal(host.children[0].textContent, "周剩余 28%");
-  assert.match(meta.textContent, /^已用 72%\n6天16小时后重置\n.*（本地时间）$/);
+  assert.match(meta.textContent, /^已用 72%\n额度重置： /);
+  assert.doesNotMatch(meta.textContent, /本地时间/);
   assert.match(meta.attributes.get("aria-label"), /^已用 72%。.*重置$/);
+  assert.equal(resetCreditTitle.textContent, "可用重置");
+  assert.match(
+    resetCreditBody.children[0].children[0].textContent,
+    /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/,
+  );
+  assert.match(resetCreditBody.children[0].children[1].textContent, /^\d+ 天/);
   assert.equal(
     details.attributes.get("aria-label"),
     "使用额度",
   );
+  harness.window.__OPSAIL_REFIT_CODEX_STATE__.cleanup();
+  assert.equal(harness.activeCounts().timeouts, 0);
+});
+
+test("opening usage details recalibrates reset countdowns from the current time", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+  harness.respondWithWeekly({
+    resetCredits: {
+      credits: [{
+        status: "available",
+        expiresAt: (harness.now() + (2 * 60 + 45) * 60 * 1000) / 1000,
+      }],
+    },
+  });
+
+  const host = harness.document.getElementById("opsail-refit-codex-usage");
+  const details = harness.document.getElementById("opsail-refit-codex-usage-details");
+  const countdownText = () => (
+    details.children[3].children[1].children[0].children[0].children[1].textContent
+  );
+  assert.equal(countdownText(), "2h");
+  const beforeHover = new vm.Script("Date.now()").runInContext(harness.context);
+  harness.advanceNow(60 * 60 * 1000);
+  assert.equal(
+    new vm.Script("Date.now()").runInContext(harness.context),
+    beforeHover + 60 * 60 * 1000,
+  );
+  assert.equal(countdownText(), "2h");
+
+  host.dispatch("pointerenter", {});
+  assert.equal(details.dataset.opsailRefitCodexOpen, "true");
+  assert.equal(countdownText(), "1h");
 });
 
 test("repeated renderer installation stays singular and cleanup releases every resource", async () => {
@@ -1133,6 +1332,35 @@ test("repeated renderer installation stays singular and cleanup releases every r
     harness.document.querySelectorAll("#opsail-refit-codex-usage-details").length,
     0,
   );
+  assert.deepEqual(harness.activeCounts(), {
+    animationFrames: 0,
+    eventListeners: 0,
+    intervals: 0,
+    mutationObservers: 0,
+    resizeObservers: 0,
+    timeouts: 0,
+  });
+});
+
+test("shared renderer control routes status and disable without leaking resources", async () => {
+  const [{ source: runtime }, { source: status }, { source: disable }] = await Promise.all([
+    assembleRuntimeSource(),
+    assembleControlSource("status"),
+    assembleControlSource("disable"),
+  ]);
+  const harness = createRuntimeHarness();
+  new vm.Script(runtime).runInContext(harness.context);
+  harness.respondWithWeekly();
+
+  const statusResult = new vm.Script(status).runInContext(harness.context);
+  assert.equal(statusResult.installed, true);
+  assert.equal(statusResult.hostCount, 1);
+  assert.equal(statusResult.styleCount, 1);
+  assert.equal(statusResult.detailsCount, 1);
+
+  const disableResult = new vm.Script(disable).runInContext(harness.context);
+  assert.equal(disableResult.clean, true);
+  assert.equal(harness.window.__OPSAIL_REFIT_CODEX_STATE__, undefined);
   assert.deepEqual(harness.activeCounts(), {
     animationFrames: 0,
     eventListeners: 0,
