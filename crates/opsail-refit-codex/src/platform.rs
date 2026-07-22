@@ -7,35 +7,79 @@ use crate::error::{CodexRefitError, CodexRefitErrorCode};
 #[derive(Debug, Clone)]
 pub(crate) struct ValidatedAppIdentity {
     executable: PathBuf,
+    #[cfg(target_os = "macos")]
     user_id: u32,
+    #[cfg(target_os = "windows")]
+    package_full_name: String,
+    #[cfg(target_os = "windows")]
+    package_family_name: String,
+    #[cfg(target_os = "windows")]
+    app_user_model_id: String,
+    #[cfg(target_os = "windows")]
+    user_sid: String,
 }
 
 #[cfg(test)]
 impl ValidatedAppIdentity {
+    #[cfg(target_os = "macos")]
     pub(crate) fn for_test() -> Self {
         Self {
             executable: PathBuf::from("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
             user_id: 501,
         }
     }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            executable: PathBuf::from(
+                r"C:\Program Files\WindowsApps\OpenAI.Codex_test\app\ChatGPT.exe",
+            ),
+            package_full_name: "OpenAI.Codex_test_x64__2p2nqsd0c76g0".to_owned(),
+            package_family_name: "OpenAI.Codex_2p2nqsd0c76g0".to_owned(),
+            app_user_model_id: "OpenAI.Codex_2p2nqsd0c76g0!App".to_owned(),
+            user_sid: "S-1-5-21-test".to_owned(),
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    pub(crate) fn for_test() -> Self {
+        Self {
+            executable: PathBuf::from("/Applications/ChatGPT.app/Contents/MacOS/ChatGPT"),
+        }
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RuntimeIdentity {
     pub listener_pids: Vec<u32>,
+    #[cfg(target_os = "windows")]
+    listener_processes: Vec<windows_native::ProcessIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LaunchedProcessIdentity {
+    pid: u32,
+    #[cfg(target_os = "windows")]
+    created_at: u64,
 }
 
 #[derive(Debug)]
 pub(crate) struct LaunchedProcess {
-    pid: u32,
+    identity: LaunchedProcessIdentity,
     exit: watch::Receiver<bool>,
     #[cfg(test)]
     _test_guard: Option<watch::Sender<bool>>,
 }
 
 impl LaunchedProcess {
+    pub(crate) fn identity(&self) -> LaunchedProcessIdentity {
+        self.identity
+    }
+
+    #[cfg(test)]
     pub(crate) fn pid(&self) -> u32 {
-        self.pid
+        self.identity.pid
     }
 
     pub(crate) fn exit_receiver(&self) -> watch::Receiver<bool> {
@@ -46,7 +90,11 @@ impl LaunchedProcess {
     pub(crate) fn untracked(pid: u32) -> Self {
         let (guard, exit) = watch::channel(false);
         Self {
-            pid,
+            identity: LaunchedProcessIdentity {
+                pid,
+                #[cfg(target_os = "windows")]
+                created_at: 1,
+            },
             exit,
             _test_guard: Some(guard),
         }
@@ -274,7 +322,7 @@ mod imp {
             let _ = exit_tx.send(true);
         });
         Ok(LaunchedProcess {
-            pid,
+            identity: LaunchedProcessIdentity { pid },
             exit,
             #[cfg(test)]
             _test_guard: None,
@@ -296,8 +344,9 @@ mod imp {
     pub(super) fn validate_launched_runtime(
         identity: &RuntimeIdentity,
         app: &ValidatedAppIdentity,
-        launched_pid: u32,
+        launched: LaunchedProcessIdentity,
     ) -> Result<(), CodexRefitError> {
+        let launched_pid = launched.pid;
         if process_number(launched_pid, "uid")? != app.user_id
             || process_executable(launched_pid)
                 .and_then(|path| fs::canonicalize(path).ok())
@@ -321,7 +370,14 @@ mod imp {
         }
     }
 
-    pub(super) fn stop_managed_process(pid: u32) -> Result<(), CodexRefitError> {
+    pub(super) fn current_process_instance_id() -> Result<Option<u64>, CodexRefitError> {
+        Ok(None)
+    }
+
+    pub(super) fn stop_managed_process(
+        pid: u32,
+        _created_at: Option<u64>,
+    ) -> Result<(), CodexRefitError> {
         if pid <= 1 || pid == std::process::id() {
             return Err(cleanup_error(
                 "refusing to signal an invalid manager process",
@@ -580,7 +636,19 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+#[allow(
+    unsafe_code,
+    reason = "all Win32 pointer and handle operations are isolated in this audited module"
+)]
+#[path = "platform/windows_native.rs"]
+mod windows_native;
+
+#[cfg(target_os = "windows")]
+#[path = "platform/windows.rs"]
+mod imp;
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 mod imp {
     use super::*;
 
@@ -617,19 +685,26 @@ mod imp {
     pub(super) fn validate_launched_runtime(
         _identity: &RuntimeIdentity,
         _app: &ValidatedAppIdentity,
-        _launched_pid: u32,
+        _launched: LaunchedProcessIdentity,
     ) -> Result<(), CodexRefitError> {
         Err(unsupported())
     }
 
-    pub(super) fn stop_managed_process(_pid: u32) -> Result<(), CodexRefitError> {
+    pub(super) fn current_process_instance_id() -> Result<Option<u64>, CodexRefitError> {
+        Ok(None)
+    }
+
+    pub(super) fn stop_managed_process(
+        _pid: u32,
+        _created_at: Option<u64>,
+    ) -> Result<(), CodexRefitError> {
         Err(unsupported())
     }
 
     fn unsupported() -> CodexRefitError {
         platform_error(
             CodexRefitErrorCode::Unsupported,
-            "the Codex refit adapter currently supports only the verified macOS ChatGPT app",
+            "the Codex refit adapter currently supports only the verified macOS and Windows ChatGPT apps",
         )
     }
 }
@@ -639,7 +714,17 @@ pub(crate) fn default_state_dir() -> Result<PathBuf, CodexRefitError> {
 }
 
 pub(crate) const fn is_supported() -> bool {
-    cfg!(target_os = "macos")
+    cfg!(any(target_os = "macos", target_os = "windows"))
+}
+
+pub(crate) const fn supported_platform_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macOS"
+    } else if cfg!(target_os = "windows") {
+        "Windows"
+    } else {
+        "unsupported"
+    }
 }
 
 pub(crate) fn validate_app() -> Result<ValidatedAppIdentity, CodexRefitError> {
@@ -667,13 +752,34 @@ pub(crate) fn launch_app(
 pub(crate) fn validate_launched_runtime(
     identity: &RuntimeIdentity,
     app: &ValidatedAppIdentity,
-    launched_pid: u32,
+    launched: LaunchedProcessIdentity,
 ) -> Result<(), CodexRefitError> {
-    imp::validate_launched_runtime(identity, app, launched_pid)
+    imp::validate_launched_runtime(identity, app, launched)
 }
 
-pub(crate) fn stop_managed_process(pid: u32) -> Result<(), CodexRefitError> {
-    imp::stop_managed_process(pid)
+pub(crate) fn current_process_instance_id() -> Result<Option<u64>, CodexRefitError> {
+    imp::current_process_instance_id()
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn protect_private_directory(
+    path: &std::path::Path,
+) -> Result<(), windows_native::WindowsPlatformError> {
+    windows_native::protect_current_user_path(path, windows_native::PrivatePathKind::Directory)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn protect_private_file(
+    path: &std::path::Path,
+) -> Result<(), windows_native::WindowsPlatformError> {
+    windows_native::protect_current_user_path(path, windows_native::PrivatePathKind::File)
+}
+
+pub(crate) fn stop_managed_process(
+    pid: u32,
+    created_at: Option<u64>,
+) -> Result<(), CodexRefitError> {
+    imp::stop_managed_process(pid, created_at)
 }
 
 pub(crate) fn loopback_port_available(port: u16) -> Result<bool, CodexRefitError> {
@@ -706,7 +812,7 @@ pub(crate) fn revalidate_runtime(
     previous: &RuntimeIdentity,
 ) -> Result<(), CodexRefitError> {
     let current = validate_runtime(port, app)?;
-    if current.listener_pids != previous.listener_pids {
+    if current != *previous {
         return Err(platform_error(
             CodexRefitErrorCode::TargetValidationFailed,
             "the debug listener identity changed during renderer validation",

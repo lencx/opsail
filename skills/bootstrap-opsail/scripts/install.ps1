@@ -140,11 +140,12 @@ $UpdatePathWasBound = $PSBoundParameters.ContainsKey("UpdatePath")
         $env:PROCESSOR_ARCHITECTURE
     }
 
-    if ($architecture -ne "AMD64") {
-        throw "opsail installer: unsupported Windows architecture: $architecture"
+    $target = switch ($architecture.ToUpperInvariant()) {
+        "AMD64" { "x86_64-pc-windows-msvc"; break }
+        "ARM64" { "aarch64-pc-windows-msvc"; break }
+        default { throw "opsail installer: unsupported Windows architecture: $architecture" }
     }
 
-    $target = "x86_64-pc-windows-msvc"
     $asset = "opsail-$target.zip"
 
     if ($Version -eq "latest") {

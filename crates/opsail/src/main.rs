@@ -54,7 +54,7 @@ struct RefitArgs {
 
 #[derive(Debug, Subcommand)]
 enum RefitTarget {
-    /// Manage the verified Codex renderer in the macOS ChatGPT app.
+    /// Manage the verified Codex renderer in the macOS or Windows ChatGPT app.
     Codex(codex::CodexRefitArgs),
 }
 

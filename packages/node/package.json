@@ -1,6 +1,6 @@
 {
   "name": "opsail",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Native tools that agents can rely on",
   "type": "module",
   "exports": {
@@ -32,11 +32,12 @@
     "release:matrix": "node scripts/print-release-matrix.js"
   },
   "optionalDependencies": {
-    "@opsail/darwin-arm64": "0.1.0",
-    "@opsail/darwin-x64": "0.1.0",
-    "@opsail/linux-arm64": "0.1.0",
-    "@opsail/linux-x64": "0.1.0",
-    "@opsail/win32-x64": "0.1.0"
+    "@opsail/darwin-arm64": "0.2.0",
+    "@opsail/darwin-x64": "0.2.0",
+    "@opsail/linux-arm64": "0.2.0",
+    "@opsail/linux-x64": "0.2.0",
+    "@opsail/win32-arm64": "0.2.0",
+    "@opsail/win32-x64": "0.2.0"
   },
   "repository": {
     "type": "git",

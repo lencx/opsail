@@ -1,10 +1,11 @@
 //! Safe Codex renderer refits for Opsail.
 //!
 //! The adapter is intentionally narrow: it connects only to a `127.0.0.1` CDP
-//! endpoint owned by the signed macOS ChatGPT process tree. Enable is
+//! endpoint owned by a platform-validated ChatGPT application identity. Enable is
 //! attach-only unless the caller explicitly selects [`LaunchPolicy::LaunchIfStopped`].
 //! Opsail never quits, restarts, modifies, or signs the application.
 
+mod atomic_file;
 mod cdp;
 mod error;
 mod github_update;
@@ -40,7 +41,7 @@ pub use model::{
 #[cfg(test)]
 use payload::usage_payload;
 use payload::{UsagePayload, build_usage_payload};
-use platform::{LaunchedProcess, ValidatedAppIdentity};
+use platform::{LaunchedProcess, LaunchedProcessIdentity, ValidatedAppIdentity};
 use renderer_assets::{RendererAssetInstallPolicy, RendererAssetStore, embedded_bundle};
 use renderer_session::{CodexSession, close_sessions, probe_renderer, renderer_status};
 #[cfg(test)]
@@ -55,6 +56,9 @@ use supervisor::{PersistentSupervisor, new_manager_token};
 use supervisor::{ReconnectBackoff, RecoveryDecision, wait_for_reconnect_or_app_exit};
 
 pub const DEFAULT_CODEX_DEBUG_PORT: u16 = 55321;
+#[cfg(target_os = "windows")]
+const APP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(45);
+#[cfg(not(target_os = "windows"))]
 const APP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -429,7 +433,8 @@ impl CodexRefit {
             checks.push(DoctorCheck {
                 name: "platform",
                 state: DoctorCheckState::Fail,
-                message: "only the verified macOS ChatGPT target is currently supported".to_owned(),
+                message: "the verified ChatGPT target is currently supported on macOS and Windows"
+                    .to_owned(),
             });
             return CodexDoctorReport {
                 supported: false,
@@ -444,7 +449,7 @@ impl CodexRefit {
         checks.push(DoctorCheck {
             name: "platform",
             state: DoctorCheckState::Pass,
-            message: "macOS is supported".to_owned(),
+            message: format!("{} is supported", platform::supported_platform_name()),
         });
 
         self.progress.report(CodexRefitStage::ValidateApplication);
@@ -482,12 +487,12 @@ impl CodexRefit {
             match run_blocking(move || platform::validate_runtime(port, &runtime_app)).await {
                 Ok(identity) => {
                     checks.push(DoctorCheck {
-                        name: "listener",
-                        state: DoctorCheckState::Pass,
-                        message:
-                            "the loopback debug listener belongs to the signed ChatGPT process tree"
-                                .to_owned(),
-                    });
+                    name: "listener",
+                    state: DoctorCheckState::Pass,
+                    message:
+                        "the loopback debug listener belongs to the validated ChatGPT application"
+                            .to_owned(),
+                });
                     identity
                 }
                 Err(error) => {
@@ -631,18 +636,18 @@ impl CodexRefit {
     async fn connect_sessions(
         &self,
         manager_token: &str,
-        launched_pid: Option<u32>,
+        launched_process: Option<LaunchedProcessIdentity>,
     ) -> Result<Vec<CodexSession>, CodexRefitError> {
         self.progress.report(CodexRefitStage::ValidateApplication);
         let app = run_blocking(platform::validate_app).await?;
-        self.connect_sessions_validated(manager_token, launched_pid, &app)
+        self.connect_sessions_validated(manager_token, launched_process, &app)
             .await
     }
 
     async fn connect_sessions_validated(
         &self,
         manager_token: &str,
-        launched_pid: Option<u32>,
+        launched_process: Option<LaunchedProcessIdentity>,
         app: &ValidatedAppIdentity,
     ) -> Result<Vec<CodexSession>, CodexRefitError> {
         self.progress.report(CodexRefitStage::ValidateListener);
@@ -675,7 +680,7 @@ impl CodexRefit {
                 )),
                 Err(error) => {
                     bridge_missing |= error.code() == CodexRefitErrorCode::BridgeUnavailable;
-                    let error = if launched_pid.is_some()
+                    let error = if launched_process.is_some()
                         && error.code() == CodexRefitErrorCode::TargetValidationFailed
                     {
                         CodexRefitError::new(
@@ -720,11 +725,11 @@ impl CodexRefit {
             close_sessions(&mut sessions).await;
             return Err(error);
         }
-        if let Some(launched_pid) = launched_pid
+        if let Some(launched_process) = launched_process
             && let Err(error) = {
                 let launched_app = app.clone();
                 run_blocking(move || {
-                    platform::validate_launched_runtime(&identity, &launched_app, launched_pid)
+                    platform::validate_launched_runtime(&identity, &launched_app, launched_process)
                 })
                 .await
             }
@@ -739,11 +744,11 @@ impl CodexRefit {
         &self,
         mode: SessionMode,
         manager_token: &str,
-        launched_pid: Option<u32>,
+        launched_process: Option<LaunchedProcessIdentity>,
         app: &ValidatedAppIdentity,
     ) -> Result<(Vec<CodexSession>, CodexRefitReport), CodexRefitError> {
         let mut sessions = self
-            .connect_sessions_validated(manager_token, launched_pid, app)
+            .connect_sessions_validated(manager_token, launched_process, app)
             .await?;
         if let Err(error) = self.prune_absent_sessions(&sessions) {
             close_sessions(&mut sessions).await;
@@ -752,7 +757,7 @@ impl CodexRefit {
         self.progress.report(CodexRefitStage::InspectUsage);
         match lifecycle::enable(&mut sessions, mode, &self.progress).await {
             Ok(report) => {
-                if launched_pid.is_some()
+                if launched_process.is_some()
                     && let Some(session) = sessions.first_mut()
                 {
                     match session.show_launch_notice().await {
@@ -824,7 +829,7 @@ impl CodexRefit {
             launch::launch_validated(backend.as_ref(), port, &launch_app, &launch_progress)
         })
         .await?;
-        let launched_pid = launched_process.pid();
+        let launched_identity = launched_process.identity();
         self.progress.report(CodexRefitStage::WaitForEndpoint);
         let (sessions, mut report) = launch::wait_for_endpoint_or_process_exit(
             self.port,
@@ -832,7 +837,12 @@ impl CodexRefit {
             launched_process.exit_receiver(),
             || async {
                 let result = self
-                    .connect_and_enable_validated(mode, manager_token, Some(launched_pid), &app)
+                    .connect_and_enable_validated(
+                        mode,
+                        manager_token,
+                        Some(launched_identity),
+                        &app,
+                    )
                     .await;
                 if result.is_err() {
                     self.progress.report(CodexRefitStage::WaitForEndpoint);
@@ -931,13 +941,17 @@ impl CodexRefit {
     }
 
     async fn stop_managed_session(&self) -> Result<(), CodexRefitError> {
-        let pid = self.state.managed_process_id(self.port)?.ok_or_else(|| {
-            CodexRefitError::new(
-                CodexRefitErrorCode::CleanupFailed,
-                "the active persistent manager has no validated owner marker",
-            )
-        })?;
-        run_blocking(move || platform::stop_managed_process(pid)).await?;
+        let identity = self
+            .state
+            .managed_process_identity(self.port)?
+            .ok_or_else(|| {
+                CodexRefitError::new(
+                    CodexRefitErrorCode::CleanupFailed,
+                    "the active persistent manager has no validated owner marker",
+                )
+            })?;
+        run_blocking(move || platform::stop_managed_process(identity.pid, identity.created_at))
+            .await?;
         let deadline = tokio::time::Instant::now() + MANAGER_STOP_TIMEOUT;
         while self.state.managed_session_active()? {
             if tokio::time::Instant::now() >= deadline {
@@ -1229,6 +1243,7 @@ mod tests {
                 session_mode: SessionMode::Persistent,
                 manager_token: "opsail-refit-codex:offline".to_owned(),
                 manager_pid: 4242,
+                manager_created_at: None,
             })
             .unwrap();
 
@@ -1741,6 +1756,7 @@ mod tests {
                 session_mode: SessionMode::Persistent,
                 manager_token: persistent_token.to_owned(),
                 manager_pid: std::process::id(),
+                manager_created_at: None,
             })
             .unwrap();
         let managed_lock = state.try_managed_session_lock().unwrap().unwrap();
@@ -1799,7 +1815,7 @@ mod tests {
         assert!(GUIDE.contains("application restart"));
         assert!(GUIDE.contains("`persistent` (managed)"));
         assert!(GUIDE.contains("`once` (ephemeral)"));
-        assert!(GUIDE.contains("detached manager"));
+        assert!(GUIDE.contains("background manager"));
         assert!(GUIDE.contains("ChatGPT has exited"));
         assert!(GUIDE.contains("there is no timer or process polling while the socket is healthy"));
         assert!(GUIDE.contains("--foreground"));

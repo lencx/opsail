@@ -20,6 +20,10 @@ use crate::{with_trailing_newline, write_stdout};
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BACKGROUND_START_MESSAGE_BYTES: usize = 256 * 1024;
 const BACKGROUND_STAGE_STABILITY_DELAY: Duration = Duration::from_millis(120);
+#[cfg(windows)]
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 #[derive(Debug, Default)]
 struct PendingBackgroundStage {
@@ -337,6 +341,8 @@ fn background_command(enable: &CodexEnableArgs) -> Result<tokio::process::Comman
         .stderr(Stdio::null());
     #[cfg(unix)]
     command.process_group(0);
+    #[cfg(windows)]
+    command.creation_flags(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
     Ok(command)
 }
 

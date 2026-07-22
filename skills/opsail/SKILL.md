@@ -2,13 +2,13 @@
 name: opsail
 description: Use the Opsail native CLI for reliable agent capabilities, including readable-content extraction and the target-validated Codex sidebar usage refit.
 license: Apache-2.0
-compatibility: Requires Opsail 0.1.0 and terminal execution.
-metadata: {"author":"Opsail contributors","version":"0.1.0","homepage":"https://github.com/lencx/opsail","openclaw":{"emoji":"⛵","homepage":"https://github.com/lencx/opsail","requires":{"bins":["opsail"]},"install":[{"id":"node","kind":"node","package":"opsail@0.1.0","bins":["opsail"],"label":"Install Opsail (npm)"}]},"hermes":{"tags":["opsail","native-tools","content-extraction","markdown","agents"]}}
+compatibility: Requires Opsail 0.2.0 and terminal execution.
+metadata: {"author":"Opsail contributors","version":"0.2.0","homepage":"https://github.com/lencx/opsail","openclaw":{"emoji":"⛵","homepage":"https://github.com/lencx/opsail","requires":{"bins":["opsail"]},"install":[{"id":"node","kind":"node","package":"opsail@0.2.0","bins":["opsail"],"label":"Install Opsail (npm)"}]},"hermes":{"tags":["opsail","native-tools","content-extraction","markdown","agents"]}}
 ---
 
 # Opsail
 
-Use the `opsail` native CLI for capabilities exposed through its unified command entry point. `read` extracts readable content from static HTML or a DOM rendered by an isolated or caller-managed Chrome. `refit codex` manages a reversible, target-validated usage display in the Codex sidebar. If the binary is missing or not version `0.1.0`, ask the user to provide and authorize `https://raw.githubusercontent.com/lencx/opsail/refs/heads/main/skills/bootstrap-opsail/SKILL.md`; do not install it implicitly from this Skill.
+Use the `opsail` native CLI for capabilities exposed through its unified command entry point. `read` extracts readable content from static HTML or a DOM rendered by an isolated or caller-managed Chrome. `refit codex` manages a reversible, target-validated usage display in the Codex sidebar. If the binary is missing or not version `0.2.0`, ask the user to provide and authorize `https://raw.githubusercontent.com/lencx/opsail/refs/heads/main/skills/bootstrap-opsail/SKILL.md`; do not install it implicitly from this Skill.
 
 ## Read: choose the source
 
@@ -114,7 +114,7 @@ Use `--output PATH` only when the user wants a file. Successful data goes to std
 
 ## Codex refit: show local usage windows
 
-Use this feature only when the user explicitly asks to manage the Codex usage display. It currently supports only the signed macOS application at `/Applications/ChatGPT.app` and only a CDP endpoint bound to `127.0.0.1`. Normal enable is attach-only. Use the explicit `--launch` policy only when the user also asks Opsail to start a stopped application; never quit, kill, restart, reload, modify, or re-sign ChatGPT.
+Use this feature only when the user explicitly asks to manage the Codex usage display. It supports the signed macOS application at `/Applications/ChatGPT.app` and the current user's validated `OpenAI.Codex` Microsoft Store package on the Windows x64 and ARM64 release targets; Linux is unsupported, and no 32-bit Windows artifact is provided. Windows requires the exact PFN `OpenAI.Codex_2p2nqsd0c76g0` and AUMID `OpenAI.Codex_2p2nqsd0c76g0!App`, and derives the executable from the installed signed manifest (currently `app\ChatGPT.exe`) instead of scanning versioned package paths. Its Local AppData state uses a protected DACL for only the current user and SYSTEM. Native x64 and ARM64 CI and npm packaging targets are configured. An installed Store application canary has verified package activation, listener ownership, renderer discovery, bridge injection, persistence, and cleanup on Windows 11 ARM64; a real installed-application x64 canary remains pending. Only use a CDP endpoint bound to `127.0.0.1`. Normal enable is attach-only. Use the explicit `--launch` policy only when the user also asks Opsail to start a stopped application; never quit, kill, restart, reload, modify, or re-sign ChatGPT.
 
 Run the read-only checks first:
 
@@ -122,13 +122,13 @@ Run the read-only checks first:
 opsail refit codex doctor
 ```
 
-`doctor` never launches the application. When an endpoint is already `ready`, enable the remaining-usage capsule idempotently in attach-only mode. Persistent (managed) mode is the default: it starts a detached manager with only the validated renderer WebSocket, prints its initial health report, and returns while retaining renderer-reload recovery:
+`doctor` never launches the application. When an endpoint is already `ready`, enable the remaining-usage capsule idempotently in attach-only mode. Persistent (managed) mode is the default: it starts a background manager with only the validated renderer WebSocket, prints its initial health report, and returns while retaining renderer-reload recovery:
 
 ```sh
 opsail refit codex enable usage
 ```
 
-When the user explicitly wants Opsail to start ChatGPT and it is currently stopped, use the formal launch entry point. It validates the bundle and signature, checks the port, spawns at most once, and then validates the launched process tree and renderer. If the application is already running without CDP, report `restart-required`; never quit or restart it automatically:
+When the user explicitly wants Opsail to start ChatGPT and it is currently stopped, use the formal launch entry point. It validates the macOS bundle and signature or the Windows Store package identity, checks the port, starts at most once through the platform launch mechanism, and then validates the launched process and renderer. If the application is already running without CDP, report `restart-required`; never quit or restart it automatically:
 
 ```sh
 opsail refit codex enable usage --launch

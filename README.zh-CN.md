@@ -39,6 +39,8 @@ opsail read https://example.com/app --launch
 
 `opsail refit codex` 提供可逆且经过目标校验的 Codex 适配器。它的首个功能通过 renderer 已有的本地 bridge，在 Codex 左侧栏显示本地化的剩余额度信息，不调用模型，也不修改应用包。
 
+Refit 目标已实现对签名 macOS 应用和 Windows 当前用户 Microsoft Store 应用的支持；Linux 不支持。Windows 发布目标为 x64 和 ARM64，不提供 32 位 x86/ia32 产物。Windows 实现使用精确的包家族名和 AUMID 定位应用，从已安装的签名 manifest 中解析可执行文件（当前为 `app\ChatGPT.exe`），并使用仅授权当前用户和 SYSTEM 的显式 DACL 保护 Local AppData 状态。Windows x64 和 ARM64 都已配置原生 CI 与 npm 打包目标；已在 Windows 11 ARM64 的 Store 应用上完成包激活、端口归属、renderer 发现、bridge 注入、持久模式与清理的端到端验证，真实 x64 Store 应用 canary 仍待完成，托管 CI 覆盖未安装目标包的路径。
+
 ```sh
 opsail refit codex enable usage --launch
 ```

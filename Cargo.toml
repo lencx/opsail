@@ -43,6 +43,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 unicode-segmentation = "1.13.3"
 url = { version = "2.5.8", features = ["serde"] }
 wiremock = "0.6.5"
+windows = "0.62.2"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

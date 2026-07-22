@@ -119,8 +119,13 @@ where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, CodexRefitError>>,
 {
+    // The real renderer connection future is intentionally large. Keep it off
+    // the caller's stack so debug Windows builds do not exhaust the platform's
+    // smaller default main-thread stack while `select!` also holds the process
+    // exit future.
+    let endpoint = Box::pin(wait_for_endpoint(port, timeout, connect));
     tokio::select! {
-        result = wait_for_endpoint(port, timeout, connect) => result,
+        result = endpoint => result,
         () = wait_for_process_exit(&mut process_exit) => Err(CodexRefitError::new(
             CodexRefitErrorCode::LaunchFailed,
             "the launched ChatGPT process exited before its validated CDP endpoint was ready",

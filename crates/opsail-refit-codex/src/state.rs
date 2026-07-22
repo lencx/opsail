@@ -1,10 +1,14 @@
 use std::fs::{self, OpenOptions, TryLockError};
-use std::io::{ErrorKind, Write as _};
+use std::io;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
+use crate::atomic_file::{
+    AtomicWriteError, ensure_no_windows_reparse_points, is_symlink_or_windows_reparse_point,
+    write_private_atomically,
+};
 use crate::error::{CodexRefitError, CodexRefitErrorCode};
 use crate::model::SessionMode;
 
@@ -42,6 +46,14 @@ pub(crate) struct TargetRecord {
     pub session_mode: SessionMode,
     pub manager_token: String,
     pub manager_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manager_created_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ManagedProcessIdentity {
+    pub pid: u32,
+    pub created_at: Option<u64>,
 }
 
 impl StateStore {
@@ -76,7 +88,10 @@ impl StateStore {
             .find(|record| record.revision == revision))
     }
 
-    pub fn managed_process_id(&self, port: u16) -> Result<Option<u32>, CodexRefitError> {
+    pub fn managed_process_identity(
+        &self,
+        port: u16,
+    ) -> Result<Option<ManagedProcessIdentity>, CodexRefitError> {
         let records = self
             .read()?
             .records
@@ -86,15 +101,18 @@ impl StateStore {
         let Some(first) = records.first() else {
             return Ok(None);
         };
-        if records
-            .iter()
-            .any(|record| record.manager_pid != first.manager_pid)
-        {
+        if records.iter().any(|record| {
+            record.manager_pid != first.manager_pid
+                || record.manager_created_at != first.manager_created_at
+        }) {
             return Err(state_error(
                 "managed target markers disagree about their owner process",
             ));
         }
-        Ok(Some(first.manager_pid))
+        Ok(Some(ManagedProcessIdentity {
+            pid: first.manager_pid,
+            created_at: first.manager_created_at,
+        }))
     }
 
     pub fn try_operation_lock(&self) -> Result<StateOperationLock, CodexRefitError> {
@@ -104,21 +122,22 @@ impl StateStore {
             .ok_or_else(|| state_error("refit state path has no parent directory"))?;
         prepare_directory(parent)?;
         let lock_path = parent.join("operation.lock");
+        ensure_no_windows_reparse_points(&lock_path)
+            .map_err(|_| state_error("could not verify the refit operation lock path"))?;
         match fs::symlink_metadata(&lock_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Ok(metadata)
+                if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_file() =>
+            {
                 return Err(state_error("refit operation lock is not a regular file"));
             }
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(_) => return Err(state_error("could not inspect the refit operation lock")),
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
+        let file = open_lock_file(&lock_path, true)
             .map_err(|_| state_error("could not open the refit operation lock"))?;
+        ensure_no_windows_reparse_points(&lock_path)
+            .map_err(|_| state_error("could not verify the refit operation lock path"))?;
         set_file_permissions(&lock_path)?;
         match file.try_lock() {
             Ok(()) => Ok(StateOperationLock { _file: file }),
@@ -141,21 +160,22 @@ impl StateStore {
             .ok_or_else(|| state_error("refit state path has no parent directory"))?;
         prepare_directory(parent)?;
         let lock_path = parent.join("managed-session.lock");
+        ensure_no_windows_reparse_points(&lock_path)
+            .map_err(|_| state_error("could not verify the managed-session lock path"))?;
         match fs::symlink_metadata(&lock_path) {
-            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            Ok(metadata)
+                if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_file() =>
+            {
                 return Err(state_error("managed-session lock is not a regular file"));
             }
             Ok(_) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(_) => return Err(state_error("could not inspect the managed-session lock")),
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)
+        let file = open_lock_file(&lock_path, true)
             .map_err(|_| state_error("could not open the managed-session lock"))?;
+        ensure_no_windows_reparse_points(&lock_path)
+            .map_err(|_| state_error("could not verify the managed-session lock path"))?;
         set_file_permissions(&lock_path)?;
         match file.try_lock() {
             Ok(()) => Ok(Some(StateManagedSessionLock { _file: file })),
@@ -172,19 +192,20 @@ impl StateStore {
             .parent()
             .ok_or_else(|| state_error("refit state path has no parent directory"))?;
         let lock_path = parent.join("managed-session.lock");
+        ensure_no_windows_reparse_points(&lock_path)
+            .map_err(|_| state_error("could not verify the managed-session lock path"))?;
         let metadata = match fs::symlink_metadata(&lock_path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
             Err(_) => return Err(state_error("could not inspect the managed-session lock")),
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_file() {
             return Err(state_error("managed-session lock is not a regular file"));
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&lock_path)
+        let file = open_lock_file(&lock_path, false)
             .map_err(|_| state_error("could not open the managed-session lock"))?;
+        ensure_no_windows_reparse_points(&lock_path)
+            .map_err(|_| state_error("could not verify the managed-session lock path"))?;
         match file.try_lock() {
             Ok(()) => Ok(false),
             Err(TryLockError::WouldBlock) => Ok(true),
@@ -253,6 +274,8 @@ impl StateStore {
     }
 
     fn read(&self) -> Result<StateDocument, CodexRefitError> {
+        ensure_no_windows_reparse_points(&self.path)
+            .map_err(|_| state_error("could not verify the refit state path"))?;
         let metadata = match fs::symlink_metadata(&self.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == ErrorKind::NotFound => {
@@ -263,7 +286,7 @@ impl StateStore {
             }
             Err(_) => return Err(state_error("could not read refit state")),
         };
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_file() {
             return Err(state_error("refit state is not a regular file"));
         }
         let bytes = fs::read(&self.path).map_err(|_| state_error("could not read refit state"))?;
@@ -288,37 +311,29 @@ impl StateStore {
             .ok_or_else(|| state_error("refit state path has no parent directory"))?;
         prepare_directory(parent)?;
 
-        static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let temporary = parent.join(format!(".state.{}.{}.tmp", std::process::id(), sequence));
         let mut bytes = serde_json::to_vec_pretty(document)
             .map_err(|_| state_error("could not serialize refit state"))?;
         bytes.push(b'\n');
-        let result = (|| {
-            let mut file = OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&temporary)
-                .map_err(|_| state_error("could not create temporary refit state"))?;
-            set_file_permissions(&temporary)?;
-            file.write_all(&bytes)
-                .map_err(|_| state_error("could not write refit state"))?;
-            file.sync_all()
-                .map_err(|_| state_error("could not flush refit state"))?;
-            fs::rename(&temporary, &self.path)
-                .map_err(|_| state_error("could not replace refit state"))?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        write_private_atomically(&self.path, &bytes).map_err(|error| match error {
+            AtomicWriteError::CreateTemporary => {
+                state_error("could not create temporary refit state")
+            }
+            AtomicWriteError::WriteTemporary => state_error("could not write refit state"),
+            AtomicWriteError::FlushTemporary => state_error("could not flush refit state"),
+            AtomicWriteError::UnsafeDestination => {
+                state_error("could not verify the refit state path")
+            }
+            AtomicWriteError::ReplaceDestination => state_error("could not replace refit state"),
+        })?;
+        set_file_permissions(&self.path)
     }
 
     fn persist(&self, document: &StateDocument) -> Result<(), CodexRefitError> {
         if !document.records.is_empty() {
             return self.write(document);
         }
+        ensure_no_windows_reparse_points(&self.path)
+            .map_err(|_| state_error("could not verify the refit state path"))?;
         match fs::remove_file(&self.path) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
@@ -327,9 +342,29 @@ impl StateStore {
     }
 }
 
+fn open_lock_file(path: &Path, create: bool) -> io::Result<fs::File> {
+    let mut options = OpenOptions::new();
+    options
+        .create(create)
+        .read(true)
+        .write(true)
+        .truncate(false);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        const FILE_SHARE_READ: u32 = 0x0000_0001;
+        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    options.open(path)
+}
+
 fn prepare_directory(path: &Path) -> Result<(), CodexRefitError> {
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| state_error("could not verify the refit state directory"))?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        Ok(metadata) if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_dir() => {
             return Err(state_error(
                 "refit state directory is not a regular directory",
             ));
@@ -340,7 +375,7 @@ fn prepare_directory(path: &Path) -> Result<(), CodexRefitError> {
                 .map_err(|_| state_error("could not create refit state directory"))?;
             let metadata = fs::symlink_metadata(path)
                 .map_err(|_| state_error("could not inspect refit state directory"))?;
-            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_dir() {
                 return Err(state_error(
                     "refit state directory is not a regular directory",
                 ));
@@ -348,6 +383,8 @@ fn prepare_directory(path: &Path) -> Result<(), CodexRefitError> {
         }
         Err(_) => return Err(state_error("could not inspect refit state directory")),
     }
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| state_error("could not verify the refit state directory"))?;
     set_directory_permissions(path)
 }
 
@@ -369,6 +406,7 @@ fn validate_record(record: &TargetRecord) -> Result<(), CodexRefitError> {
         && record.session_mode == SessionMode::Persistent
         && token_valid
         && record.manager_pid > 1
+        && record.manager_created_at != Some(0)
     {
         Ok(())
     } else {
@@ -384,7 +422,13 @@ fn set_directory_permissions(path: &Path) -> Result<(), CodexRefitError> {
         .map_err(|_| state_error("could not protect the refit state directory"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_directory_permissions(path: &Path) -> Result<(), CodexRefitError> {
+    crate::platform::protect_private_directory(path)
+        .map_err(|_| state_error("could not protect the refit state directory"))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_directory_permissions(_path: &Path) -> Result<(), CodexRefitError> {
     Ok(())
 }
@@ -397,7 +441,13 @@ fn set_file_permissions(path: &Path) -> Result<(), CodexRefitError> {
         .map_err(|_| state_error("could not protect refit state"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_file_permissions(path: &Path) -> Result<(), CodexRefitError> {
+    crate::platform::protect_private_file(path)
+        .map_err(|_| state_error("could not protect refit state"))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_file_permissions(_path: &Path) -> Result<(), CodexRefitError> {
     Ok(())
 }
@@ -420,6 +470,7 @@ mod tests {
             session_mode: SessionMode::Persistent,
             manager_token: token.to_owned(),
             manager_pid: 4242,
+            manager_created_at: None,
         }
     }
 

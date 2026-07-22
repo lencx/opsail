@@ -38,9 +38,6 @@ jobs:
 
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
           package_version="$(jq -r '.packages[] | select(.name == "opsail") | .version' <<<"$metadata")"
-          chrome_version="$(jq -r '.packages[] | select(.name == "opsail-chrome") | .version' <<<"$metadata")"
-          read_version="$(jq -r '.packages[] | select(.name == "opsail-read") | .version' <<<"$metadata")"
-          refit_codex_version="$(jq -r '.packages[] | select(.name == "opsail-refit-codex") | .version' <<<"$metadata")"
           node_version="$(jq -r '.version' packages/node/package.json)"
           rust_version="$(jq -r '.packages[] | select(.name == "opsail") | .rust_version' <<<"$metadata")"
 
@@ -54,8 +51,8 @@ jobs:
             exit 1
           fi
 
-          if [[ "$chrome_version" != "$package_version" || "$read_version" != "$package_version" || "$refit_codex_version" != "$package_version" || "$node_version" != "$package_version" ]]; then
-            echo "::error::Cargo and npm package versions must match ($package_version, $chrome_version, $read_version, $refit_codex_version, $node_version)"
+          if [[ "$node_version" != "$package_version" ]]; then
+            echo "::error::The opsail CLI and npm facade versions must match ($package_version, $node_version)"
             exit 1
           fi
 
@@ -163,11 +160,11 @@ jobs:
           & "target/${{ matrix.target }}/release/opsail.exe" --version
           & "target/${{ matrix.target }}/release/opsail.exe" read --help | Out-Null
 
-      # The hosted Ubuntu arm64 image intentionally omits Chrome. macOS arm64
-      # still exercises the arm64 launcher, without downloading a browser at
-      # release time.
+      # The hosted Ubuntu and Windows arm64 images do not guarantee Chrome.
+      # Their native Opsail binaries are still exercised by the smoke step
+      # above, without downloading a browser at release time.
       - name: Smoke test Chrome launch
-        if: matrix.target != 'aarch64-unknown-linux-musl'
+        if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'aarch64-pc-windows-msvc'
         env:
           OPSAIL_BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
         shell: bash

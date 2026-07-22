@@ -5,7 +5,7 @@
 The crate owns the complete adapter boundary:
 
 - an internal, reusable refit lifecycle with idempotent enable, disable, status, rollback, cleanup, and health checks;
-- macOS application identity, signature, process ancestry, loopback listener, and renderer validation;
+- platform-specific application identity, process ownership, loopback listener, and renderer validation for macOS and Windows;
 - bounded Chrome DevTools Protocol discovery and transport;
 - Codex renderer bridge methods, a versioned DOM adapter, rate-limit normalization, partial-update merging, refresh coordination, and UI payloads;
 - embedded locale JSON and theme-token-only CSS;
@@ -13,11 +13,17 @@ The crate owns the complete adapter boundary:
 
 The lifecycle remains an internal module while Codex is the only refit adapter. A shared crate should be extracted only after another adapter demonstrates a stable duplicated contract.
 
-## Supported target
+## Supported targets
 
-The only currently implemented target is the signed macOS application at `/Applications/ChatGPT.app`, with bundle identifier `com.openai.codex` and signing team `2DC432GLL2`. Other platforms return an explicit `unsupported` diagnostic.
+| Platform | Validated application contract | Status |
+| --- | --- | --- |
+| macOS | `/Applications/ChatGPT.app`, bundle identifier `com.openai.codex`, signing team `2DC432GLL2`, and its signed executable/process tree | Implemented |
+| Windows | The current user's Store-signed, non-development `OpenAI.Codex` package with exact PFN `OpenAI.Codex_2p2nqsd0c76g0` and AUMID `OpenAI.Codex_2p2nqsd0c76g0!App`; the executable is derived from the installed signed manifest (currently `app\ChatGPT.exe`) | Implemented for the x64 and ARM64 release targets; native compile, unit, and missing-application CI configured; installed-application end-to-end canary passed on Windows 11 ARM64; real x64 Store canary pending; no 32-bit x86/ia32 release target |
+| Linux | No official application identity is defined | Unsupported |
 
-Normal enable is attach-only. Explicit `--launch` may start a confirmed-stopped application once, using Rust's process API and the validated executable directly. Opsail never quits, kills, restarts, reloads, modifies, re-signs, or writes into the application. It accepts only a debugging endpoint bound to `127.0.0.1`, validates that the listener belongs to the expected signed application process tree, and requires an `app://` renderer with the expected application shell, sidebar, and local bridge.
+The Windows backend and its native API boundary are implemented without depending on the reference PowerShell project. It queries the current user's packages by exact PFN and AUMID instead of matching a versioned `WindowsApps` directory, then reads the application executable from the installed signed `AppxManifest.xml`. The manifest path is accepted only when it is relative, resolves to a regular file, and remains canonically contained by the package root. Native Windows CI and npm packaging targets are configured for x64 and ARM64. A Windows 11 ARM64 canary against an installed Store application validates package activation, live listener ownership, renderer discovery, bridge injection, persistent mode, and cleanup. A real installed-application x64 canary remains pending; hosted CI covers the no-installed-package path.
+
+Normal enable is attach-only. Explicit `--launch` may start a confirmed-stopped application once through the platform's validated launch mechanism. Opsail never quits, kills, restarts, reloads, modifies, re-signs, or writes into the application. It accepts only a debugging endpoint bound to `127.0.0.1`, validates that the listener belongs to the expected platform-validated application process, and requires an `app://` renderer with the expected application shell, sidebar, and local bridge.
 
 ## Launch and attach CLI
 
@@ -28,9 +34,11 @@ opsail refit codex enable usage --launch
 opsail refit codex enable usage --launch --once
 ```
 
-Interactive lifecycle commands show the current bounded milestone with a terminal spinner, including application validation, endpoint inspection, launch preflight, application startup, CDP readiness, renderer/bridge validation, injection, and health confirmation. Background startup changes the visible message only after a stage remains current for about 120ms; rapid milestones are coalesced instead of flashing completed work, without delaying the operation itself. The spinner writes only to `stderr`; structured results remain the only content on `stdout`. Redirected commands, automation without a terminal, and the detached manager itself stay quiet. The foreground and detached startup paths use the same structured stage model, so background startup does not fall back to an unexplained static wait.
+Interactive lifecycle commands show the current bounded milestone with a terminal spinner, including application validation, endpoint inspection, launch preflight, application startup, CDP readiness, renderer/bridge validation, injection, and health confirmation. Background startup changes the visible message only after a stage remains current for about 120ms; rapid milestones are coalesced instead of flashing completed work, without delaying the operation itself. The spinner writes only to `stderr`; structured results remain the only content on `stdout`. Redirected commands, automation without a terminal, and the background manager itself stay quiet. The foreground and background startup paths use the same structured stage model, so background startup does not fall back to an unexplained static wait.
 
-`--launch` maps to the crate's `LaunchPolicy::LaunchIfStopped`. Enable first attempts to attach to an existing validated endpoint. If none exists, Opsail validates the application path, bundle identifier, signing team, and code signature; confirms that ChatGPT is stopped and the selected port is free; and directly spawns exactly one process with:
+`--launch` maps to the crate's `LaunchPolicy::LaunchIfStopped`. Enable first attempts to attach to an existing validated endpoint. If none exists, Opsail validates the platform application identity, confirms that ChatGPT is stopped and the selected port is free, and starts exactly one application instance.
+
+On macOS, it validates the bundle identifier, signing team, code signature, and executable before spawning:
 
 ```sh
 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT \
@@ -38,7 +46,11 @@ Interactive lifecycle commands show the current bounded milestone with a termina
   --remote-debugging-port=55321
 ```
 
-There is no shell wrapper and no `open -a` call. Standard streams and the process group are detached from the Opsail session, and a once command or stopped persistent manager never takes ChatGPT down with it. Endpoint startup has a bounded timeout. After discovery, Opsail revalidates that the listener descends from the process it launched, then performs renderer and bridge validation before injection.
+There is no shell wrapper and no `open -a` call. Standard streams and the process group are detached from the Opsail session.
+
+On Windows, Opsail validates the current user's registered Store package, Store signature kind, non-development status, exact PFN and AUMID, signed-manifest-derived executable, and user SID. The executable is currently `app\ChatGPT.exe`, but its versioned installation path and filename are not discovered with a prefix or regular-expression scan. Opsail then passes the same two CDP arguments through the Windows application activation API. It does not execute the protected WindowsApps executable directly or invoke PowerShell. The activated PID, creation time, package identity, executable file identity, and user SID are checked again around listener discovery.
+
+A once command or stopped persistent manager never takes ChatGPT down with it. Endpoint startup has a bounded timeout. After discovery, Opsail revalidates the platform process and listener identity, then performs renderer and bridge validation before injection.
 
 When `--launch` actually starts ChatGPT and the injected runtime passes its health check, the renderer shows one short, localized notice confirming that Opsail mode is active. It is horizontally centered near 30% of the viewport height, above the visual midpoint without hugging the window edge. Its background and high-contrast foreground use Codex's paired activity-badge theme tokens, with the themed progress accent and foreground as semantic fallbacks. Attaching to an already-running validated endpoint, reconnecting after a renderer reload, and repeated idempotent enable do not produce that launch notice. Notice failure is diagnostic-only and never replaces or rolls back a healthy usage capsule.
 
@@ -46,7 +58,7 @@ An already-valid endpoint is attached without starting another process. If ChatG
 
 The public default is `55321`, and `--port PORT` or `-p PORT` explicitly overrides it. `--launch` also has `-l`, `--once` has `-o`, and `--foreground` has `-F`. Discovery, preflight, and launch always use `127.0.0.1`; `localhost`, IPv6 addresses, `0.0.0.0`, and non-loopback listeners are rejected. The current implementation does not automatically choose another port if `55321` is occupied. Selecting a free port from `49152..65535` and persisting that choice is a future consideration, not a current capability.
 
-For a user-managed endpoint, start the application manually with the same address and selected port, then use attach-only enable:
+On macOS, a user-managed endpoint can start the application manually with the same address and selected port before attach-only enable:
 
 ```sh
 /Applications/ChatGPT.app/Contents/MacOS/ChatGPT \
@@ -57,15 +69,17 @@ opsail refit codex enable usage
 opsail refit codex enable usage --once
 ```
 
+On Windows, do not run the executable inside WindowsApps directly. `--launch` uses the implemented AUMID package-activation route; attach-only commands may reuse an endpoint that is already running and passes the full Windows identity checks. The executable path is used for identity validation, not direct launch.
+
 The read-only diagnostic command reports why an existing target is or is not ready, but does not launch it:
 
 ```sh
 opsail refit codex doctor
 ```
 
-`persistent` (managed) is the default. Opsail starts a detached manager, waits for its validated health report, prints that JSON, and returns control to the terminal. The manager holds one WebSocket per validated renderer; it does not create an Opsail HTTP service, proxy, or additional listening port. A dedicated async reader drains responses, control frames, and unrelated CDP events while stable idle work blocks on the socket, and Rust does not duplicate the renderer's usage polling.
+`persistent` (managed) is the default. Opsail starts a background manager, waits for its validated health report, prints that JSON, and returns control to the terminal. The manager holds one WebSocket per validated renderer; it does not create an Opsail HTTP service, proxy, or additional listening port. A dedicated async reader drains responses, control frames, and unrelated CDP events while stable idle work blocks on the socket, and Rust does not duplicate the renderer's usage polling.
 
-The CDP socket is also the primary application-lifetime signal. For an application started by Opsail, the detached manager additionally owns a process-exit receiver backed by the child wait primitive; either the socket close or the process-exit event wakes the blocked supervisor. For an application attached after external startup, socket close triggers one process-identity check. If ChatGPT has exited, the manager removes its local target markers, releases its lock, and terminates. If ChatGPT is still running, the disconnect is treated as a renderer reload and target rediscovery uses exponential backoff from 250ms up to 30 seconds. Process checks occur only before and after those disconnected recovery waits; there is no timer or process polling while the socket is healthy. A successful renderer connection resets the backoff.
+The CDP socket is also the primary application-lifetime signal. For an application started by Opsail, the background manager additionally owns a process-exit receiver backed by the child wait primitive; either the socket close or the process-exit event wakes the blocked supervisor. For an application attached after external startup, socket close triggers one process-identity check. If ChatGPT has exited, the manager removes its local target markers, releases its lock, and terminates. If ChatGPT is still running, the disconnect is treated as a renderer reload and target rediscovery uses exponential backoff from 250ms up to 30 seconds. Process checks occur only before and after those disconnected recovery waits; there is no timer or process polling while the socket is healthy. A successful renderer connection resets the backoff.
 
 For diagnostics, keep the manager attached to the terminal explicitly:
 
@@ -74,7 +88,7 @@ opsail refit codex enable usage --foreground
 opsail refit codex enable usage --launch --foreground
 ```
 
-Foreground mode has the same managed lifecycle and accepts `Ctrl+C`, `Ctrl+Z`, `SIGTERM`, and `SIGHUP` as shutdown requests.
+Foreground mode has the same managed lifecycle. macOS accepts `Ctrl+C`, `Ctrl+Z`, `SIGTERM`, and `SIGHUP` as shutdown requests; Windows currently handles `Ctrl+C`.
 
 Disable validates and stops an active Opsail manager when necessary, reconnects temporarily, and removes the current DOM, styles, listeners, observers, timers, and managed marker. It never stops ChatGPT:
 
@@ -101,7 +115,7 @@ Use the same explicit `--port PORT` on later `status`, `doctor`, and `disable` c
 
 The renderer runtime is a separate cost boundary. Its longer-lived work is more important to constrain than an idle socket: mutation observations are filtered to relevant sidebar changes and coalesced with animation frames, geometry follows `ResizeObserver`, hidden pages pause fallback refreshes, and all listeners, observers, and timers have deterministic cleanup. Stable state performs no high-frequency polling.
 
-The listener's security exposure matters more than its idle performance. Opsail accepts only the literal `127.0.0.1` and revalidates process and signed-application ownership around discovery. Discovery admits only a bounded, credential-free local `app:` renderer candidate on that verified endpoint; Opsail then separately probes the expected shell, sidebar, and bridge before any injection. This layered check avoids treating one private packaged URL such as `app://-/index.html` as a permanent product contract while still failing closed when the renderer identity changes. Prefer an available randomized high port and pass that exact value with `--port`; never expose the endpoint on another interface. These controls bound the listener, CDP session, and renderer runtime separately rather than claiming zero overhead.
+The listener's security exposure matters more than its idle performance. Opsail accepts only the literal `127.0.0.1` and revalidates process and platform application ownership around discovery. Discovery admits only a bounded, credential-free local `app:` renderer candidate on that verified endpoint; Opsail then separately probes the expected shell, sidebar, and bridge before any injection. This layered check avoids treating one private packaged URL such as `app://-/index.html` as a permanent product contract while still failing closed when the renderer identity changes. Prefer an available randomized high port and pass that exact value with `--port`; never expose the endpoint on another interface. These controls bound the listener, CDP session, and renderer runtime separately rather than claiming zero overhead.
 
 An Apple Events-based read-only probe is an unverified future consideration only. It is not implemented, enabled, or included in current capability and health decisions, and Opsail does not change application or system preferences for it.
 
@@ -152,7 +166,7 @@ When every JavaScript SHA-256 is unchanged, the normal `update` command succeeds
 
 Force confirms the validated content change only. It cannot override the fixed GitHub origin, file allowlist, size limits, manifest/file hashes, payload compatibility, or downgrade protection. Repository control is the update trust root; SHA-256 and byte counts provide content integrity and consistency, not an independent publisher signature. Fetching the mutable `main` manifest and files can race with a repository update; those checks make that race fail safely instead of mixing versions. Retrying later obtains one coherent publication.
 
-Validated versions are staged under the owner-only Opsail application-support directory, then a small `current.json` pointer is replaced atomically. Version directories are immutable and retained; symlinks and non-regular files are rejected. Nothing is written to a Codex configuration directory, ChatGPT.app, app.asar, or the application installation tree. `status`, lifecycle reports, and `doctor` expose the selected renderer asset version and whether it came from `embedded` or `github`. A malformed installed pointer or bundle falls back to the embedded version and produces a bounded doctor warning.
+Validated versions are staged under Opsail's platform state directory, then activated through a small `current.json` pointer. Version directories are immutable and retained; symlinks, Windows reparse points, and non-regular files are rejected where applicable. Nothing is written to a Codex configuration directory, `ChatGPT.app`, `app.asar`, the Windows Store package directory, or any other application installation tree. `status`, lifecycle reports, and `doctor` expose the selected renderer asset version and whether it came from `embedded` or `github`. A malformed installed pointer or bundle falls back to the embedded version and produces a bounded doctor warning.
 
 An installed update activates when the next `CodexRefit` session is constructed. It does not mutate a currently running persistent manager or renderer in place. Run `opsail refit codex disable usage`, update, then enable again when immediate activation is desired; the update command itself never stops anything.
 
@@ -178,4 +192,4 @@ Embedders can construct `CodexRefit` with `CodexRefitConfig` and call `enable_us
 
 A `stale` target with `healthy: true` means the installed runtime is structurally healthy but its local account snapshot is unavailable or stale; enable remains idempotent and does not reinject in that case. A `stale` target with `healthy: false` means renderer artifacts and the session lifecycle marker require reconciliation.
 
-Local managed markers, versioned renderer JavaScript, and advisory locks use owner-only permissions under `~/Library/Application Support/opsail/refit/codex` by default. Markers contain only bounded target identifiers, payload revisions, debugging ports, the persistent mode, non-secret installation tokens, and the owning Opsail manager PID. CDP early-script identifiers remain only in the live session that owns them and are never treated as cross-connection receipts. CSS and locale JSON stay embedded; updated JavaScript is stored only in Opsail's application-support tree and never in a Codex configuration directory or the application bundle.
+Local managed markers, versioned renderer JavaScript, and advisory locks live under `~/Library/Application Support/opsail/refit/codex` on macOS and `%LOCALAPPDATA%\opsail\refit\codex` on Windows by default. macOS applies owner-only permission bits. Windows rejects symlinks and reparse points and replaces inherited access with a protected DACL granting full control only to the current user and SYSTEM; directory entries inherit that policy to descendants. Markers contain only bounded target identifiers, payload revisions, debugging ports, the persistent mode, non-secret installation tokens, and the owning Opsail manager PID plus its creation-time identity on Windows. CDP early-script identifiers remain only in the live session that owns them and are never treated as cross-connection receipts. CSS and locale JSON stay embedded; updated JavaScript is stored only in Opsail's state tree and never in a Codex configuration directory or the application installation tree.

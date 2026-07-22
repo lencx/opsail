@@ -11,10 +11,12 @@ binary for the current platform:
 npm install opsail
 ```
 
-Prebuilt packages are available for macOS arm64/x64, Linux arm64/x64, and
-Windows x64. The public package resolves them automatically; the internal
-`@opsail/*` platform packages are implementation details and have no separate
-API or command.
+The prebuilt release matrix targets macOS arm64/x64, Linux arm64/x64, and
+Windows arm64/x64. It builds and stages `@opsail/win32-arm64` and
+`@opsail/win32-x64` as optional native packages for publication; the public
+package resolves the matching published target automatically. All `@opsail/*`
+platform packages remain implementation details and have no separate API or
+command.
 
 ```js
 import { read } from "opsail";

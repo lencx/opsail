@@ -37,6 +37,15 @@ const targets = [
   },
   {
     platform: "win32",
+    arch: "arm64",
+    packageName: "@opsail/win32-arm64",
+    rustTarget: "aarch64-pc-windows-msvc",
+    binarySubpath: "bin/opsail.exe",
+    runner: "windows-11-arm",
+    asset: "opsail-aarch64-pc-windows-msvc.zip",
+  },
+  {
+    platform: "win32",
     arch: "x64",
     packageName: "@opsail/win32-x64",
     rustTarget: "x86_64-pc-windows-msvc",

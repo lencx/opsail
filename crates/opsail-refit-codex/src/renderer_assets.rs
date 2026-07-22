@@ -10,6 +10,10 @@ use ring::digest;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+use crate::atomic_file::{
+    AtomicWriteError, ensure_no_windows_reparse_points, is_symlink_or_windows_reparse_point,
+    write_private_atomically,
+};
 use crate::error::{CodexRefitError, CodexRefitErrorCode};
 use crate::model::{RendererAssetInfo, RendererAssetSource};
 
@@ -432,6 +436,10 @@ impl RendererAssetStore {
                 .map_err(|_| update_error("could not serialize renderer asset manifest"))?;
             manifest_bytes.push(b'\n');
             write_new_private_file(&temporary.join("manifest.json"), &manifest_bytes)?;
+            ensure_no_windows_reparse_points(&temporary)
+                .map_err(|_| update_error("could not verify renderer asset staging path"))?;
+            ensure_no_windows_reparse_points(&final_directory)
+                .map_err(|_| update_error("could not verify renderer asset version path"))?;
             fs::rename(&temporary, &final_directory)
                 .map_err(|_| update_error("could not commit renderer asset version"))?;
             let pointer = CurrentPointer {
@@ -448,19 +456,24 @@ impl RendererAssetStore {
     }
 
     fn write_current_pointer(&self, pointer: &CurrentPointer) -> Result<(), CodexRefitError> {
-        let temporary = self.root.join(format!(".current-{}.tmp", unique_suffix()));
         let mut bytes = serde_json::to_vec_pretty(pointer)
             .map_err(|_| update_error("could not serialize renderer asset pointer"))?;
         bytes.push(b'\n');
-        let result = (|| {
-            write_new_private_file(&temporary, &bytes)?;
-            fs::rename(&temporary, self.root.join("current.json"))
-                .map_err(|_| update_error("could not activate renderer asset version"))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
+        let path = self.root.join("current.json");
+        write_private_atomically(&path, &bytes).map_err(|error| match error {
+            AtomicWriteError::CreateTemporary => {
+                update_error("could not create renderer asset file")
+            }
+            AtomicWriteError::WriteTemporary => update_error("could not write renderer asset file"),
+            AtomicWriteError::FlushTemporary => update_error("could not flush renderer asset file"),
+            AtomicWriteError::UnsafeDestination => {
+                update_error("could not verify renderer asset pointer path")
+            }
+            AtomicWriteError::ReplaceDestination => {
+                update_error("could not activate renderer asset version")
+            }
+        })?;
+        set_file_permissions(&path)
     }
 }
 
@@ -553,12 +566,14 @@ fn valid_directory_name(value: &str) -> bool {
 }
 
 fn read_regular_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, CodexRefitError> {
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| update_error("could not verify renderer asset storage"))?;
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(update_error("could not inspect renderer asset storage")),
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_file() {
         return Err(update_error(
             "renderer asset storage contains a non-regular file",
         ));
@@ -574,8 +589,10 @@ fn read_regular_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, Codex
 }
 
 fn prepare_private_directory(path: &Path) -> Result<(), CodexRefitError> {
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| update_error("could not verify renderer asset storage"))?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+        Ok(metadata) if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_dir() => {
             return Err(update_error(
                 "renderer asset storage is not a regular directory",
             ));
@@ -588,13 +605,17 @@ fn prepare_private_directory(path: &Path) -> Result<(), CodexRefitError> {
         }
         Err(_) => return Err(update_error("could not inspect renderer asset storage")),
     }
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| update_error("could not verify renderer asset storage"))?;
     set_directory_permissions(path)
 }
 
 fn ensure_existing_directory(path: &Path) -> Result<(), CodexRefitError> {
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| update_error("could not verify renderer asset storage"))?;
     let metadata = fs::symlink_metadata(path)
         .map_err(|_| update_error("could not inspect renderer asset storage"))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+    if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_dir() {
         return Err(update_error(
             "renderer asset storage is not a regular directory",
         ));
@@ -603,10 +624,14 @@ fn ensure_existing_directory(path: &Path) -> Result<(), CodexRefitError> {
 }
 
 fn existing_directory(path: &Path) -> Result<bool, CodexRefitError> {
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| update_error("could not verify renderer asset storage"))?;
     match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => Err(
-            update_error("renderer asset storage is not a regular directory"),
-        ),
+        Ok(metadata) if is_symlink_or_windows_reparse_point(&metadata) || !metadata.is_dir() => {
+            Err(update_error(
+                "renderer asset storage is not a regular directory",
+            ))
+        }
         Ok(_) => Ok(true),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(_) => Err(update_error("could not inspect renderer asset storage")),
@@ -614,6 +639,8 @@ fn existing_directory(path: &Path) -> Result<bool, CodexRefitError> {
 }
 
 fn write_new_private_file(path: &Path, bytes: &[u8]) -> Result<(), CodexRefitError> {
+    ensure_no_windows_reparse_points(path)
+        .map_err(|_| update_error("could not verify renderer asset file path"))?;
     let mut file = OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -644,7 +671,13 @@ fn set_directory_permissions(path: &Path) -> Result<(), CodexRefitError> {
         .map_err(|_| update_error("could not protect renderer asset storage"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_directory_permissions(path: &Path) -> Result<(), CodexRefitError> {
+    crate::platform::protect_private_directory(path)
+        .map_err(|_| update_error("could not protect renderer asset storage"))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_directory_permissions(_path: &Path) -> Result<(), CodexRefitError> {
     Ok(())
 }
@@ -657,7 +690,13 @@ fn set_file_permissions(path: &Path) -> Result<(), CodexRefitError> {
         .map_err(|_| update_error("could not protect renderer asset file"))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn set_file_permissions(path: &Path) -> Result<(), CodexRefitError> {
+    crate::platform::protect_private_file(path)
+        .map_err(|_| update_error("could not protect renderer asset file"))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn set_file_permissions(_path: &Path) -> Result<(), CodexRefitError> {
     Ok(())
 }

@@ -41,7 +41,7 @@ skills/opsail          统一的 Opsail 运行时 Agent Skill
 
 `opsail-read` 的两个入口都返回 CLI JSON 输出所使用的带版本号 `ReadResult` 模型。浏览器捕获保留不同的来源信息：自有启动使用 `SourceKind::Chrome`，借用 endpoint 使用 `SourceKind::Cdp`。
 
-`opsail-refit-codex` 暴露通过 `CodexRefitConfig` 配置的 `CodexRefit`，提供异步的 `enable_usage`、`disable_usage`、`status` 与只读 `doctor` 操作。适配器目前只支持经过校验的 macOS 应用 `/Applications/ChatGPT.app`。Enable 默认为只附加；只有显式使用类型化 `LaunchIfStopped` 策略时才可启动一次已校验的可执行文件，但不得退出、kill、重启、重载、修改或重新签名该应用。`doctor`、`status` 与 `disable` 绝不启动应用。连接必须只使用 `127.0.0.1`，并且只有应用签名、进程祖先链、renderer URL 与 shell、侧栏以及预期本机 bridge 全部通过校验后才能继续。Codex 协议名、选择器、额度语义、本地化 JSON 和 UI 文案均属于此 crate，不进入共享模块。
+`opsail-refit-codex` 暴露通过 `CodexRefitConfig` 配置的 `CodexRefit`，提供异步的 `enable_usage`、`disable_usage`、`status` 与只读 `doctor` 操作。适配器支持经过校验的 macOS 应用 `/Applications/ChatGPT.app`，以及 Windows x64 和 ARM64 发布目标上当前用户已校验的 `OpenAI.Codex` Microsoft Store 包；Linux 和 32 位 Windows 发布不受支持。Enable 默认为只附加；只有显式使用类型化 `LaunchIfStopped` 策略时，才可通过平台校验后的启动机制启动一次应用，但不得退出、kill、重启、重载、修改或重新签名它。`doctor`、`status` 与 `disable` 绝不启动应用。连接必须只使用 `127.0.0.1`，并且只有平台应用身份、进程归属、renderer URL 与 shell、侧栏以及预期本机 bridge 全部通过校验后才能继续。Codex 协议名、选择器、额度语义、本地化 JSON 和 UI 文案均属于此 crate，不进入共享模块。
 
 ## 开发流程
 

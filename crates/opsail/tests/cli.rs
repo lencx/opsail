@@ -298,8 +298,13 @@ fn top_level_help_places_the_github_repository_before_usage() {
 #[test]
 fn read_without_arguments_shows_help_instead_of_reading_stdin() {
     let mut command = cargo_bin_cmd!("opsail");
+    let binary_name = if cfg!(windows) {
+        "opsail.exe"
+    } else {
+        "opsail"
+    };
     command.arg("read").assert().code(2).stdout("").stderr(
-        predicate::str::contains("Usage: opsail read [OPTIONS] [SOURCE]")
+        predicate::str::contains(format!("Usage: {binary_name} read [OPTIONS] [SOURCE]"))
             .and(predicate::str::contains("--format")),
     );
 }

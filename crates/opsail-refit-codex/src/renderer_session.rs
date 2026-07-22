@@ -7,6 +7,7 @@ use crate::error::{CodexRefitError, CodexRefitErrorCode};
 use crate::lifecycle::{ManagedSession, SessionFuture};
 use crate::model::{CodexRefitState, CodexTargetHealth, ResetCreditState, SessionMode};
 use crate::payload::UsagePayload;
+use crate::platform;
 use crate::state::{StateStore, TargetRecord};
 
 pub(super) const USAGE_RUNTIME_LISTENER_COUNT: usize = 10;
@@ -197,6 +198,7 @@ impl ManagedSession for CodexSession {
                         session_mode: SessionMode::Persistent,
                         manager_token: self.manager_token.clone(),
                         manager_pid: std::process::id(),
+                        manager_created_at: platform::current_process_instance_id()?,
                     };
                     if let Err(error) = self.state.replace(record) {
                         let _ = self.cdp.remove_script(&identifier).await;

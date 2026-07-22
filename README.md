@@ -39,6 +39,8 @@ See [`opsail-read`](crates/opsail-read/README.md) for acquisition, extraction, r
 
 `opsail refit codex` provides a reversible, target-validated Codex adapter. Its first feature adds localized remaining-usage information to the Codex sidebar using the renderer's existing local bridge, without model calls or changes to the application bundle.
 
+The refit target is implemented for the signed macOS application and the current-user Microsoft Store application on Windows; Linux is not supported. Windows release targets are x64 and ARM64; no 32-bit x86/ia32 artifact is provided. Opsail resolves the exact package family and AUMID, derives the application executable from the installed signed manifest (currently `app\ChatGPT.exe`), and protects its Local AppData state with an explicit current-user-and-SYSTEM DACL. Native CI and npm packaging targets are configured for both Windows architectures. A Windows 11 ARM64 canary against the installed Store application validates package activation, listener ownership, renderer discovery, bridge injection, persistence, and cleanup; a real installed-application x64 canary remains pending, while hosted CI covers the no-installed-package path.
+
 ```sh
 opsail refit codex enable usage --launch
 ```
