@@ -845,13 +845,6 @@ test("notification calibration is debounced and waits for an active read", async
   coordinator.finish(initial);
   assert.equal(sent.length, 2);
   assert.equal(model.NOTIFICATION_CALIBRATION_MS, 1200);
-
-  coordinator.finish(sent[1]);
-  coordinator.scheduleCalibration(3000);
-  clock.advance(2999);
-  assert.equal(sent.length, 2);
-  clock.advance(1);
-  assert.equal(sent.length, 3);
   coordinator.dispose();
 });
 
@@ -1675,19 +1668,58 @@ test("opening usage details recalibrates reset countdowns from the current time"
   host.dispatch("pointerenter", {});
   assert.equal(details.dataset.opsailRefitCodexOpen, "true");
   assert.equal(countdownText(), "1h");
+
+  harness.advanceNow(2 * 60 * 60 * 1000);
+  const diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.resetCreditState, "empty");
+  assert.equal(diagnostics.resetCreditCount, 0);
+  host.dispatch("pointerenter", {});
+  assert.equal(details.children[3].hidden, true);
 });
 
-test("an initially omitted reset-credit field gets one bounded calibration and preserves later data", async () => {
+test("omitted reset credits remain unobserved without dedicated startup reads", async () => {
   const { source } = await assembleRuntimeSource();
   const harness = createRuntimeHarness({ nativeAccountRow: true });
   new vm.Script(source).runInContext(harness.context);
 
   assert.equal(harness.sent.length, 1);
   harness.respondWithWeekly();
-  assert.equal(harness.activeCounts().timeouts, 1);
+  const diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  const resetCreditSection = harness.document
+    .getElementById("opsail-refit-codex-usage-details")
+    .children[3];
+  assert.equal(diagnostics.resetCreditState, "not-observed");
+  assert.equal(diagnostics.resetCreditCount, 0);
+  assert.equal(resetCreditSection.hidden, true);
+  assert.equal(harness.sent.length, 1);
+  assert.equal(harness.activeCounts().timeouts, 0);
+});
 
-  harness.runPendingTimeouts();
+test("reset-credit observation distinguishes empty and available while null preserves state", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+  const resetCreditSection = harness.document
+    .getElementById("opsail-refit-codex-usage-details")
+    .children[3];
+
+  harness.respondWithWeekly({ resetCredits: null });
+  let diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.resetCreditState, "not-observed");
+  assert.equal(diagnostics.resetCreditCount, 0);
+  assert.equal(harness.activeCounts().timeouts, 0);
+
+  harness.advanceNow(60 * 1000);
+  harness.window.dispatch("focus", {});
   assert.equal(harness.sent.length, 2);
+  harness.respondWithWeekly({ resetCredits: { credits: [] } });
+  diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.resetCreditState, "empty");
+  assert.equal(diagnostics.resetCreditCount, 0);
+  assert.equal(resetCreditSection.hidden, true);
+
+  harness.advanceNow(60 * 1000);
+  harness.window.dispatch("focus", {});
   harness.respondWithWeekly({
     resetCredits: {
       credits: [{
@@ -1696,69 +1728,46 @@ test("an initially omitted reset-credit field gets one bounded calibration and p
       }],
     },
   });
-  assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
-    1,
-  );
-  assert.equal(harness.activeCounts().timeouts, 0);
+  diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.resetCreditState, "available");
+  assert.equal(diagnostics.resetCreditCount, 1);
+  assert.equal(resetCreditSection.hidden, false);
 
   harness.advanceNow(60 * 1000);
   harness.window.dispatch("focus", {});
-  assert.equal(harness.sent.length, 3);
-  harness.respondWithWeekly();
-  assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
-    1,
-  );
-  assert.equal(harness.activeCounts().timeouts, 0);
+  harness.respondWithWeekly({ resetCredits: null });
+  diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.resetCreditState, "available");
+  assert.equal(diagnostics.resetCreditCount, 1);
 });
 
-test("null reset-credit snapshots stay provisional and cannot erase a valid list", async () => {
+test("an observed list without a usable future reset credit is explicitly empty", async () => {
   const { source } = await assembleRuntimeSource();
   const harness = createRuntimeHarness({ nativeAccountRow: true });
   new vm.Script(source).runInContext(harness.context);
 
-  harness.respondWithWeekly({ resetCredits: null });
-  assert.equal(harness.activeCounts().timeouts, 1);
-  assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditsResolved,
-    false,
-  );
-
-  harness.runPendingTimeouts();
-  assert.equal(harness.sent.length, 2);
   harness.respondWithWeekly({
     resetCredits: {
-      credits: [{
-        status: "available",
-        expiresAt: (harness.now() + 10 * 24 * 60 * 60 * 1000) / 1000,
-      }],
+      credits: [
+        {
+          status: "available",
+          expiresAt: (harness.now() - 1000) / 1000,
+        },
+        {
+          status: "redeemed",
+          expiresAt: (harness.now() + 10 * 24 * 60 * 60 * 1000) / 1000,
+        },
+      ],
     },
   });
-  assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
-    1,
-  );
-  assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditsResolved,
-    true,
-  );
 
-  harness.advanceNow(60 * 1000);
-  harness.window.dispatch("focus", {});
-  harness.respondWithWeekly({ resetCredits: null });
-  assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
-    1,
-  );
-
-  harness.advanceNow(60 * 1000);
-  harness.window.dispatch("focus", {});
-  harness.respondWithWeekly({ resetCredits: { credits: [] } });
-  assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditCount,
-    0,
-  );
+  const diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  const resetCreditSection = harness.document
+    .getElementById("opsail-refit-codex-usage-details")
+    .children[3];
+  assert.equal(diagnostics.resetCreditState, "empty");
+  assert.equal(diagnostics.resetCreditCount, 0);
+  assert.equal(resetCreditSection.hidden, true);
 });
 
 test("quota windows and delayed reset credits merge through the same payload path", async () => {
@@ -1770,23 +1779,19 @@ test("quota windows and delayed reset credits merge through the same payload pat
   let diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
   assert.equal(diagnostics.visible, true);
   assert.equal(diagnostics.resetCreditCount, 0);
+  assert.equal(diagnostics.resetCreditState, "not-observed");
 
-  harness.runPendingTimeouts();
-  const requestId = harness.sent.at(-1)?.request?.id;
-  assert.ok(requestId);
   harness.window.dispatch("message", {
     data: {
       hostId: "local",
-      type: "mcp-response",
-      message: {
-        id: requestId,
-        result: {
-          rateLimitResetCredits: {
-            credits: [{
-              status: "available",
-              expiresAt: (harness.now() + 10 * 24 * 60 * 60 * 1000) / 1000,
-            }],
-          },
+      type: "mcp-notification",
+      method: "account/rateLimits/updated",
+      params: {
+        rateLimitResetCredits: {
+          credits: [{
+            status: "available",
+            expiresAt: (harness.now() + 10 * 24 * 60 * 60 * 1000) / 1000,
+          }],
         },
       },
     },
@@ -1796,7 +1801,7 @@ test("quota windows and delayed reset credits merge through the same payload pat
   assert.equal(diagnostics.visible, true);
   assert.equal(diagnostics.stale, false);
   assert.equal(diagnostics.resetCreditCount, 1);
-  assert.equal(diagnostics.resetCreditsResolved, true);
+  assert.equal(diagnostics.resetCreditState, "available");
 
   harness.window.dispatch("message", {
     data: {
@@ -1809,24 +1814,27 @@ test("quota windows and delayed reset credits merge through the same payload pat
   diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
   assert.equal(diagnostics.visible, true);
   assert.equal(diagnostics.resetCreditCount, 0);
+  assert.equal(diagnostics.resetCreditState, "empty");
 });
 
-test("unresolved reset credits use bounded startup calibration delays", async () => {
+test("repeated null reset-credit reads never create dedicated polling", async () => {
   const { source } = await assembleRuntimeSource();
   const harness = createRuntimeHarness({ nativeAccountRow: true });
   new vm.Script(source).runInContext(harness.context);
 
   for (let response = 0; response < 4; response += 1) {
+    if (response > 0) {
+      harness.advanceNow(60 * 1000);
+      harness.window.dispatch("focus", {});
+    }
     harness.respondWithWeekly({ resetCredits: null });
-    const expectedPending = response < 3 ? 1 : 0;
-    assert.equal(harness.activeCounts().timeouts, expectedPending);
-    if (expectedPending) harness.runPendingTimeouts();
+    assert.equal(harness.activeCounts().timeouts, 0);
   }
 
   assert.equal(harness.sent.length, 4);
   assert.equal(
-    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditsResolved,
-    false,
+    harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics().resetCreditState,
+    "not-observed",
   );
 });
 

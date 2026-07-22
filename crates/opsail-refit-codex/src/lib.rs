@@ -35,7 +35,7 @@ pub use model::{
     CodexDoctorReport, CodexRefitOperation, CodexRefitReport, CodexRefitStage, CodexRefitState,
     CodexTargetHealth, CodexUpdateReport, DoctorCheck, DoctorCheckState, LaunchPolicy,
     RendererAssetActivation, RendererAssetInfo, RendererAssetSource, RendererAssetUpdatePolicy,
-    SessionMode,
+    ResetCreditState, SessionMode,
 };
 #[cfg(test)]
 use payload::usage_payload;
@@ -1137,7 +1137,9 @@ mod tests {
                 "bridgeAvailable": true,
                 "domAdapterVersion": DOM_ADAPTER_API_VERSION,
                 "dataState": "ready",
-                "visible": true
+                "visible": true,
+                "resetCreditState": "empty",
+                "resetCreditCount": 0
             },
             "hostCount": 1,
             "styleCount": 1,
@@ -1655,6 +1657,40 @@ mod tests {
                 .contains("safe account-row placement")
         );
         session.close().await;
+    }
+
+    #[tokio::test]
+    async fn status_reports_only_observed_reset_credit_state() {
+        let directory = tempdir().unwrap();
+        let state = StateStore::new(directory.path().to_owned());
+        let payload = Arc::new(usage_payload().unwrap());
+        let token = "opsail-refit-codex:reset-credit-observation";
+
+        for (serialized, expected, reported_count, expected_count) in [
+            ("not-observed", ResetCreditState::NotObserved, 0, None),
+            ("empty", ResetCreditState::Empty, 0, Some(0)),
+            ("available", ResetCreditState::Available, 3, Some(3)),
+        ] {
+            let mut status = healthy_renderer_status(&payload, SessionMode::Once, token);
+            status["diagnostics"]["resetCreditState"] = serde_json::json!(serialized);
+            status["diagnostics"]["resetCreditCount"] = serde_json::json!(reported_count);
+            let (cdp, _) = test_cdp_session(status).await;
+            let mut session = CodexSession::new(
+                cdp,
+                DEFAULT_CODEX_DEBUG_PORT,
+                state.clone(),
+                Arc::clone(&payload),
+                token,
+            );
+
+            let health = session.health().await.unwrap();
+            assert!(health.healthy);
+            assert_eq!(health.state, CodexRefitState::Enabled);
+            assert_eq!(health.reset_credit_state, Some(expected));
+            assert_eq!(health.reset_credit_count, expected_count);
+            assert!(health.detail.is_none());
+            session.close().await;
+        }
     }
 
     #[tokio::test]

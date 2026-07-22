@@ -21,11 +21,6 @@
   const LOCALE_BUNDLE = __OPSAIL_REFIT_CODEX_LOCALES_JSON__;
   const installToken = {};
   const usageModel = createOpsailRefitCodexUsageModel(LOCALE_BUNDLE);
-  const RESET_CREDIT_CALIBRATION_DELAYS_MS = [
-    usageModel.NOTIFICATION_CALIBRATION_MS,
-    3_000,
-    8_000,
-  ];
   const codexDom = createOpsailRefitCodexDomAdapter();
   let configuredLocale = null;
   const resolveCopy = () => usageModel.selectLocale(
@@ -54,8 +49,8 @@
     snapshot: null,
     startupCalibrationAttempted: false,
     resetCredits: [],
-    resetCreditsResolved: false,
-    resetCreditCalibrationAttempts: 0,
+    resetCreditState: "not-observed",
+    presentResetCreditCount: 0,
     host: null,
     details: null,
     parts: null,
@@ -572,6 +567,20 @@
     }, delay);
   };
 
+  const refreshResetCreditObservation = (presentCount) => {
+    if (state.resetCreditState === "not-observed") {
+      state.presentResetCreditCount = 0;
+      return;
+    }
+    const count = Number.isInteger(presentCount) && presentCount >= 0
+      ? presentCount
+      : state.resetCredits.filter((credit) => (
+        Number.isFinite(credit?.expiresAt) && credit.expiresAt * 1000 > Date.now()
+      )).length;
+    state.presentResetCreditCount = count;
+    state.resetCreditState = count > 0 ? "available" : "empty";
+  };
+
   const renderResetCredits = () => {
     if (!state.parts) return [];
     const resetCredits = usageModel.presentResetCredits(
@@ -579,6 +588,7 @@
       copy,
       copy.locale,
     );
+    refreshResetCreditObservation(resetCredits.length);
     state.parts.resetCreditSection.hidden = resetCredits.length === 0;
     state.parts.resetCreditSection.setAttribute("aria-label", copy.resetCreditsTitle);
     state.parts.resetCreditTable.setAttribute("aria-label", copy.resetCreditsTitle);
@@ -721,32 +731,19 @@
     onFailure: markReadFailure,
   });
 
-  const mergeResetCredits = (value, scheduleIfUnresolved) => {
+  const mergeResetCredits = (value) => {
     const resetCredits = usageModel.normalizeResetCreditsUpdate(value);
-    if (resetCredits !== null) {
-      state.resetCreditsResolved = true;
-      state.resetCredits = resetCredits;
-      return true;
-    }
-    if (!scheduleIfUnresolved || state.resetCreditsResolved) return false;
-    const delay = RESET_CREDIT_CALIBRATION_DELAYS_MS[
-      state.resetCreditCalibrationAttempts
-    ];
-    if (delay === undefined) return false;
-    state.resetCreditCalibrationAttempts += 1;
-    coordinator.scheduleCalibration(delay);
-    return false;
+    if (resetCredits === null) return false;
+    state.resetCredits = resetCredits;
+    state.resetCreditState = resetCredits.length > 0 ? "available" : "empty";
+    return true;
   };
 
   const mergeUsagePayload = (result, {
     mergeWindows = false,
-    scheduleUnresolvedResetCredits = false,
   } = {}) => {
     const snapshot = usageModel.normalizeSnapshot(result?.rateLimits);
-    const resetCreditsAccepted = mergeResetCredits(
-      result?.rateLimitResetCredits,
-      scheduleUnresolvedResetCredits,
-    );
+    const resetCreditsAccepted = mergeResetCredits(result?.rateLimitResetCredits);
     if (snapshot) {
       state.snapshot = mergeWindows
         ? usageModel.mergeSnapshot(state.snapshot, snapshot)
@@ -791,9 +788,7 @@
           markReadFailure();
           return;
         }
-        if (!mergeUsagePayload(message?.result, {
-          scheduleUnresolvedResetCredits: true,
-        })) {
+        if (!mergeUsagePayload(message?.result)) {
           markReadFailure();
         }
         return;
@@ -1062,29 +1057,32 @@
     showLaunchNotice,
     revision: REVISION,
     version: VERSION,
-    diagnostics: () => ({
-      installed: true,
-      mode: "usage",
-      sessionMode: SESSION_MODE,
-      managerToken: MANAGER_TOKEN,
-      revision: REVISION,
-      domAdapterVersion: codexDom.VERSION,
-      language: copy.locale,
-      hostCount: document.querySelectorAll(`#${USAGE_ID}`).length,
-      styleCount: document.querySelectorAll(`#${STYLE_ID}`).length,
-      detailsCount: document.querySelectorAll(`#${DETAILS_ID}`).length,
-      listenerCount: listeners.length,
-      mutationObserver: Boolean(mutationObserver),
-      resizeObserver: Boolean(resizeObserver),
-      refreshTimer: state.refreshTimer !== null,
-      resetCountdownTimer: state.resetCountdownTimer !== null,
-      bridgeAvailable: typeof window.electronBridge?.sendMessageFromView === "function",
-      dataState: state.status,
-      visible: Boolean(state.hasWindows && state.host?.isConnected && !state.host.hidden),
-      stale: state.status === "stale",
-      resetCreditCount: state.resetCredits.length,
-      resetCreditsResolved: state.resetCreditsResolved,
-    }),
+    diagnostics: () => {
+      refreshResetCreditObservation();
+      return {
+        installed: true,
+        mode: "usage",
+        sessionMode: SESSION_MODE,
+        managerToken: MANAGER_TOKEN,
+        revision: REVISION,
+        domAdapterVersion: codexDom.VERSION,
+        language: copy.locale,
+        hostCount: document.querySelectorAll(`#${USAGE_ID}`).length,
+        styleCount: document.querySelectorAll(`#${STYLE_ID}`).length,
+        detailsCount: document.querySelectorAll(`#${DETAILS_ID}`).length,
+        listenerCount: listeners.length,
+        mutationObserver: Boolean(mutationObserver),
+        resizeObserver: Boolean(resizeObserver),
+        refreshTimer: state.refreshTimer !== null,
+        resetCountdownTimer: state.resetCountdownTimer !== null,
+        bridgeAvailable: typeof window.electronBridge?.sendMessageFromView === "function",
+        dataState: state.status,
+        visible: Boolean(state.hasWindows && state.host?.isConnected && !state.host.hidden),
+        stale: state.status === "stale",
+        resetCreditCount: state.presentResetCreditCount,
+        resetCreditState: state.resetCreditState,
+      };
+    },
     metrics,
   };
   waitForDocument();

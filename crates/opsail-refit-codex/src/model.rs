@@ -66,6 +66,18 @@ pub enum CodexRefitState {
     Stale,
 }
 
+/// What the renderer has explicitly observed about usable reset credits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ResetCreditState {
+    /// No structurally valid reset-credit list has been observed.
+    NotObserved,
+    /// A structurally valid list was observed with no usable credits.
+    Empty,
+    /// A structurally valid list was observed with one or more usable credits.
+    Available,
+}
+
 /// Health information for one validated renderer target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -76,6 +88,10 @@ pub struct CodexTargetHealth {
     pub changed: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_mode: Option<SessionMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_credit_state: Option<ResetCreditState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_credit_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -88,12 +104,28 @@ impl CodexTargetHealth {
             healthy,
             changed: false,
             session_mode: None,
+            reset_credit_state: None,
+            reset_credit_count: None,
             detail: None,
         }
     }
 
     pub(crate) fn with_session_mode(mut self, session_mode: SessionMode) -> Self {
         self.session_mode = Some(session_mode);
+        self
+    }
+
+    pub(crate) fn with_reset_credits(
+        mut self,
+        state: ResetCreditState,
+        count: Option<usize>,
+    ) -> Self {
+        self.reset_credit_state = Some(state);
+        self.reset_credit_count = match state {
+            ResetCreditState::NotObserved => None,
+            ResetCreditState::Empty => Some(0),
+            ResetCreditState::Available => count,
+        };
         self
     }
 

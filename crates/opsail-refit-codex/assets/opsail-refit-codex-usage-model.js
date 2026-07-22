@@ -499,10 +499,7 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
       return true;
     };
 
-    const scheduleCalibration = (delayMs = NOTIFICATION_CALIBRATION_MS) => {
-      const delay = typeof delayMs === "number" && Number.isFinite(delayMs) && delayMs >= 0
-        ? delayMs
-        : NOTIFICATION_CALIBRATION_MS;
+    const scheduleCalibration = () => {
       calibrationPending = true;
       calibrationReady = false;
       if (calibrationTimer !== null) clearTimer(calibrationTimer);
@@ -510,7 +507,7 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
         calibrationTimer = null;
         calibrationReady = true;
         requestCalibration();
-      }, delay);
+      }, NOTIFICATION_CALIBRATION_MS);
     };
 
     const focus = () => now() - lastRequestedAt >= FOCUS_REFRESH_MIN_MS ? request() : null;

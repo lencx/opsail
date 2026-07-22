@@ -5,7 +5,7 @@ use serde::Deserialize;
 use crate::cdp::CdpSession;
 use crate::error::{CodexRefitError, CodexRefitErrorCode};
 use crate::lifecycle::{ManagedSession, SessionFuture};
-use crate::model::{CodexRefitState, CodexTargetHealth, SessionMode};
+use crate::model::{CodexRefitState, CodexTargetHealth, ResetCreditState, SessionMode};
 use crate::payload::UsagePayload;
 use crate::state::{StateStore, TargetRecord};
 
@@ -127,6 +127,14 @@ impl ManagedSession for CodexSession {
                 );
                 if let Some(mode) = detected_mode {
                     health = health.with_session_mode(mode);
+                }
+                if let Some(reset_credit_state) =
+                    diagnostics.and_then(|diagnostics| diagnostics.reset_credit_state)
+                {
+                    health = health.with_reset_credits(
+                        reset_credit_state,
+                        diagnostics.and_then(|diagnostics| diagnostics.reset_credit_count),
+                    );
                 }
                 return Ok(match data_state {
                     Some("unavailable") => health.with_detail(
@@ -309,6 +317,10 @@ pub(super) struct RendererDiagnostics {
     data_state: String,
     #[serde(default)]
     visible: bool,
+    #[serde(default)]
+    reset_credit_state: Option<ResetCreditState>,
+    #[serde(default)]
+    reset_credit_count: Option<usize>,
 }
 
 #[derive(Deserialize)]
