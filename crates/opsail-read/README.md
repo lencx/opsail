@@ -34,7 +34,7 @@ browser path.
 
 ```toml
 [dependencies]
-opsail-read = "0.1"
+opsail-read = "0.2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
