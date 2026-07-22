@@ -9,7 +9,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  # Serialize tag workflows so release-state checks and publication cannot race.
+  group: opsail-release
   cancel-in-progress: false
 
 env:
@@ -22,6 +23,7 @@ jobs:
     timeout-minutes: 20
     outputs:
       rust-version: ${{ steps.versions.outputs.rust-version }}
+      build-matrix: ${{ steps.targets.outputs.build-matrix }}
     steps:
       - name: Check out source
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -36,6 +38,7 @@ jobs:
 
           metadata="$(cargo metadata --locked --no-deps --format-version 1)"
           package_version="$(jq -r '.packages[] | select(.name == "opsail") | .version' <<<"$metadata")"
+          node_version="$(jq -r '.version' packages/node/package.json)"
           rust_version="$(jq -r '.packages[] | select(.name == "opsail") | .rust_version' <<<"$metadata")"
 
           if [[ -z "$package_version" || "$package_version" == "null" ]]; then
@@ -45,6 +48,11 @@ jobs:
 
           if [[ -z "$rust_version" || "$rust_version" == "null" ]]; then
             echo "::error::Unable to read the opsail Rust version"
+            exit 1
+          fi
+
+          if [[ "$node_version" != "$package_version" ]]; then
+            echo "::error::The opsail CLI and npm facade versions must match ($package_version, $node_version)"
             exit 1
           fi
 
@@ -75,28 +83,30 @@ jobs:
       - name: Test
         run: cargo test --workspace --locked
 
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+
+      - name: Generate release target matrix
+        id: targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "build-matrix=$(node packages/node/scripts/print-release-matrix.js)" >>"$GITHUB_OUTPUT"
+
+      - name: Test Node adapter
+        run: npm test --prefix packages/node
+
+      - name: Verify npm package contents
+        run: npm run pack:check --prefix packages/node
+
   build:
     name: Build ${{ matrix.target }}
     needs: verify
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            asset: opsail-aarch64-apple-darwin.tar.gz
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            asset: opsail-x86_64-apple-darwin.tar.gz
-          - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-musl
-            asset: opsail-x86_64-unknown-linux-musl.tar.gz
-          - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            asset: opsail-aarch64-unknown-linux-musl.tar.gz
-          - runner: windows-2025
-            target: x86_64-pc-windows-msvc
-            asset: opsail-x86_64-pc-windows-msvc.zip
+      matrix: ${{ fromJSON(needs.verify.outputs.build-matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     steps:
@@ -115,6 +125,11 @@ jobs:
           rustup toolchain install "$RUST_VERSION" --profile minimal --no-self-update
           rustup default "$RUST_VERSION"
           rustup target add "$TARGET"
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
 
       - name: Install musl toolchain
         if: runner.os == 'Linux'
@@ -145,6 +160,187 @@ jobs:
           & "target/${{ matrix.target }}/release/opsail.exe" --version
           & "target/${{ matrix.target }}/release/opsail.exe" read --help | Out-Null
 
+      # The hosted Ubuntu and Windows arm64 images do not guarantee Chrome.
+      # Their native Opsail binaries are still exercised by the smoke step
+      # above, without downloading a browser at release time.
+      - name: Smoke test Chrome launch
+        if: matrix.target != 'aarch64-unknown-linux-musl' && matrix.target != 'aarch64-pc-windows-msvc'
+        env:
+          OPSAIL_BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require("node:fs");
+          const http = require("node:http");
+          const os = require("node:os");
+          const path = require("node:path");
+          const { spawn } = require("node:child_process");
+
+          const html = `<!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8">
+              <title>Pending browser launch</title>
+              <script>document.title = "Opsail launch smoke";</script>
+            </head>
+            <body><main><article>
+              <h1>Opsail launch smoke</h1>
+              <p>This local fixture verifies that the release binary can discover a preinstalled browser, launch an isolated headless Chrome process, navigate to a loopback URL, and return the rendered document through the read pipeline.</p>
+              <p>The page deliberately contains enough ordinary prose for article extraction while remaining deterministic, private to the runner, and independent of external network availability or third-party content.</p>
+              <p>The expected title is checked after capture so the smoke test covers browser startup, DevTools communication, navigation, HTML capture, extraction, and orderly process cleanup.</p>
+            </article></main></body>
+          </html>`;
+          const server = http.createServer((request, response) => {
+            if (request.url !== "/article") {
+              response.writeHead(404).end();
+              return;
+            }
+            response.writeHead(200, {
+              "connection": "close",
+              "content-type": "text/html; charset=utf-8",
+            });
+            response.end(html);
+          });
+
+          function chromeCandidates() {
+            if (process.platform === "darwin") {
+              return [
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+              ];
+            }
+            if (process.platform === "linux") {
+              return [
+                "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
+                "/usr/bin/chromium",
+                "/usr/bin/chromium-browser",
+              ];
+            }
+            if (process.platform === "win32") {
+              return [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA]
+                .filter(Boolean)
+                .map((root) => path.join(root, "Google", "Chrome", "Application", "chrome.exe"));
+            }
+            return [];
+          }
+
+          function findChrome() {
+            return chromeCandidates().find((candidate) => {
+              try {
+                fs.accessSync(candidate, fs.constants.X_OK);
+                return true;
+              } catch {
+                return false;
+              }
+            });
+          }
+
+          function runOpsail(binary, url, chromeTempRoot) {
+            return new Promise((resolve, reject) => {
+              const child = spawn(
+                binary,
+                ["read", url, "--launch", "--property", "title"],
+                {
+                  env: { ...process.env, OPSAIL_CHROME_TEMP_ROOT: chromeTempRoot },
+                  stdio: ["ignore", "pipe", "pipe"],
+                },
+              );
+              let stdout = "";
+              let stderr = "";
+              child.stdout.setEncoding("utf8");
+              child.stderr.setEncoding("utf8");
+              child.stdout.on("data", (chunk) => {
+                stdout += chunk;
+              });
+              child.stderr.on("data", (chunk) => {
+                stderr += chunk;
+              });
+              child.once("error", reject);
+              child.once("close", (code, signal) => resolve({ code, signal, stdout, stderr }));
+            });
+          }
+
+          function assertNoChromeProfiles(chromeTempRoot) {
+            const profiles = fs
+              .readdirSync(chromeTempRoot)
+              .filter((name) => name.startsWith("opsail-chrome-"));
+            if (profiles.length > 0) {
+              throw new Error(`Chrome launch left temporary profiles behind: ${profiles.join(", ")}`);
+            }
+          }
+
+          async function main() {
+            const chromePath = findChrome();
+            if (!chromePath) {
+              throw new Error("No preinstalled Chrome executable found in a standard location");
+            }
+            console.log(`Using the runner Chrome installation at ${chromePath}`);
+
+            const chromeTempRoot = fs.mkdtempSync(
+              path.join(os.tmpdir(), "opsail-launch-smoke-"),
+            );
+            try {
+              await new Promise((resolve, reject) => {
+                server.once("error", reject);
+                server.listen(0, "127.0.0.1", resolve);
+              });
+              const address = server.address();
+              if (!address || typeof address === "string") {
+                throw new Error("Local smoke-test server did not expose a TCP port");
+              }
+              const result = await runOpsail(
+                process.env.OPSAIL_BINARY,
+                `http://127.0.0.1:${address.port}/article`,
+                chromeTempRoot,
+              );
+              if (result.stderr) {
+                process.stderr.write(result.stderr);
+              }
+              assertNoChromeProfiles(chromeTempRoot);
+              if (result.code !== 0) {
+                throw new Error(
+                  `Chrome launch smoke test exited with code ${result.code ?? `signal ${result.signal}`}`,
+                );
+              }
+              const title = result.stdout.trim();
+              if (title !== "Opsail launch smoke") {
+                throw new Error(`Unexpected title returned by Chrome launch smoke test: ${title}`);
+              }
+            } finally {
+              try {
+                if (server.listening) {
+                  await new Promise((resolve) => server.close(resolve));
+                }
+              } finally {
+                fs.rmSync(chromeTempRoot, {
+                  force: true,
+                  maxRetries: 5,
+                  recursive: true,
+                  retryDelay: 100,
+                });
+              }
+            }
+          }
+
+          main().catch((error) => {
+            console.error(`::error::${error.message}`);
+            process.exitCode = 1;
+          });
+          NODE
+
+      - name: Verify static Linux binary
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          readelf -l "target/${{ matrix.target }}/release/${{ matrix.binary }}" >program-headers.txt
+          if grep -q "Requesting program interpreter" program-headers.txt; then
+            echo "::error::Linux npm binaries must be statically linked"
+            exit 1
+          fi
+
       - name: Package Unix archive
         if: runner.os != 'Windows'
         shell: bash
@@ -166,6 +362,20 @@ jobs:
           Copy-Item LICENSE "dist/$archiveRoot/"
           Compress-Archive -Path "dist/$archiveRoot" -DestinationPath "dist/${{ matrix.asset }}" -CompressionLevel Optimal
 
+      - name: Build npm platform package
+        env:
+          BINARY: target/${{ matrix.target }}/release/${{ matrix.binary }}
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node packages/node/scripts/build-platform-package.js \
+            --target "$TARGET" \
+            --binary "$BINARY" \
+            --output dist/npm-package
+          mkdir -p dist/npm-tarballs
+          npm pack ./dist/npm-package --pack-destination dist/npm-tarballs
+
       - name: Upload archive
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -173,11 +383,66 @@ jobs:
           archive: false
           if-no-files-found: error
 
+      - name: Upload npm platform package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-${{ matrix.target }}
+          path: dist/npm-tarballs/*.tgz
+          if-no-files-found: error
+
+  npm-bundle:
+    name: Assemble npm release bundle
+    needs:
+      - verify
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 20
+
+      - name: Download npm platform packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: npm-*
+          path: dist/npm-platforms
+          merge-multiple: true
+
+      - name: Pack and verify the public npm package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/npm-release
+          cp dist/npm-platforms/*.tgz dist/npm-release/
+          npm pack ./packages/node --pack-destination dist/npm-release
+
+          expected_count="$(node -e 'import("./packages/node/src/platforms.js").then(({ PLATFORM_TARGETS }) => process.stdout.write(String(PLATFORM_TARGETS.length + 1)))')"
+          actual_count="$(find dist/npm-release -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')"
+          if [[ "$actual_count" != "$expected_count" ]]; then
+            echo "::error::Expected $expected_count npm packages, found $actual_count"
+            exit 1
+          fi
+
+      - name: Upload npm release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: npm-release-bundle-${{ github.ref_name }}
+          path: dist/npm-release/*.tgz
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     needs:
       - verify
       - build
+      - npm-bundle
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -214,14 +479,70 @@ jobs:
           )
           publish_args=(--draft=false)
 
+          if ! existing_release="$(
+            gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | [.draft, .prerelease] | @tsv"
+          )"; then
+            echo "::error::Unable to inspect existing GitHub releases"
+            exit 1
+          fi
+
+          existing_release_count="$(printf '%s\n' "$existing_release" | sed '/^$/d' | wc -l | tr -d ' ')"
+          if [[ "$existing_release_count" -gt 1 ]]; then
+            echo "::error::Multiple GitHub releases exist for tag $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+          repair_draft=false
+          if [[ "$existing_release_count" == "1" ]]; then
+            IFS=$'\t' read -r existing_is_draft _ <<<"$existing_release"
+            if [[ "$existing_is_draft" != "true" ]]; then
+              echo "::error::Release $GITHUB_REF_NAME is already published; refusing to replace its assets or metadata"
+              exit 1
+            fi
+            repair_draft=true
+          fi
+
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             create_args+=(--prerelease)
             publish_args+=(--prerelease --latest=false)
           else
-            publish_args+=(--latest)
+            if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Stable releases require a vMAJOR.MINOR.PATCH tag: $GITHUB_REF_NAME"
+              exit 1
+            fi
+
+            if ! published_stable_tags="$(
+              gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+                --jq '.[] | select(.draft == false and .prerelease == false) | .tag_name'
+            )"; then
+              echo "::error::Unable to inspect published stable GitHub releases"
+              exit 1
+            fi
+
+            while IFS= read -r published_tag; do
+              [[ -z "$published_tag" ]] && continue
+              if [[ ! "$published_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                echo "::error::Published stable release has an unsupported tag: $published_tag"
+                exit 1
+              fi
+            done <<<"$published_stable_tags"
+
+            highest_tag="$(
+              printf '%s\n' "$published_stable_tags" "$GITHUB_REF_NAME" \
+                | sed '/^$/d' \
+                | LC_ALL=C sort -V \
+                | tail -n 1
+            )"
+            publish_args+=(--prerelease=false)
+            if [[ "$highest_tag" == "$GITHUB_REF_NAME" ]]; then
+              publish_args+=(--latest)
+            else
+              publish_args+=(--latest=false)
+            fi
           fi
 
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          if [[ "$repair_draft" == "true" ]]; then
             gh release upload "$GITHUB_REF_NAME" dist/* --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" "${create_args[@]}"

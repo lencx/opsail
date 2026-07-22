@@ -1,0 +1,56 @@
+<!-- base-url: https://example.test/notes/two-compilers -->
+<!doctype html>
+<html lang="en">
+  <head><title>Two Compiler Examples</title></head>
+  <body>
+    <article>
+      <h3>A source example</h3>
+      <p>First, inspect the source function:</p>
+      <div class="highlight"><div class="chroma">
+        <table class="lntable"><tbody><tr>
+          <td class="lntd"><pre><code><span class="lnt">1
+</span><span class="lnt">2
+</span><span class="lnt">3
+</span><span class="lnt">4
+</span><span class="lnt">5
+</span><span class="lnt">6
+</span><span class="lnt">7
+</span></code></pre></td>
+          <td class="lntd"><pre><code class="language-cpp" data-lang="cpp"><span class="line">auto process_values(const std::vector&lt;uint8_t&gt; &amp;values)
+</span><span class="line">{
+</span><span class="line">    return std::count_if(
+</span><span class="line">        values.begin(),
+</span><span class="line">        values.end(),
+</span><span class="line">        [](uint8_t value) { return value % 2 == 0; }
+</span><span class="line">    );
+</span><span class="line">}
+</span></code></pre></td>
+        </tr></tbody></table>
+      </div></div>
+
+      <p>Next, compare the generated assembly:</p>
+      <div class="highlight"><div class="chroma">
+        <table class="lntable"><tbody><tr>
+          <td class="lntd"><pre><code><span class="lnt">1
+</span><span class="lnt">2
+</span><span class="lnt">3
+</span><span class="lnt">4
+</span><span class="lnt">5
+</span><span class="lnt">6
+</span><span class="lnt">7
+</span></code></pre></td>
+          <td class="lntd"><pre><code class="language-nasm" data-lang="nasm"><span class="line">process_values:
+</span><span class="line">    vpbroadcastb xmm1, byte ptr [rip + .mask]
+</span><span class="line">    vmovd xmm2, dword ptr [rsi + rax]
+</span><span class="line">    vpandn xmm2, xmm2, xmm1
+</span><span class="line">    add rax, 4
+</span><span class="line">    cmp r8, rax
+</span><span class="line">    jne .loop
+</span></code></pre></td>
+        </tr></tbody></table>
+      </div></div>
+
+      <p>The two listings describe the same operation at different levels.</p>
+    </article>
+  </body>
+</html>

@@ -221,3 +221,206 @@ fn keeps_short_cjk_content_via_semantic_fallback() {
     assert_eq!(result.content.lines().next(), Some("# 山谷雨讯"));
     assert_markdown_matches_golden(&result, "06-short-cjk-main.md");
 }
+
+#[test]
+fn recovers_lazy_and_noscript_images() {
+    let result = fixture(
+        "07-lazy-images.html",
+        "https://example.test/guides/read/index.html",
+    );
+
+    for image in [
+        "https://example.test/guides/read/images/pipeline-large.webp",
+        "https://example.test/guides/media/deferred-map.png",
+        "https://example.test/gallery/first.jpg",
+        "https://example.test/gallery/second.jpg",
+        "https://example.test/assets/static-fallback.svg",
+    ] {
+        assert!(
+            result.content.contains(image),
+            "missing recovered image: {image}"
+        );
+    }
+    for loader_detail in ["data-src", "data:image", "<noscript"] {
+        assert!(
+            !result.content_html.contains(loader_detail),
+            "loader detail survived: {loader_detail}"
+        );
+    }
+    assert_markdown_matches_golden(&result, "07-lazy-images.md");
+}
+
+#[test]
+fn normalizes_highlighted_code_without_line_numbers() {
+    let result = fixture(
+        "08-highlighted-code.html",
+        "https://example.test/guides/code-layouts",
+    );
+
+    assert!(result.content.contains("```rust\nfn total"));
+    assert!(result.content.contains("```python\ndef greet"));
+    assert!(result.content.contains("values.iter().sum()"));
+    assert!(result.content.contains("return f\"Hello, {name}\""));
+    for gutter_text in ["10def greet", "11    return", "| ```"] {
+        assert!(
+            !result.content.contains(gutter_text),
+            "code gutter survived: {gutter_text}"
+        );
+    }
+    assert_markdown_matches_golden(&result, "08-highlighted-code.md");
+}
+
+#[test]
+fn keeps_prose_around_multiple_highlighted_code_blocks() {
+    let result = fixture(
+        "09-multiple-code-blocks.html",
+        "https://example.test/notes/two-compilers",
+    );
+
+    for value in [
+        "First, inspect the source function",
+        "auto process_values",
+        "Next, compare the generated assembly",
+        "vpandn xmm2",
+        "same operation",
+    ] {
+        assert!(result.content.contains(value), "missing content: {value}");
+    }
+    assert_markdown_matches_golden(&result, "09-multiple-code-blocks.md");
+}
+
+#[test]
+fn reveals_the_script_initialized_wechat_article_body() {
+    let result = fixture(
+        "10-wechat-hidden-content.html",
+        "https://mp.weixin.qq.com/s/random-fixture",
+    );
+
+    for value in [
+        "蓝色杯子、三张空白卡片",
+        "纸风车转了两圈",
+        "橘子、折尺、旧信封",
+        "潮湿、方格、慢速和北边",
+        "https://mp.weixin.qq.com/images/random-placeholder.png",
+    ] {
+        assert!(
+            result.content.contains(value),
+            "missing WeChat content: {value}"
+        );
+    }
+    assert!(!result.content.contains("环境异常"));
+    assert_markdown_matches_golden(&result, "10-wechat-hidden-content.md");
+
+    let unrelated_origin = fixture(
+        "10-wechat-hidden-content.html",
+        "https://example.test/copied-markup",
+    );
+    assert!(
+        !unrelated_origin.content.contains("蓝色杯子、三张空白卡片"),
+        "script-hidden content must remain hidden outside the WeChat origin"
+    );
+}
+
+#[test]
+fn recovers_a_hidden_semantic_root_when_visible_extraction_is_thin() {
+    let result = fixture(
+        "11-hidden-semantic-root.html",
+        "https://example.test/fragments/random-doorplate",
+    );
+
+    for value in [
+        "桌角放着一枚绿色棋子",
+        "十二号抽屉里依次装着玻璃珠",
+        "used hidden-content fallback",
+    ] {
+        let haystack = if value.starts_with("used ") {
+            result.warnings.join("\n")
+        } else {
+            result.content.clone()
+        };
+        assert!(haystack.contains(value), "missing recovered value: {value}");
+    }
+    for noise in [
+        "FPS: --",
+        "RANDOM FOOTER",
+        "NESTED_HIDDEN_TEXT_MUST_NOT_APPEAR",
+        "SCRIPT_TEXT_MUST_NOT_APPEAR",
+        "FORM_CONTROL_MUST_NOT_APPEAR",
+    ] {
+        assert!(
+            !result.content.contains(noise),
+            "page noise survived: {noise}"
+        );
+    }
+    assert_markdown_matches_golden(&result, "11-hidden-semantic-root.md");
+}
+
+#[test]
+fn does_not_recover_hidden_content_when_visible_article_is_substantial() {
+    let base_url = Url::parse("https://example.test/visible-article").unwrap();
+    let html = r#"<!doctype html><html><head><title>Visible article</title></head><body>
+        <main><article>
+          <h1>Visible article</h1>
+          <p>The visible article contains enough ordinary prose to be selected without consulting hidden alternatives. It describes a wooden tray, two paper clips, a folded map, and a numbered card on a quiet desk.</p>
+          <p>A second visible paragraph adds enough structure for a normal article while remaining unrelated to the concealed test material beside it.</p>
+        </article></main>
+        <section aria-hidden="true"><article><h1>HIDDEN_PROMPT_MUST_NOT_APPEAR</h1>
+          <p>HIDDEN_PROMPT_MUST_NOT_APPEAR repeated inside a longer concealed article-shaped block that must never replace an already substantial visible result.</p>
+          <p>HIDDEN_PROMPT_MUST_NOT_APPEAR remains excluded even when this alternative contains more raw characters than the ordinary visible article.</p>
+        </article></section>
+      </body></html>"#;
+
+    let result = extract_html(html, Some(&base_url)).unwrap();
+
+    assert!(result.content.contains("wooden tray"));
+    assert!(!result.content.contains("HIDDEN_PROMPT_MUST_NOT_APPEAR"));
+}
+
+#[test]
+fn does_not_recover_hidden_promotional_content_from_a_thin_page() {
+    let base_url = Url::parse("https://example.test/thin-note").unwrap();
+    let html = r#"<!doctype html><html><head><title>Thin note</title></head><body>
+        <main><p>A short visible note.</p></main>
+        <section class="advertisement" aria-hidden="true">
+          <h1>HIDDEN_ADVERTISEMENT_MUST_NOT_APPEAR</h1>
+          <p>This concealed promotional block deliberately contains long article-shaped prose, several ordinary sentences, and enough characters to look richer than the visible note.</p>
+          <p>It must remain excluded because an advertisement marker is stronger evidence than its length or paragraph structure.</p>
+        </section>
+        <section class="modal" aria-hidden="true"><article>
+          <h1>HIDDEN_MODAL_MUST_NOT_APPEAR</h1>
+          <p>This concealed modal also contains long article-shaped prose and multiple meaningful blocks, but its user-interface role makes it an unsafe recovery candidate.</p>
+          <p>It must remain excluded even when the ordinary visible result is short and no advertisement candidate is eligible.</p>
+        </article></section>
+      </body></html>"#;
+
+    let result = extract_html(html, Some(&base_url)).unwrap();
+
+    assert!(result.content.contains("A short visible note"));
+    assert!(
+        !result
+            .content
+            .contains("HIDDEN_ADVERTISEMENT_MUST_NOT_APPEAR")
+    );
+    assert!(!result.content.contains("HIDDEN_MODAL_MUST_NOT_APPEAR"));
+}
+
+#[test]
+fn css_custom_properties_do_not_hide_visible_content() {
+    let base_url = Url::parse("https://example.test/custom-properties").unwrap();
+    let html = r#"<!doctype html><html><head><title>Custom properties</title></head><body>
+        <main style="--footer-display: none; --panel-visibility: hidden">
+          <h1>Custom properties</h1>
+          <p>VISIBLE_CUSTOM_PROPERTY_CONTENT remains readable because CSS custom property names are not the display or visibility properties themselves.</p>
+        </main>
+      </body></html>"#;
+
+    let result = extract_html(html, Some(&base_url)).unwrap();
+
+    assert!(
+        result
+            .content
+            .contains("remains readable because CSS custom property"),
+        "unexpected content: {}",
+        result.content
+    );
+}

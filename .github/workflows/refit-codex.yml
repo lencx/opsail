@@ -1,0 +1,78 @@
+name: Refit Codex native checks
+
+on:
+  pull_request:
+    paths:
+      - ".github/scripts/refit-codex-smoke.mjs"
+      - ".github/workflows/refit-codex.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/opsail/**"
+      - "crates/opsail-refit-codex/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/scripts/refit-codex-smoke.mjs"
+      - ".github/workflows/refit-codex.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/opsail/**"
+      - "crates/opsail-refit-codex/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refit-codex-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  native:
+    name: Native checks on ${{ matrix.runner }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-15
+          - ubuntu-24.04
+          - windows-11-arm
+          - windows-2025
+    steps:
+      - name: Check out source
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          rust_version="$(sed -n 's/^rust-version = "\([^"]*\)"/\1/p' Cargo.toml)"
+          if [[ -z "$rust_version" ]]; then
+            echo "::error::Unable to read the workspace Rust version"
+            exit 1
+          fi
+          rustup toolchain install "$rust_version" --profile minimal --no-self-update
+          rustup default "$rust_version"
+          rustup component add clippy
+
+      - name: Test refit and CLI
+        run: cargo test --locked --package opsail-refit-codex --package opsail
+
+      - name: Lint refit and CLI
+        run: cargo clippy --locked --package opsail-refit-codex --package opsail --all-targets --all-features -- -D warnings
+
+      - name: Build native CLI
+        run: cargo build --locked --package opsail
+
+      - name: Smoke test refit CLI
+        env:
+          OPSAIL_BINARY: ${{ github.workspace }}/target/debug/opsail${{ runner.os == 'Windows' && '.exe' || '' }}
+        run: node .github/scripts/refit-codex-smoke.mjs

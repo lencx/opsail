@@ -4,147 +4,88 @@
 
 <h1 align="center">Opsail</h1>
 
+<p align="center"><strong>Native tools that agents can rely on.</strong></p>
+
 <p align="center">
   English | <a href="https://github.com/lencx/opsail/blob/main/README.zh-CN.md">简体中文</a>
 </p>
 
-Opsail is a modular Rust CLI for small, composable actions used by software agents. Its first action, `read`, turns static HTML from an HTTP(S) URL, a local file, or standard input into readable Markdown, sanitized HTML, or versioned JSON.
+<a href="https://www.buymeacoffee.com/lencx" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" alt="Buy Me A Coffee" style="height: 40px !important;width: 145px !important;" ></a>
 
-Opsail extracts the HTML it receives; it does not execute JavaScript, maintain a browser session, authenticate to sites, crawl links, or interact with pages.
+Opsail is a modular native toolkit that gives software agents small, composable, and reliable capabilities through one command-line entry point. Its Rust crates keep acquisition, browser control, content extraction, and application-specific refits behind explicit boundaries, while the Node.js package makes the same native runtime easy to embed.
 
-<table>
-  <thead>
-    <tr>
-      <th width="180">Crate</th>
-      <th width="180">Version</th>
-      <th>Description</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td width="180"><a href="https://crates.io/crates/opsail"><code>opsail</code></a></td>
-      <td width="180"><a href="https://crates.io/crates/opsail"><img src="https://img.shields.io/crates/v/opsail" alt="crates.io version"></a></td>
-      <td>Agent action CLI and unified command entry point</td>
-    </tr>
-    <tr>
-      <td width="180"><a href="https://crates.io/crates/opsail-read"><code>opsail-read</code></a></td>
-      <td width="180"><a href="https://crates.io/crates/opsail-read"><img src="https://img.shields.io/crates/v/opsail-read" alt="crates.io version"></a></td>
-      <td>Extracts clean Markdown, sanitized HTML, and structured JSON from static HTML</td>
-    </tr>
-  </tbody>
-</table>
+## Core characteristics
 
-## Installation
+- **Native and predictable.** Long-running work, process ownership, transport, validation, and cleanup are implemented in Rust rather than shell scripts or proxy services.
+- **Small composable capabilities.** Each package owns one clear boundary and can be used independently or through the `opsail` CLI.
+- **Agent-ready contracts.** Commands expose stable output, structured diagnostics, bounded resource use, and quiet failure modes suitable for automation.
+- **Explicit trust boundaries.** Borrowed browsers, owned processes, remote content, and application refits are validated according to their actual ownership and security model.
+- **Reversible by design.** Refit features are target-validated, idempotent, and removable without modifying the target application bundle.
 
-### Prebuilt binaries
+## Core capabilities
 
-On macOS or Linux:
+### Read HTML
+
+`opsail read` turns static HTML or a browser-rendered DOM into readable Markdown, sanitized HTML, or versioned JSON. It accepts URLs, files, stdin, an Opsail-owned isolated Chrome process, or an explicitly borrowed CDP endpoint.
 
 ```sh
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.sh | sh
+opsail read https://example.com/article
+opsail read https://example.com/app --launch
 ```
 
-On Windows, run in PowerShell:
+See [`opsail-read`](crates/opsail-read/README.md) for acquisition, extraction, result contracts, and Rust APIs. See [`opsail-chrome`](crates/opsail-chrome/README.md) for Chrome discovery, owned launch, borrowed CDP, navigation, and rendered DOM capture.
 
-```powershell
-irm -UseBasicParsing https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.ps1 | iex
+### Refit Codex
+
+`opsail refit codex` provides a reversible, target-validated Codex adapter. Its first feature adds localized remaining-usage information to the Codex sidebar using the renderer's existing local bridge, without model calls or changes to the application bundle.
+
+![refit-codex](assets/refit-codex.png)
+
+The refit target is implemented for the signed macOS application and the current-user Microsoft Store application on Windows; Linux is not supported. Windows release targets are x64 and ARM64; no 32-bit x86/ia32 artifact is provided. Opsail resolves the exact package family and AUMID, derives the application executable from the installed signed manifest (currently `app\ChatGPT.exe`), and protects its Local AppData state with an explicit current-user-and-SYSTEM DACL. Native CI and npm packaging targets are configured for both Windows architectures. A Windows 11 ARM64 canary against the installed Store application validates package activation, listener ownership, renderer discovery, bridge injection, persistence, and cleanup; a real installed-application x64 canary remains pending, while hosted CI covers the no-installed-package path.
+
+```sh
+opsail refit codex enable usage --launch
 ```
 
-The installers detect the platform, verify the SHA-256 checksum, and install to `~/.local/bin`. Windows adds that directory to the user `PATH`; on macOS and Linux, the installer prints PATH setup guidance when needed.
+Persistent mode starts a validated background manager and returns after its health report; `--once` remains ephemeral and `--foreground` is available for diagnostics.
 
-Manual downloads:
+Interactive waits show their current validated lifecycle stage on `stderr`, while the final machine-readable JSON remains isolated on `stdout`.
 
-- macOS: [Apple Silicon](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-apple-darwin.tar.gz) · [Intel](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-apple-darwin.tar.gz)
-- Linux: [x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-unknown-linux-musl.tar.gz) · [ARM64](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-unknown-linux-musl.tar.gz)
-- Windows: [x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-pc-windows-msvc.zip)
-- [SHA-256 checksums](https://github.com/lencx/opsail/releases/latest/download/SHA256SUMS)
+See [`opsail-refit-codex`](crates/opsail-refit-codex/README.md) for supported targets, attach and launch modes, lifecycle semantics, renderer updates, localization, security checks, and library APIs.
 
-### Cargo
+## Packages
 
-Opsail requires Rust 1.97 or newer when installed from crates.io:
+| Package | Responsibility | Documentation |
+| --- | --- | --- |
+| [`opsail`](https://crates.io/crates/opsail) | Native CLI and unified command entry point | Run `opsail --help` |
+| [`opsail-read`](https://crates.io/crates/opsail-read) | Content acquisition, extraction, sanitization, and result contracts | [README](crates/opsail-read/README.md) |
+| [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | Cross-platform Chrome lifecycle, CDP transport, and rendered capture | [README](crates/opsail-chrome/README.md) |
+| [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Validated Codex refit lifecycle, usage semantics, localization, and UI payload | [README](crates/opsail-refit-codex/README.md) |
+| [`opsail`](https://www.npmjs.com/package/opsail) for Node.js | ESM API and native binary distribution | [README](packages/node/README.md) |
+
+## Install
+
+Install the CLI from crates.io:
 
 ```sh
 cargo install opsail
 ```
 
-Verify the installation:
+Install the Node.js API and CLI from npm:
 
 ```sh
-opsail --version
+npm install opsail
 ```
 
-## Read HTML
+Prebuilt native binaries are available from [GitHub Releases](https://github.com/lencx/opsail/releases/latest). Agent hosts can use the reviewed [`bootstrap-opsail` Skill](skills/bootstrap-opsail/SKILL.md) to reconcile the CLI and runtime Skill with explicit approval.
 
-Markdown is the default output:
+## Project documentation
 
-```sh
-opsail read https://example.com/article
-opsail read ./article.html
-opsail read - < article.html
-```
-
-Choose another representation, resolve relative links for non-URL input, project one field, or write the result to a file:
-
-```sh
-opsail read ./article.html --format html --output cleaned.html
-opsail read - --base-url https://example.com/articles/ < article.html
-opsail read ./article.html --format json
-opsail read ./article.html --property title
-```
-
-`extract` is a visible alias for `read`. Run `opsail read --help` for request headers, timeout, byte-limit, and output options.
-
-### Output contract
-
-Data is written to stdout, or to `--output PATH`. Diagnostics and extraction warnings are written to stderr, so stdout remains safe to pipe. Every successful representation ends with a newline. A downstream closed pipe is treated as a successful termination.
-
-| Exit code | Meaning |
-| --- | --- |
-| `0` | Successful command, help, or version output |
-| `1` | Acquisition, extraction, serialization, or write failure |
-| `2` | Invalid command-line usage |
-
-`--format json` emits schema version `1` with these top-level fields:
-
-```text
-schemaVersion
-content
-contentHtml
-metadata
-source
-extraction
-quality
-warnings
-```
-
-`content` is Markdown and `contentHtml` is sanitized HTML. Metadata includes the title and, when available, author, description, site, publication timestamps, image, favicon, language, direction, canonical URL, and domain. Source, extraction, and quality objects record provenance and useful confidence signals.
-
-`--property` accepts:
-
-```text
-content, markdown, contentHtml, html, title, author, description, site,
-published, modified, image, favicon, language, direction, url, canonicalUrl, domain,
-wordCount, quality, source, extraction
-```
-
-With `--format json`, a projected property is valid JSON. With Markdown or HTML format, scalar properties are plain text and structured properties are pretty-printed JSON.
-
-### Defaults and limits
-
-- Maximum input: 5 MiB; override with a positive `--max-bytes` value.
-- Maximum parsed DOM: 50,000 elements and 256 nesting levels.
-- HTTP(S) timeouts: 5 seconds to connect and 15 seconds overall; `--timeout` overrides the overall timeout.
-- Redirect limit: 10.
-- URL input and `--base-url` must use HTTP(S) and cannot contain embedded username/password credentials.
-- Character decoding considers a BOM, HTTP charset, HTML metadata, UTF-8 validity, then a Windows-1252 fallback.
-- A fetched body must look like HTML. If a media type is declared, it must be HTML or a tolerated generic text/binary type.
-- File input must be a regular file. Its links remain relative unless `--base-url` is supplied. URL input resolves links against the final response URL.
-
-The byte and DOM limits bound common resource-exhaustion paths; they are not a security sandbox. URL fetching can reach destinations allowed by the host network and honors the system proxy. Treat extracted text and links as untrusted, and enforce network, filesystem, and downstream execution policy in the embedding agent.
-
-## Contributing
-
-Development setup, module boundaries, testing rules, and verification commands are documented in [CONTRIBUTING.md](https://github.com/lencx/opsail/blob/main/CONTRIBUTING.md).
+- [Content extraction and result model](crates/opsail-read/README.md)
+- [Chrome and CDP integration](crates/opsail-chrome/README.md)
+- [Codex sidebar refit](crates/opsail-refit-codex/README.md)
+- [Node.js API and packaging](packages/node/README.md)
+- [Development and contribution guide](CONTRIBUTING.md)
 
 ## License
 

@@ -1,5 +1,6 @@
 #!/bin/sh
 
+# Canonical Opsail installer shared by the README and bootstrap Skill.
 set -eu
 
 fail() {
@@ -11,10 +12,13 @@ for command_name in awk chmod curl install mkdir mktemp rm tar uname; do
   command -v "$command_name" >/dev/null 2>&1 || fail "required command not found: $command_name"
 done
 
-: "${HOME:?opsail installer: HOME is not set}"
-
 version="${OPSAIL_VERSION:-latest}"
-install_dir="${OPSAIL_INSTALL_DIR:-$HOME/.local/bin}"
+if [ -n "${OPSAIL_INSTALL_DIR:-}" ]; then
+  install_dir="$OPSAIL_INSTALL_DIR"
+else
+  : "${HOME:?opsail installer: HOME is not set}"
+  install_dir="$HOME/.local/bin"
+fi
 
 case "$install_dir" in
   /*) ;;
@@ -132,12 +136,40 @@ binary_path="$temp_dir/opsail-$target/opsail"
 [ -f "$binary_path" ] || fail "downloaded archive does not contain opsail"
 
 chmod 755 "$binary_path"
-if ! installed_version="$("$binary_path" --version)"; then
+if ! downloaded_version="$("$binary_path" --version)"; then
   fail "downloaded opsail binary could not be executed"
+fi
+
+case "$downloaded_version" in
+  "opsail "?*) reported_version="${downloaded_version#opsail }" ;;
+  *) fail "downloaded opsail returned malformed version output: $downloaded_version" ;;
+esac
+
+case "$reported_version" in
+  *[!0-9A-Za-z.+_-]*)
+    fail "downloaded opsail returned malformed version output: $downloaded_version"
+    ;;
+esac
+
+if [ "$version" != "latest" ]; then
+  case "$version" in
+    v*) expected_version="${version#v}" ;;
+    *) expected_version="$version" ;;
+  esac
+
+  [ "$reported_version" = "$expected_version" ] ||
+    fail "downloaded opsail version mismatch: expected $expected_version, found $reported_version"
 fi
 
 mkdir -p "$install_dir"
 install -m 755 "$binary_path" "$install_dir/opsail"
+
+if ! installed_version="$("$install_dir/opsail" --version)"; then
+  fail "installed opsail binary could not be executed"
+fi
+
+[ "$installed_version" = "$downloaded_version" ] ||
+  fail "installed opsail version mismatch: expected $downloaded_version, found $installed_version"
 
 printf '%s\n' "$installed_version"
 printf 'Installed opsail to %s/opsail\n' "$install_dir"

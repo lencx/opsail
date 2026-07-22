@@ -3,7 +3,7 @@ use std::time::Duration;
 use opsail_read::{Input, ReadError, ReadOptions, SourceKind, read};
 use tempfile::tempdir;
 use url::Url;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const HTML: &str = "<!doctype html><html><head><title>Local note</title></head><body><main><p>A readable local note for acquisition tests.</p></main></body></html>";
@@ -165,6 +165,31 @@ async fn follows_redirects_and_decodes_declared_charsets() {
 }
 
 #[tokio::test]
+async fn sends_the_configured_user_agent() {
+    let server = MockServer::start().await;
+    let user_agent = "opsail-integration-test/1.0";
+    Mock::given(method("GET"))
+        .and(path("/article"))
+        .and(header("user-agent", user_agent))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/html")
+                .set_body_string(HTML),
+        )
+        .mount(&server)
+        .await;
+    let options = ReadOptions {
+        user_agent: Some(user_agent.to_owned()),
+        ..ReadOptions::default()
+    };
+
+    let url = Url::parse(&format!("{}/article", server.uri())).unwrap();
+    let result = read(Input::Url(url), &options).await.unwrap();
+
+    assert!(result.content.contains("A readable local note"));
+}
+
+#[tokio::test]
 async fn rejects_non_html_content_types_before_extraction() {
     let server = MockServer::start().await;
     Mock::given(method("GET"))
@@ -281,4 +306,192 @@ async fn rejects_redirect_targets_with_embedded_credentials_without_leaking_them
     assert!(matches!(error, ReadError::Request { .. }));
     assert!(!diagnostic.contains("reader"));
     assert!(!diagnostic.contains("redirect-secret"));
+}
+
+#[tokio::test]
+async fn maps_a_cloudflare_challenge_response_to_verification_required() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/cloudflare-challenge"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("cf-mitigated", "challenge")
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html><body>Cloudflare challenge</body></html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let requested = Url::parse(&format!(
+        "{}/cloudflare-challenge?token=request-secret#verification",
+        server.uri()
+    ))
+    .unwrap();
+    let expected_url = format!("{}/cloudflare-challenge", server.uri());
+
+    let error = read(Input::Url(requested), &ReadOptions::default())
+        .await
+        .unwrap_err();
+    let diagnostic = format!("{error:?}");
+
+    assert!(matches!(
+        &error,
+        ReadError::VerificationRequired { url } if url == &expected_url
+    ));
+    assert!(!diagnostic.contains("request-secret"));
+    assert!(!diagnostic.contains("#verification"));
+}
+
+#[tokio::test]
+async fn maps_an_aws_waf_challenge_response_to_verification_required() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/aws-waf-challenge"))
+        .respond_with(
+            ResponseTemplate::new(202)
+                .insert_header("x-amzn-waf-action", "challenge")
+                .insert_header("content-type", "text/html")
+                .set_body_string(HTML),
+        )
+        .mount(&server)
+        .await;
+
+    let requested = Url::parse(&format!("{}/aws-waf-challenge", server.uri())).unwrap();
+    let error = read(Input::Url(requested), &ReadOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ReadError::VerificationRequired { .. }));
+}
+
+#[tokio::test]
+async fn maps_an_aws_waf_captcha_response_to_verification_required() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/aws-waf-captcha"))
+        .respond_with(
+            ResponseTemplate::new(405)
+                .insert_header("x-amzn-waf-action", "captcha")
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html><body>AWS WAF CAPTCHA</body></html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let requested = Url::parse(&format!("{}/aws-waf-captcha", server.uri())).unwrap();
+    let error = read(Input::Url(requested), &ReadOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ReadError::VerificationRequired { .. }));
+}
+
+#[tokio::test]
+async fn does_not_treat_an_aws_waf_header_with_the_wrong_status_as_verification() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/aws-waf-mismatched-status"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("x-amzn-waf-action", "challenge")
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html><body>Forbidden</body></html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let requested = Url::parse(&format!("{}/aws-waf-mismatched-status", server.uri())).unwrap();
+    let expected_url = requested.to_string();
+    let error = read(Input::Url(requested), &ReadOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ReadError::HttpStatus { url, status } if url == expected_url && status == 403
+    ));
+}
+
+#[tokio::test]
+async fn keeps_an_ordinary_forbidden_response_as_an_http_status_error() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/forbidden"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("content-type", "text/html")
+                .set_body_string("<html><body>Forbidden</body></html>"),
+        )
+        .mount(&server)
+        .await;
+
+    let requested = Url::parse(&format!("{}/forbidden", server.uri())).unwrap();
+    let expected_url = requested.to_string();
+    let error = read(Input::Url(requested), &ReadOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ReadError::HttpStatus { url, status } if url == expected_url && status == 403
+    ));
+}
+
+#[tokio::test]
+async fn inspects_a_bounded_html_error_body_for_structural_verification() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/structural-challenge"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("content-type", "text/html")
+                .set_body_string(
+                    r#"<!doctype html><html><body>
+                      <form id="challenge-form" action="/?__cf_chl_rt_tk=secret"></form>
+                      <script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script>
+                    </body></html>"#,
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    let requested = Url::parse(&format!("{}/structural-challenge", server.uri())).unwrap();
+    let error = read(Input::Url(requested), &ReadOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, ReadError::VerificationRequired { .. }));
+}
+
+#[tokio::test]
+async fn embedded_captcha_on_an_ordinary_error_page_remains_an_http_status() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/login"))
+        .respond_with(
+            ResponseTemplate::new(403)
+                .insert_header("content-type", "text/html")
+                .set_body_string(
+                    r#"<!doctype html><html><body><main>
+                      <h1>Sign in</h1><p>Use the form below to access your account.</p>
+                      <form action="/session" method="post">
+                        <input name="email"><div class="g-recaptcha" data-sitekey="public-key"></div>
+                      </form>
+                      <script src="https://www.google.com/recaptcha/api.js"></script>
+                    </main></body></html>"#,
+                ),
+        )
+        .mount(&server)
+        .await;
+
+    let requested = Url::parse(&format!("{}/login", server.uri())).unwrap();
+    let expected_url = requested.to_string();
+    let error = read(Input::Url(requested), &ReadOptions::default())
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ReadError::HttpStatus { url, status } if url == expected_url && status == 403
+    ));
 }

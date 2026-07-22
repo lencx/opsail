@@ -1,150 +1,91 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/lencx/opsail/main/assets/opsail-logo.png" alt="Opsail Logo" width="160">
+  <img src="https://raw.githubusercontent.com/lencx/opsail/main/assets/opsail-logo.png" alt="Opsail 标志" width="160">
 </p>
 
 <h1 align="center">Opsail</h1>
+
+<p align="center"><strong>让 Agent 可以信赖的原生工具。</strong></p>
 
 <p align="center">
   <a href="https://github.com/lencx/opsail/blob/main/README.md">English</a> | 简体中文
 </p>
 
-Opsail 是一个模块化 Rust CLI，为软件 Agent 提供小型、可组合的行动能力。首个行动 `read` 可将 HTTP(S) URL、本地文件或标准输入中的静态 HTML 转换为可阅读的 Markdown、清洗后的 HTML 或带版本号的 JSON。
+<a href="https://www.buymeacoffee.com/lencx" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-blue.png" alt="Buy Me A Coffee" style="height: 40px !important;width: 145px !important;" ></a>
 
-Opsail 只提取接收到的 HTML；它不会执行 JavaScript、维护浏览器会话、登录网站、抓取链接或与页面交互。
+Opsail 是一个模块化原生工具集，通过统一的命令行入口，为软件 Agent 提供小而可组合、行为可靠的能力。它使用职责清晰的 Rust crate 隔离内容获取、浏览器控制、正文提取和应用适配，并通过 Node.js 包方便地嵌入同一套原生运行时。
 
-<table>
-  <thead>
-    <tr>
-      <th width="180">Crate</th>
-      <th width="180">版本</th>
-      <th>描述</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td width="180"><a href="https://crates.io/crates/opsail"><code>opsail</code></a></td>
-      <td width="180"><a href="https://crates.io/crates/opsail"><img src="https://img.shields.io/crates/v/opsail" alt="crates.io 版本"></a></td>
-      <td>面向 Agent 行动的 CLI 与统一命令入口</td>
-    </tr>
-    <tr>
-      <td width="180"><a href="https://crates.io/crates/opsail-read"><code>opsail-read</code></a></td>
-      <td width="180"><a href="https://crates.io/crates/opsail-read"><img src="https://img.shields.io/crates/v/opsail-read" alt="crates.io 版本"></a></td>
-      <td>从静态 HTML 中提取干净的 Markdown、清洗后的 HTML 和结构化 JSON</td>
-    </tr>
-  </tbody>
-</table>
+## 核心特色
+
+- **原生且可预测**：长期运行、进程归属、传输、校验和清理均由 Rust 实现，不依赖 shell 脚本或代理服务作为主引擎。
+- **能力小而可组合**：每个包只负责一个清晰边界，既可以独立使用，也可以通过 `opsail` CLI 统一调用。
+- **面向 Agent 的契约**：命令提供稳定输出、结构化诊断、受控资源占用和适合自动化的安静失败模式。
+- **明确的信任边界**：对借用的浏览器、自有进程、远程内容和应用适配，按照各自真实的所有权与安全模型进行校验。
+- **默认可逆**：Refit 功能会验证目标，支持幂等执行和完整移除，不修改目标应用包。
+
+## 核心能力
+
+### 读取 HTML
+
+`opsail read` 可以将静态 HTML 或浏览器渲染后的 DOM 转换为易读的 Markdown、经过清理的 HTML 或带版本的 JSON。输入可以来自 URL、文件、stdin、由 Opsail 启动的隔离 Chrome，或显式借用的 CDP 端点。
+
+```sh
+opsail read https://example.com/article
+opsail read https://example.com/app --launch
+```
+
+内容获取、正文提取、结果契约和 Rust API 请参阅 [`opsail-read`](crates/opsail-read/README.md)；Chrome 发现、自有启动、借用 CDP、页面导航和渲染 DOM 捕获请参阅 [`opsail-chrome`](crates/opsail-chrome/README.md)。
+
+### Codex Refit
+
+`opsail refit codex` 提供可逆且经过目标校验的 Codex 适配器。它的首个功能通过 renderer 已有的本地 bridge，在 Codex 左侧栏显示本地化的剩余额度信息，不调用模型，也不修改应用包。
+
+![refit-codex](assets/refit-codex.png)
+
+Refit 目标已实现对签名 macOS 应用和 Windows 当前用户 Microsoft Store 应用的支持；Linux 不支持。Windows 发布目标为 x64 和 ARM64，不提供 32 位 x86/ia32 产物。Windows 实现使用精确的包家族名和 AUMID 定位应用，从已安装的签名 manifest 中解析可执行文件（当前为 `app\ChatGPT.exe`），并使用仅授权当前用户和 SYSTEM 的显式 DACL 保护 Local AppData 状态。Windows x64 和 ARM64 都已配置原生 CI 与 npm 打包目标；已在 Windows 11 ARM64 的 Store 应用上完成包激活、端口归属、renderer 发现、bridge 注入、持久模式与清理的端到端验证，真实 x64 Store 应用 canary 仍待完成，托管 CI 覆盖未安装目标包的路径。
+
+```sh
+opsail refit codex enable usage --launch
+```
+
+默认 persistent 模式会启动经过校验的后台 manager，并在输出健康报告后返回；`--once` 仍是单次注入，诊断时可显式使用 `--foreground`。
+
+交互式等待会在 `stderr` 中显示当前经过校验的生命周期阶段，最终供程序读取的 JSON 仍只写入 `stdout`。
+
+支持目标、附加与启动模式、生命周期语义、renderer 更新、多语言、安全校验和库 API 请参阅 [`opsail-refit-codex`](crates/opsail-refit-codex/README.md)。
+
+## 包结构
+
+| 包 | 职责 | 文档 |
+| --- | --- | --- |
+| [`opsail`](https://crates.io/crates/opsail) | 原生 CLI 与统一命令入口 | 运行 `opsail --help` |
+| [`opsail-read`](https://crates.io/crates/opsail-read) | 内容获取、正文提取、清理和结果契约 | [README](crates/opsail-read/README.md) |
+| [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | 跨平台 Chrome 生命周期、CDP 传输和渲染捕获 | [README](crates/opsail-chrome/README.md) |
+| [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Codex 适配生命周期、额度语义、多语言和 UI payload | [README](crates/opsail-refit-codex/README.md) |
+| Node.js [`opsail`](https://www.npmjs.com/package/opsail) | ESM API 与原生二进制分发 | [README](packages/node/README.md) |
 
 ## 安装
 
-### 预编译二进制
-
-在 macOS 或 Linux 上运行：
-
-```sh
-curl --proto '=https' --proto-redir '=https' --tlsv1.2 -LsSf https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.sh | sh
-```
-
-在 Windows 上，使用 PowerShell 运行：
-
-```powershell
-irm -UseBasicParsing https://raw.githubusercontent.com/lencx/opsail/main/scripts/install.ps1 | iex
-```
-
-安装器会自动识别平台、验证 SHA-256 校验和，并安装到 `~/.local/bin`。Windows 会自动将该目录加入用户 `PATH`；macOS 和 Linux 在需要时会输出 PATH 配置提示。
-
-手动下载：
-
-- macOS：[Apple Silicon](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-apple-darwin.tar.gz) · [Intel](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-apple-darwin.tar.gz)
-- Linux：[x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-unknown-linux-musl.tar.gz) · [ARM64](https://github.com/lencx/opsail/releases/latest/download/opsail-aarch64-unknown-linux-musl.tar.gz)
-- Windows：[x86_64](https://github.com/lencx/opsail/releases/latest/download/opsail-x86_64-pc-windows-msvc.zip)
-- [SHA-256 校验文件](https://github.com/lencx/opsail/releases/latest/download/SHA256SUMS)
-
-### Cargo
-
-通过 crates.io 安装时，Opsail 需要 Rust 1.97 或更高版本：
+从 crates.io 安装 CLI：
 
 ```sh
 cargo install opsail
 ```
 
-验证安装：
+从 npm 安装 Node.js API 和 CLI：
 
 ```sh
-opsail --version
+npm install opsail
 ```
 
-## 读取 HTML
+预编译原生二进制可从 [GitHub Releases](https://github.com/lencx/opsail/releases/latest) 下载。Agent 宿主可以在明确授权后，使用经过审阅的 [`bootstrap-opsail` Skill](skills/bootstrap-opsail/SKILL.md) 同步 CLI 和运行时 Skill。
 
-默认输出 Markdown：
+## 项目文档
 
-```sh
-opsail read https://example.com/article
-opsail read ./article.html
-opsail read - < article.html
-```
-
-可以选择其他输出形式、为非 URL 输入解析相对链接、投影单个字段，或将结果写入文件：
-
-```sh
-opsail read ./article.html --format html --output cleaned.html
-opsail read - --base-url https://example.com/articles/ < article.html
-opsail read ./article.html --format json
-opsail read ./article.html --property title
-```
-
-`extract` 是 `read` 的可见别名。运行 `opsail read --help` 可查看请求头、超时、字节限制和输出选项。
-
-### 输出契约
-
-数据写入 stdout，或写入 `--output PATH` 指定的文件。诊断和提取警告写入 stderr，因此 stdout 可以安全地通过管道传递。每个成功结果都以换行符结尾；下游提前关闭管道会被视为正常结束。
-
-| 退出码 | 含义 |
-| --- | --- |
-| `0` | 命令成功，或成功输出帮助/版本信息 |
-| `1` | 获取、提取、序列化或写入失败 |
-| `2` | 命令行用法无效 |
-
-`--format json` 输出 schema 版本 `1`，包含以下顶层字段：
-
-```text
-schemaVersion
-content
-contentHtml
-metadata
-source
-extraction
-quality
-warnings
-```
-
-`content` 是 Markdown，`contentHtml` 是清洗后的 HTML。元数据包含标题，以及可用时的作者、描述、站点、发布时间、图片、图标、语言、文字方向、规范 URL 和域名。`source`、`extraction` 和 `quality` 对象记录来源、提取过程和质量信号。
-
-`--property` 接受：
-
-```text
-content, markdown, contentHtml, html, title, author, description, site,
-published, modified, image, favicon, language, direction, url, canonicalUrl, domain,
-wordCount, quality, source, extraction
-```
-
-使用 `--format json` 时，投影字段输出合法 JSON；使用 Markdown 或 HTML 格式时，标量字段输出纯文本，结构化字段输出格式化 JSON。
-
-### 默认值与限制
-
-- 最大输入为 5 MiB，可通过正数 `--max-bytes` 覆盖。
-- 解析后的 DOM 最多包含 50,000 个元素，嵌套深度最多为 256 层。
-- HTTP(S) 连接超时为 5 秒，总超时为 15 秒；`--timeout` 可覆盖总超时。
-- 最多跟随 10 次重定向。
-- URL 输入和 `--base-url` 必须使用 HTTP(S)，且不能包含用户名/密码凭据。
-- 字符解码依次考虑 BOM、HTTP charset、HTML 元数据、UTF-8 有效性，最后回退到 Windows-1252。
-- 获取的响应体必须表现为 HTML；如果声明了媒体类型，则必须是 HTML 或允许的通用文本/二进制类型。
-- 文件输入必须是普通文件。除非提供 `--base-url`，文件中的链接会保持相对形式；URL 输入则以重定向后的最终 URL 解析链接。
-
-字节和 DOM 限制可约束常见的资源耗尽路径，但它们不是安全沙箱。URL 获取能够访问宿主网络允许的目标，并遵循系统代理设置。提取出的文本和链接都应视为不可信数据；嵌入 Agent 时，应另行实施网络、文件系统和下游执行策略。
-
-## 参与贡献
-
-开发环境、模块边界、测试规则与验证命令见 [CONTRIBUTING.zh-CN.md](https://github.com/lencx/opsail/blob/main/CONTRIBUTING.zh-CN.md)。
+- [内容提取与结果模型](crates/opsail-read/README.md)
+- [Chrome 与 CDP 集成](crates/opsail-chrome/README.md)
+- [Codex 左侧栏 Refit](crates/opsail-refit-codex/README.md)
+- [Node.js API 与打包](packages/node/README.md)
+- [开发与贡献指南](CONTRIBUTING.md)
 
 ## 许可证
 

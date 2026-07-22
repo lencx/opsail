@@ -1,7 +1,7 @@
 [package]
 name = "opsail"
-description = "Composable actions for software agents"
-version.workspace = true
+description = "Native tools that agents can rely on"
+version = "0.2.0"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -15,8 +15,12 @@ path = "src/main.rs"
 
 [dependencies]
 clap.workspace = true
+indicatif.workspace = true
+libc.workspace = true
 miette.workspace = true
-opsail-read = { path = "../opsail-read", version = "0.1.0" }
+opsail-read = { path = "../opsail-read", version = "0.2.0" }
+opsail-refit-codex = { path = "../opsail-refit-codex", version = "0.1.0" }
+serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
