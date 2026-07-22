@@ -1,18 +1,36 @@
 {
   "locale": "zh-CN",
   "usageTitle": "使用额度",
-  "summaryItem": "{label} {remaining}%",
+  "summaryItem": "{label}剩余 {remaining}%",
   "remaining": "剩余 {remaining}%",
   "used": "已用 {used}%",
-  "reset": "{time} 重置",
+  "resetRelative": "{relative}后重置",
+  "resetAbsolute": "{date} {weekday} · {time}（本地时间）",
+  "resetSoon": "即将重置",
   "ariaSummary": "使用额度：{summary}",
   "ariaProgress": "{label}剩余 {remaining}%",
+  "ariaMeta": "已用 {used}%。{time} 重置",
   "stale": "刷新失败，当前显示上次成功读取的额度",
+  "relativeUnits": {
+    "day": "天",
+    "hour": "小时",
+    "minute": "分钟",
+    "separator": ""
+  },
   "windowLabels": {
     "fiveHours": "5 小时",
     "weekly": "每周",
     "daily": "每日",
     "monthly": "每月",
+    "hours": "{value} 小时",
+    "minutes": "{value} 分钟",
+    "generic": "额度"
+  },
+  "summaryWindowLabels": {
+    "fiveHours": "5 小时",
+    "weekly": "周",
+    "daily": "日",
+    "monthly": "月",
     "hours": "{value} 小时",
     "minutes": "{value} 分钟",
     "generic": "额度"

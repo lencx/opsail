@@ -20,6 +20,22 @@
   left: var(--opsail-refit-usage-left, 0);
 }
 
+#opsail-refit-codex-usage[data-opsail-refit-codex-layout="measuring"] {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: max-content;
+  max-width: none;
+  pointer-events: none;
+}
+
+#opsail-refit-codex-usage[data-opsail-refit-codex-layout="inline"] {
+  flex: 0 1 auto;
+  min-width: 36px;
+  max-width: var(--opsail-refit-usage-inline-max-width, 112px);
+  overflow: hidden;
+}
+
 #opsail-refit-codex-usage[hidden],
 .opsail-refit-codex-usage-row[hidden] {
   display: none !important;
@@ -40,7 +56,7 @@
   font-weight: 550;
   letter-spacing: 0;
   line-height: 16px;
-  text-overflow: clip;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

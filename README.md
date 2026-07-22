@@ -96,6 +96,8 @@ Agent hosts such as OpenClaw, Hermes Agent, Claude Code, and Codex persist only 
 
 `opsail-refit-codex` adds a reversible remaining-usage capsule to the account row in the Codex sidebar. It reads only through the renderer's existing local account bridge, derives labels from the actual rate-limit window durations, and loads user-facing copy from embedded locale JSON. It does not make model calls or external account requests.
 
+Codex-native DOM discovery and layout measurement are centralized in a versioned JavaScript adapter asset shared by probe, early bootstrap, and runtime. The Opsail Skill documents how to repair that adapter from current UI evidence, test it, and rebuild the binary; installed binaries never hot-load user-writable JavaScript.
+
 The adapter currently supports only the signed macOS application at `/Applications/ChatGPT.app` and only a CDP endpoint bound to `127.0.0.1`. Opsail validates the bundle identifier, signing team, code signature, process ownership and ancestry, renderer URL and shell, sidebar structure, and bridge capability before injection. Normal enable is attach-only. An explicit `--launch` may start a confirmed-stopped application once through Rust's process API; Opsail never quits, kills, restarts, reloads, modifies, or re-signs ChatGPT.
 
 ```sh
@@ -112,7 +114,7 @@ opsail refit codex disable usage
 
 The public default port is `55321`; `--port PORT` overrides it, while discovery and launch remain fixed to `127.0.0.1`. The current implementation does not automatically select another port when the default is occupied. The default `persistent`/managed enable command prints its initial report and remains in the foreground so renderer reloads can be recovered without another service or listening port. `--once` is ephemeral: it validates and injects the current document, confirms health, closes CDP, and exits. It does not survive a hard reload, renderer reconstruction, or application restart. Disable can stop the validated Opsail manager before cleanup, but never stops ChatGPT.
 
-See the [Codex refit guide](crates/opsail-refit-codex/README.md) for launch and manual attach flows, lifecycle guarantees, refresh behavior, localization, and library APIs.
+See the [Codex refit guide](crates/opsail-refit-codex/README.md) for launch and manual attach flows, lifecycle guarantees, DOM adapter maintenance and packaging, refresh behavior, localization, and library APIs.
 
 ## Installation
 

@@ -1,6 +1,6 @@
 ---
 name: opsail
-description: Use the Opsail native CLI for reliable agent capabilities, including readable-content extraction and the target-validated Codex sidebar usage refit.
+description: Use the Opsail native CLI for readable-content extraction and the target-validated Codex sidebar usage refit, including source-backed DOM adapter repair when the Codex UI changes.
 license: Apache-2.0
 compatibility: Requires Opsail 0.1.0 and terminal execution.
 metadata: {"author":"Opsail contributors","version":"0.1.0","homepage":"https://github.com/lencx/opsail","openclaw":{"emoji":"⛵","homepage":"https://github.com/lencx/opsail","requires":{"bins":["opsail"]},"install":[{"id":"node","kind":"node","package":"opsail@0.1.0","bins":["opsail"],"label":"Install Opsail (npm)"}]},"hermes":{"tags":["opsail","native-tools","content-extraction","markdown","agents"]}}
@@ -151,6 +151,36 @@ opsail refit codex disable usage
 ```
 
 The public default port is `55321`; `--port PORT` overrides it when the user selected another unprivileged `127.0.0.1` CDP port. The current implementation does not automatically choose a replacement when the default is occupied. Do not guess ports or connect to any other host. The feature reads only through the renderer's existing local account bridge and does not invoke a model or contact an external account service. If validation, bridge discovery, or selector checks fail, report the structured diagnostic and leave the native interface untouched; do not attempt recovery by quitting or restarting the application. `doctor`, `status`, and `disable` never launch it.
+
+## Codex refit: repair the DOM adapter
+
+Use this source-maintenance workflow only when the user asks to repair the refit after a Codex UI change and an Opsail repository checkout is available. Installed binaries cannot be hot-patched. The single source of native DOM knowledge is:
+
+```text
+crates/opsail-refit-codex/assets/opsail-refit-codex-dom-adapter.js
+```
+
+Read that file before proposing a change. Also read the renderer assets in the same directory, `crates/opsail-refit-codex/src/payload.rs`, and `packages/node/test/opsail-refit-codex-usage.test.js`. The adapter owns native shell/sidebar selectors, account-row discovery, geometry measurement, and mutation relevance. The probe, early bootstrap, and usage runtime must share it; do not duplicate native selectors or renderer script bodies in Rust.
+
+Require evidence from the current UI: a user-provided screenshot, a bounded redacted DOM fixture, or an already-authorized inspection of a validated local renderer. Never infer a selector only from a class name in old source. Never launch, quit, kill, restart, or reload ChatGPT to collect evidence. Do not capture text content, input values, account identifiers, credentials, full renderer payloads, or unrelated conversation DOM. If safe current evidence is unavailable, report that blocker and request a bounded artifact instead of guessing.
+
+Prefer the smallest adapter-only change. Preserve `createOpsailRefitCodexDomAdapter()` and its existing returned API. Keep `VERSION` unchanged for selector or heuristic changes; change the adapter API version only with matching Rust validation and tests. Do not alter application identity checks, loopback policy, bridge method names, rate-limit semantics, Opsail-owned DOM IDs/classes, or CDP lifecycle unless the user separately requests that scope. Do not add network, model, dynamic-code-loading, or persistent user-script behavior.
+
+After editing, prove that native DOM knowledge remains centralized and that every assembled JavaScript expression parses:
+
+```sh
+node --test packages/node/test/opsail-refit-codex-usage.test.js
+cargo test --locked -p opsail-refit-codex
+cargo clippy --locked -p opsail-refit-codex --all-targets -- -D warnings
+```
+
+Then rebuild the self-contained executable; the JavaScript is compiled into the binary and is not read from a user-writable runtime directory:
+
+```sh
+cargo build --locked --release -p opsail
+```
+
+Report the evidence used, the exact adapter behavior changed, the checks run, and that the rebuilt binary must replace the installed one. Do not run `enable`, add `--launch`, or perform a real GUI injection unless the user separately asks for that validation.
 
 ## Safety boundaries
 

@@ -113,6 +113,19 @@ test("bootstrap is independently versioned and runtime matches the public packag
   assert.match(opsailSkill, /opsail refit codex disable usage/);
   assert.match(opsailSkill, /never quit, kill, restart, reload, modify, or re-sign ChatGPT/);
   assert.match(opsailSkill, /public default port is `55321`/);
+  assert.match(opsailSkill, /repair the DOM adapter/i);
+  assert.match(opsailSkill, /opsail-refit-codex-dom-adapter\.js/);
+  assert.match(opsailSkill, /Require evidence from the current UI/);
+  assert.match(opsailSkill, /Installed binaries cannot be hot-patched/);
+  assert.match(
+    opsailSkill,
+    /Never launch, quit, kill, restart, or reload ChatGPT to collect evidence/,
+  );
+  assert.match(
+    opsailSkill,
+    /node --test packages\/node\/test\/opsail-refit-codex-usage\.test\.js/,
+  );
+  assert.match(opsailSkill, /cargo build --locked --release -p opsail/);
 });
 
 test("README and release workflow keep one installer source", async () => {

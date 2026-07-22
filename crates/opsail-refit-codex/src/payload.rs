@@ -6,22 +6,34 @@ use crate::error::{CodexRefitError, CodexRefitErrorCode};
 use crate::model::SessionMode;
 
 const MODEL_SOURCE: &str = include_str!("../assets/opsail-refit-codex-usage-model.js");
+const DOM_ADAPTER_SOURCE: &str = include_str!("../assets/opsail-refit-codex-dom-adapter.js");
+const RENDERER_PROBE_TEMPLATE: &str =
+    include_str!("../assets/opsail-refit-codex-renderer-probe.js");
+const EARLY_TEMPLATE: &str = include_str!("../assets/opsail-refit-codex-usage-early.js");
 const RUNTIME_TEMPLATE: &str = include_str!("../assets/opsail-refit-codex-usage-runtime.js");
+const STATUS_TEMPLATE: &str = include_str!("../assets/opsail-refit-codex-usage-status.js");
+const DISABLE_SOURCE: &str = include_str!("../assets/opsail-refit-codex-usage-disable.js");
 const CSS_SOURCE: &str = include_str!("../assets/opsail-refit-codex-usage.css");
 const EN_LOCALE: &str = include_str!("../assets/locales/en.json");
 const ZH_CN_LOCALE: &str = include_str!("../assets/locales/zh-CN.json");
 
 const MODEL_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_MODEL_SOURCE__";
+const DOM_ADAPTER_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__";
 const VERSION_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_VERSION_JSON__";
 const REVISION_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_REVISION_JSON__";
 const CSS_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_CSS_JSON__";
 const LOCALES_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_LOCALES_JSON__";
 const SESSION_MODE_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_SESSION_MODE_JSON__";
 const MANAGER_TOKEN_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_MANAGER_TOKEN_JSON__";
+const EARLY_REVISION_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_EARLY_REVISION_JSON__";
+const CURRENT_PAYLOAD_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_CURRENT_PAYLOAD__";
+const STATUS_REVISION_PLACEHOLDER: &str = "__OPSAIL_REFIT_CODEX_STATUS_REVISION_JSON__";
 
 #[derive(Clone)]
 pub(crate) struct UsagePayload {
     current_template: String,
+    early_template: String,
+    renderer_probe: String,
     pub revision: String,
 }
 
@@ -37,10 +49,20 @@ impl UsagePayload {
     }
 
     pub fn early(&self, manager_token: &str) -> String {
-        early_expression(
-            &self.current(SessionMode::Persistent, manager_token),
-            &self.revision,
-        )
+        self.early_template
+            .replace(EARLY_REVISION_PLACEHOLDER, &json_string(&self.revision))
+            .replace(
+                CURRENT_PAYLOAD_PLACEHOLDER,
+                &self.current(SessionMode::Persistent, manager_token),
+            )
+    }
+
+    pub fn renderer_probe(&self) -> &str {
+        &self.renderer_probe
+    }
+
+    pub fn status(&self) -> String {
+        STATUS_TEMPLATE.replace(STATUS_REVISION_PLACEHOLDER, &json_string(&self.revision))
     }
 }
 
@@ -53,56 +75,8 @@ pub(crate) fn usage_payload() -> Result<UsagePayload, CodexRefitError> {
         .map_err(|message| CodexRefitError::new(CodexRefitErrorCode::InjectionFailed, message))
 }
 
-pub(crate) fn status_expression() -> String {
-    let revision = json_string(&payload_revision());
-    format!(
-        r##"(() => {{
-          const runtime = window.__OPSAIL_REFIT_CODEX_STATE__;
-          let diagnostics = null;
-          try {{ diagnostics = runtime?.diagnostics?.() ?? null; }} catch {{}}
-          return {{
-            installed: Boolean(runtime && runtime.mode === "usage"),
-            revision: runtime?.revision ?? null,
-            expectedRevision: {revision},
-            diagnostics,
-            hostCount: document.querySelectorAll("#opsail-refit-codex-usage").length,
-            styleCount: document.querySelectorAll("#opsail-refit-codex-usage-style").length,
-            detailsCount: document.querySelectorAll("#opsail-refit-codex-usage-details").length
-          }};
-        }})()"##
-    )
-}
-
-pub(crate) fn renderer_probe_expression() -> &'static str {
-    r#"(() => ({
-      appProtocol: location.protocol === "app:",
-      shell: Boolean(document.querySelector("main.main-surface")),
-      sidebar: Boolean(document.querySelector(
-        "aside.app-shell-left-panel, aside[data-testid='app-shell-floating-left-panel']"
-      )),
-      bridge: typeof window.electronBridge?.sendMessageFromView === "function"
-    }))()"#
-}
-
 pub(crate) fn disable_expression() -> &'static str {
-    r#"(() => {
-      window.__OPSAIL_REFIT_CODEX_DISABLED__ = true;
-      window.__OPSAIL_REFIT_CODEX_EARLY_GENERATION__ = `disabled:${Date.now()}`;
-      try { window.__OPSAIL_REFIT_CODEX_EARLY_STATE__?.cleanup?.(); } catch {}
-      try { window.__OPSAIL_REFIT_CODEX_STATE__?.cleanup?.(); } catch {}
-      document.getElementById("opsail-refit-codex-usage")?.remove();
-      document.getElementById("opsail-refit-codex-usage-details")?.remove();
-      document.getElementById("opsail-refit-codex-usage-style")?.remove();
-      document.documentElement?.classList.remove("opsail-refit-codex-usage-enabled");
-      delete window.__OPSAIL_REFIT_CODEX_STATE__;
-      delete window.__OPSAIL_REFIT_CODEX_EARLY_STATE__;
-      return {
-        clean: !document.getElementById("opsail-refit-codex-usage")
-          && !document.getElementById("opsail-refit-codex-usage-details")
-          && !document.getElementById("opsail-refit-codex-usage-style")
-          && !window.__OPSAIL_REFIT_CODEX_STATE__
-      };
-    })()"#
+    DISABLE_SOURCE
 }
 
 fn build_payload() -> Result<UsagePayload, String> {
@@ -121,12 +95,14 @@ fn build_payload() -> Result<UsagePayload, String> {
     let revision = payload_revision();
     let current_template = RUNTIME_TEMPLATE
         .replace(MODEL_PLACEHOLDER, MODEL_SOURCE)
+        .replace(DOM_ADAPTER_PLACEHOLDER, DOM_ADAPTER_SOURCE)
         .replace(VERSION_PLACEHOLDER, &json_string(env!("CARGO_PKG_VERSION")))
         .replace(REVISION_PLACEHOLDER, &json_string(&revision))
         .replace(CSS_PLACEHOLDER, &json_string(CSS_SOURCE))
         .replace(LOCALES_PLACEHOLDER, &locales.to_string());
     for placeholder in [
         MODEL_PLACEHOLDER,
+        DOM_ADAPTER_PLACEHOLDER,
         VERSION_PLACEHOLDER,
         REVISION_PLACEHOLDER,
         CSS_PLACEHOLDER,
@@ -141,64 +117,39 @@ fn build_payload() -> Result<UsagePayload, String> {
     {
         return Err("renderer payload is missing its session metadata placeholders".to_owned());
     }
+    let renderer_probe =
+        RENDERER_PROBE_TEMPLATE.replace(DOM_ADAPTER_PLACEHOLDER, DOM_ADAPTER_SOURCE);
+    if renderer_probe.contains(DOM_ADAPTER_PLACEHOLDER) {
+        return Err("renderer probe contains an unresolved DOM adapter placeholder".to_owned());
+    }
+    let early_template = EARLY_TEMPLATE.replace(DOM_ADAPTER_PLACEHOLDER, DOM_ADAPTER_SOURCE);
+    if early_template.contains(DOM_ADAPTER_PLACEHOLDER)
+        || !early_template.contains(EARLY_REVISION_PLACEHOLDER)
+        || !early_template.contains(CURRENT_PAYLOAD_PLACEHOLDER)
+    {
+        return Err("early renderer payload has invalid placeholders".to_owned());
+    }
+    if !STATUS_TEMPLATE.contains(STATUS_REVISION_PLACEHOLDER) {
+        return Err("renderer status payload is missing its revision placeholder".to_owned());
+    }
     Ok(UsagePayload {
         current_template,
+        early_template,
+        renderer_probe,
         revision,
     })
-}
-
-fn early_expression(payload: &str, revision: &str) -> String {
-    let revision = json_string(revision);
-    format!(
-        r#"(() => {{
-          const STATE_KEY = "__OPSAIL_REFIT_CODEX_EARLY_STATE__";
-          const GENERATION_KEY = "__OPSAIL_REFIT_CODEX_EARLY_GENERATION__";
-          const generation = {revision};
-          const installToken = {{}};
-          try {{ window[STATE_KEY]?.cleanup?.(); }} catch {{}}
-          window[GENERATION_KEY] = generation;
-          let observer = null;
-          let timeout = null;
-          const cleanup = () => {{
-            if (window[STATE_KEY]?.installToken !== installToken) return false;
-            observer?.disconnect();
-            observer = null;
-            if (timeout !== null) clearTimeout(timeout);
-            timeout = null;
-            delete window[STATE_KEY];
-            return true;
-          }};
-          const install = () => {{
-            if (window[GENERATION_KEY] !== generation) {{ cleanup(); return true; }}
-            if (!document.documentElement) return false;
-            if (location.protocol !== "app:") {{ cleanup(); return true; }}
-            const bridge = typeof window.electronBridge?.sendMessageFromView === "function";
-            const shell = Boolean(document.querySelector("main.main-surface"));
-            const sidebar = Boolean(document.querySelector(
-              "aside.app-shell-left-panel, aside[data-testid='app-shell-floating-left-panel']"
-            ));
-            if (!bridge || !shell || !sidebar) return false;
-            cleanup();
-            {payload};
-            return true;
-          }};
-          window[STATE_KEY] = {{ cleanup, installToken }};
-          if (!install()) {{
-            if (typeof MutationObserver === "function" && document.documentElement) {{
-              observer = new MutationObserver(install);
-              observer.observe(document.documentElement, {{ childList: true, subtree: true }});
-            }}
-            timeout = setTimeout(cleanup, 30000);
-          }}
-        }})()"#
-    )
 }
 
 fn payload_revision() -> String {
     let mut hash = 0xcbf29ce484222325u64;
     for byte in MODEL_SOURCE
         .bytes()
+        .chain(DOM_ADAPTER_SOURCE.bytes())
+        .chain(RENDERER_PROBE_TEMPLATE.bytes())
+        .chain(EARLY_TEMPLATE.bytes())
         .chain(RUNTIME_TEMPLATE.bytes())
+        .chain(STATUS_TEMPLATE.bytes())
+        .chain(DISABLE_SOURCE.bytes())
         .chain(CSS_SOURCE.bytes())
         .chain(EN_LOCALE.bytes())
         .chain(ZH_CN_LOCALE.bytes())
@@ -287,27 +238,75 @@ mod tests {
         assert!(current.contains("account/rateLimits/read"));
         assert!(current.contains("account/rateLimits/updated"));
         assert!(current.contains("__OPSAIL_REFIT_CODEX_STATE__"));
+        assert!(current.contains("createOpsailRefitCodexDomAdapter"));
         assert!(current.contains("\"once\""));
         assert!(current.contains("\"test-token\""));
         assert!(!current.contains("__OPSAIL_REFIT_CODEX_MODEL_SOURCE__"));
+        assert!(!current.contains(DOM_ADAPTER_PLACEHOLDER));
         let early = payload.early("managed-token");
         assert!(early.contains(&payload.revision));
         assert!(early.contains("\"persistent\""));
+        assert!(early.contains("createOpsailRefitCodexDomAdapter"));
+        assert!(!early.contains(EARLY_REVISION_PLACEHOLDER));
+        assert!(!early.contains(CURRENT_PAYLOAD_PLACEHOLDER));
+        assert!(
+            payload
+                .renderer_probe()
+                .contains("createOpsailRefitCodexDomAdapter")
+        );
+        assert!(!payload.renderer_probe().contains(DOM_ADAPTER_PLACEHOLDER));
+        let status = payload.status();
+        assert!(status.contains(&payload.revision));
+        assert!(!status.contains(STATUS_REVISION_PLACEHOLDER));
+        assert!(disable_expression().contains("__OPSAIL_REFIT_CODEX_DISABLED__"));
+    }
+
+    #[test]
+    fn native_dom_knowledge_is_centralized_in_the_adapter_asset() {
+        assert!(DOM_ADAPTER_SOURCE.contains("const SELECTORS"));
+        assert!(DOM_ADAPTER_SOURCE.contains("measureNativeLayout"));
+        assert!(DOM_ADAPTER_SOURCE.contains("nodeMayAffectLayout"));
+        assert!(DOM_ADAPTER_SOURCE.contains("const VERSION = 1"));
+        for source in [
+            MODEL_SOURCE,
+            RUNTIME_TEMPLATE,
+            RENDERER_PROBE_TEMPLATE,
+            EARLY_TEMPLATE,
+            STATUS_TEMPLATE,
+            DISABLE_SOURCE,
+        ] {
+            for native_marker in [
+                ["app", "shell", "left", "panel"].join("-"),
+                ["main", "main-surface"].join("."),
+            ] {
+                assert!(!source.contains(&native_marker));
+            }
+        }
     }
 
     #[test]
     fn renderer_assets_do_not_define_network_or_model_calls() {
         let payload = usage_payload().unwrap();
-        let current = payload.current(SessionMode::Once, "test-token");
+        let sources = [
+            payload.current(SessionMode::Once, "test-token"),
+            payload.early("test-token"),
+            payload.renderer_probe().to_owned(),
+            payload.status(),
+            disable_expression().to_owned(),
+        ];
         for forbidden in [
             "fetch(",
             "XMLHttpRequest",
             "WebSocket(",
+            "eval(",
+            "new Function",
             "/v1/",
             "responses.create",
             "chat.completions",
         ] {
-            assert!(!current.contains(forbidden), "found {forbidden}");
+            for source in &sources {
+                assert!(!source.contains(forbidden), "found {forbidden}");
+            }
         }
     }
 

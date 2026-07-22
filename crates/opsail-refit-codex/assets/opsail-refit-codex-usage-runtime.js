@@ -1,5 +1,6 @@
 (() => {
   __OPSAIL_REFIT_CODEX_MODEL_SOURCE__
+  __OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__
 
   const STATE_KEY = "__OPSAIL_REFIT_CODEX_STATE__";
   const DISABLED_KEY = "__OPSAIL_REFIT_CODEX_DISABLED__";
@@ -8,9 +9,6 @@
   const DETAILS_ID = "opsail-refit-codex-usage-details";
   const ROOT_CLASS = "opsail-refit-codex-usage-enabled";
   const HOST_ID = "local";
-  const SIDEBAR_SELECTOR = "aside.app-shell-left-panel, aside[data-testid='app-shell-floating-left-panel']";
-  const AVATAR_SELECTOR = "img, [data-testid*='avatar' i], [class*='avatar' i]";
-  const ACTION_SELECTOR = "button, [role='button']";
   const VERSION = __OPSAIL_REFIT_CODEX_VERSION_JSON__;
   const REVISION = __OPSAIL_REFIT_CODEX_REVISION_JSON__;
   const SESSION_MODE = __OPSAIL_REFIT_CODEX_SESSION_MODE_JSON__;
@@ -19,13 +17,15 @@
   const LOCALE_BUNDLE = __OPSAIL_REFIT_CODEX_LOCALES_JSON__;
   const installToken = {};
   const usageModel = createOpsailRefitCodexUsageModel(LOCALE_BUNDLE);
-  const copy = usageModel.selectLocale(
-    document.documentElement?.lang,
-    typeof navigator === "object" ? navigator.language : "",
-  );
-  const systemLocale = typeof navigator === "object" && navigator.language
-    ? navigator.language
-    : document.documentElement?.lang;
+  const codexDom = createOpsailRefitCodexDomAdapter();
+  const resolveCopy = () => usageModel.selectLocale(...codexDom.languageCandidates());
+  let copy = resolveCopy();
+  const syncLocale = () => {
+    const nextCopy = resolveCopy();
+    if (nextCopy === copy) return false;
+    copy = nextCopy;
+    return true;
+  };
 
   try { window[STATE_KEY]?.cleanup?.(); } catch {}
   document.getElementById(USAGE_ID)?.remove();
@@ -80,99 +80,6 @@
     }
   };
 
-  const elementRect = (element) => {
-    try {
-      const rect = element?.getBoundingClientRect?.();
-      if (!rect) return null;
-      const values = [rect.left, rect.top, rect.right, rect.bottom, rect.width, rect.height].map(Number);
-      if (!values.every(Number.isFinite)) return null;
-      return {
-        left: values[0],
-        top: values[1],
-        right: values[2],
-        bottom: values[3],
-        width: values[4],
-        height: values[5],
-        centerX: values[0] + values[4] / 2,
-        centerY: values[1] + values[5] / 2,
-      };
-    } catch {
-      return null;
-    }
-  };
-
-  const queryRects = (root, selector) => {
-    try {
-      return [...(root?.querySelectorAll?.(selector) || [])]
-        .map((element) => ({ element, rect: elementRect(element) }))
-        .filter((entry) => entry.rect);
-    } catch {
-      return [];
-    }
-  };
-
-  const nearestCommonAncestor = (left, right) => {
-    if (!left || !right) return null;
-    const ancestors = new Set();
-    for (let current = left; current; current = current.parentElement) ancestors.add(current);
-    for (let current = right; current; current = current.parentElement) {
-      if (ancestors.has(current)) return current;
-    }
-    return null;
-  };
-
-  const directChildContaining = (ancestor, descendant) => {
-    if (!ancestor || !descendant) return null;
-    let current = descendant;
-    while (current?.parentElement && current.parentElement !== ancestor) current = current.parentElement;
-    return current?.parentElement === ancestor ? current : null;
-  };
-
-  const measureNativeLayout = (sidebar) => {
-    const sidebarRect = elementRect(sidebar);
-    if (!sidebarRect) return null;
-    const footerTop = sidebarRect.bottom - Math.min(112, sidebarRect.height * 0.3);
-    const avatars = queryRects(sidebar, AVATAR_SELECTOR)
-      .filter(({ rect }) => rect.width >= 16 && rect.width <= 48
-        && rect.height >= 16 && rect.height <= 48
-        && Math.abs(rect.width - rect.height) <= 8
-        && rect.centerY >= footerTop
-        && rect.centerX <= sidebarRect.left + sidebarRect.width * 0.55)
-      .sort((left, right) => right.rect.centerY - left.rect.centerY);
-    const actions = queryRects(sidebar, ACTION_SELECTOR)
-      .filter(({ rect }) => rect.width >= 20 && rect.width <= 48
-        && rect.height >= 20 && rect.height <= 48
-        && rect.centerY >= footerTop
-        && rect.centerX >= sidebarRect.left + sidebarRect.width * 0.5)
-      .sort((left, right) => right.rect.centerY - left.rect.centerY
-        || right.rect.centerX - left.rect.centerX);
-    const avatar = avatars[0] || null;
-    const trailingAction = actions[0] || null;
-    const accountControlElement = avatar?.element?.closest?.("button, [role='button'], a") || null;
-    const accountControlRect = elementRect(accountControlElement);
-    const accountControl = accountControlElement && accountControlRect
-      ? { element: accountControlElement, rect: accountControlRect }
-      : null;
-    const row = nearestCommonAncestor(accountControlElement, trailingAction?.element);
-    const accountSlot = directChildContaining(row, accountControlElement);
-    const trailingSlot = directChildContaining(row, trailingAction?.element);
-    const rowRect = elementRect(row);
-    const inline = Boolean(
-      row && row !== sidebar && accountSlot && trailingSlot && accountSlot !== trailingSlot
-      && rowRect && rowRect.width >= 120 && rowRect.height >= 28 && rowRect.height <= 72
-      && Math.abs((avatar?.rect.centerY || 0) - (trailingAction?.rect.centerY || 0)) <= 16,
-    );
-    return {
-      sidebarRect,
-      avatar,
-      accountControl,
-      trailingAction,
-      row: inline ? row : null,
-      accountSlot: inline ? accountSlot : null,
-      trailingSlot: inline ? trailingSlot : null,
-    };
-  };
-
   const setText = (node, value) => {
     if (node && node.textContent !== value) node.textContent = value;
   };
@@ -206,9 +113,9 @@
       scheduler.tooltipFrame = null;
       scheduler.tooltipFrameKind = null;
       if (!state.detailsOpen || !state.host || !state.details || !state.sidebar) return;
-      const anchor = elementRect(state.host);
-      const sidebar = elementRect(state.sidebar);
-      const tooltip = elementRect(state.details);
+      const anchor = codexDom.elementRect(state.host);
+      const sidebar = codexDom.elementRect(state.sidebar);
+      const tooltip = codexDom.elementRect(state.details);
       const viewport = {
         left: 0,
         top: 0,
@@ -234,7 +141,7 @@
         anchor,
         sidebar,
         viewport,
-        tooltip: elementRect(state.details),
+        tooltip: codexDom.elementRect(state.details),
       });
       if (!placement) {
         closeDetails();
@@ -350,15 +257,17 @@
       return;
     }
 
-    if (!wasInline && host.parentElement !== sidebar) sidebar.append(host);
-    host.dataset.opsailRefitCodexLayout = "measuring";
+    const measurementRoot = document.body || document.documentElement;
+    if (!wasInline && host.parentElement !== measurementRoot) measurementRoot.append(host);
+    host.dataset.opsailRefitCodexLayout = wasInline ? "inline" : "measuring";
     host.hidden = false;
     host.style.visibility = "hidden";
     host.style.removeProperty("--opsail-refit-usage-left");
     host.style.removeProperty("--opsail-refit-usage-top");
+    host.style.removeProperty("--opsail-refit-usage-inline-max-width");
 
-    const measured = measureNativeLayout(sidebar);
-    const hostRect = elementRect(host);
+    const measured = codexDom.measureNativeLayout(sidebar);
+    const hostRect = codexDom.elementRect(host);
     const capsuleWidth = Math.max(
       hostRect?.width || 0,
       Number(state.parts?.summary?.scrollWidth) || 0,
@@ -366,35 +275,32 @@
     let mounted = false;
 
     if (measured?.row && measured.accountSlot && measured.trailingSlot && capsuleWidth > 0) {
-      const accountRect = elementRect(measured.accountSlot);
-      const trailingRect = elementRect(measured.trailingSlot);
-      if (accountRect && trailingRect && usageModel.canFitCapsule({
-        leftBoundary: accountRect.right,
-        rightBoundary: trailingRect.left,
-        capsuleWidth,
-      })) {
+      const maximumInlineWidth = Math.max(
+        usageModel.MIN_INLINE_CAPSULE_WIDTH,
+        Math.min(112, measured.sidebarRect.width * 0.42),
+      );
+      host.style.setProperty(
+        "--opsail-refit-usage-inline-max-width",
+        `${Math.floor(maximumInlineWidth)}px`,
+      );
+      if (host.parentElement !== measured.row
+        || host.nextElementSibling !== measured.trailingSlot) {
         measured.row.insertBefore(host, measured.trailingSlot);
-        host.dataset.opsailRefitCodexLayout = "inline";
-        const inlineHostRect = elementRect(host);
-        const inlineAccountRect = elementRect(measured.accountSlot);
-        const inlineTrailingRect = elementRect(measured.trailingSlot);
-        mounted = Boolean(
-          inlineHostRect && inlineAccountRect && inlineTrailingRect
-          && inlineHostRect.left >= inlineAccountRect.right
-          && inlineHostRect.right <= inlineTrailingRect.left
-          && inlineHostRect.left >= measured.sidebarRect.left
-          && inlineHostRect.right <= measured.sidebarRect.right
-          && inlineHostRect.top >= Math.max(0, measured.sidebarRect.top)
-          && inlineHostRect.bottom <= Math.min(
-            Number(window.innerHeight) || measured.sidebarRect.bottom,
-            measured.sidebarRect.bottom,
-          ),
-        );
-        if (mounted) state.row = measured.row;
       }
+      host.dataset.opsailRefitCodexLayout = "inline";
+      mounted = usageModel.isSafeInlineCapsuleLayout({
+        accountSlot: codexDom.elementRect(measured.accountSlot),
+        avatar: codexDom.elementRect(measured.avatar?.element),
+        host: codexDom.elementRect(host),
+        trailingSlot: codexDom.elementRect(measured.trailingSlot),
+        sidebar: measured.sidebarRect,
+        viewportBottom: Number(window.innerHeight) || measured.sidebarRect.bottom,
+      });
+      if (mounted) state.row = measured.row;
     }
 
-    if (!mounted && measured?.accountControl && measured.trailingAction && capsuleWidth > 0) {
+    if (!mounted && !measured?.row
+      && measured?.accountControl && measured.trailingAction && capsuleWidth > 0) {
       const leftBoundary = measured.accountControl.rect.right;
       const rightBoundary = measured.trailingAction.rect.left;
       const hostHeight = hostRect?.height || 0;
@@ -424,7 +330,7 @@
         );
         host.style.setProperty("--opsail-refit-usage-left", `${Math.round(left)}px`);
         host.style.setProperty("--opsail-refit-usage-top", `${Math.round(top)}px`);
-        const fallbackRect = elementRect(host);
+        const fallbackRect = codexDom.elementRect(host);
         mounted = Boolean(
           fallbackRect
           && fallbackRect.left >= measured.sidebarRect.left
@@ -479,10 +385,12 @@
   };
 
   const render = () => {
+    syncLocale();
     if (!state.parts || !state.host || !state.details) return;
-    const windows = usageModel.presentWindows(state.snapshot, copy, systemLocale);
+    const windows = usageModel.presentWindows(state.snapshot, copy, copy.locale);
     const stale = state.status === "stale" && windows.length > 0;
     state.hasWindows = windows.length > 0;
+    state.details.setAttribute("aria-label", copy.usageTitle);
     state.host.dataset.opsailRefitCodexStale = String(stale);
     state.host.dataset.opsailRefitCodexState = state.status;
     state.parts.stale.hidden = !stale;
@@ -508,10 +416,24 @@
       row.row.hidden = false;
       setText(row.label, windowValue.label);
       setText(row.value, usageModel.formatMessage(copy.remaining, windowValue));
+      const resetLines = windowValue.reset ? [
+        windowValue.reset.soon || !windowValue.reset.relative
+          ? copy.resetSoon
+          : usageModel.formatMessage(copy.resetRelative, windowValue.reset),
+        usageModel.formatMessage(copy.resetAbsolute, windowValue.reset),
+      ] : [];
       setText(row.meta, [
         usageModel.formatMessage(copy.used, windowValue),
-        windowValue.reset ? usageModel.formatMessage(copy.reset, { time: windowValue.reset }) : null,
+        ...resetLines,
       ].filter(Boolean).join("\n"));
+      if (windowValue.reset) {
+        row.meta.setAttribute("aria-label", usageModel.formatMessage(copy.ariaMeta, {
+          ...windowValue,
+          time: windowValue.reset.full,
+        }));
+      } else {
+        row.meta.removeAttribute?.("aria-label");
+      }
       row.track.style.setProperty("--opsail-refit-usage-remaining", `${windowValue.remaining}%`);
       row.track.setAttribute("aria-label", usageModel.formatMessage(copy.ariaProgress, windowValue));
       row.track.setAttribute("aria-valuemin", "0");
@@ -582,7 +504,7 @@
     ensureStyle();
     document.documentElement?.classList.add(ROOT_CLASS);
     if (!state.host || !state.details) createUi();
-    const sidebar = document.querySelector(SIDEBAR_SELECTOR);
+    const sidebar = codexDom.findSidebar(document);
     if (!sidebar) {
       const sidebarChanged = state.sidebar !== null;
       state.sidebar = null;
@@ -620,30 +542,34 @@
     mutationObserver.disconnect();
     observedMutationSidebar = nextSidebar;
     if (!nextSidebar) {
-      mutationObserver.observe(document.documentElement, { childList: true, subtree: true });
+      mutationObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ["lang"],
+        childList: true,
+        subtree: true,
+      });
       return;
     }
     mutationObserver.observe(nextSidebar, { childList: true, subtree: true });
     for (let ancestor = nextSidebar.parentElement; ancestor; ancestor = ancestor.parentElement) {
-      mutationObserver.observe(ancestor, { childList: true });
+      if (ancestor !== document.documentElement) {
+        mutationObserver.observe(ancestor, { childList: true });
+      }
     }
-  };
-
-  const nodeMayAffectLayout = (node) => {
-    if (!node || typeof node !== "object") return false;
-    try {
-      return Boolean(
-        node.matches?.(AVATAR_SELECTOR)
-        || node.matches?.(ACTION_SELECTOR)
-        || node.querySelector?.(AVATAR_SELECTOR)
-        || node.querySelector?.(ACTION_SELECTOR),
-      );
-    } catch {
-      return true;
-    }
+    mutationObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["lang"],
+      childList: true,
+    });
   };
 
   const handleMutations = (records) => {
+    if ([...(records || [])].some((record) => record.type === "attributes"
+      && record.target === document.documentElement
+      && record.attributeName === "lang")) {
+      render();
+      return;
+    }
     if (!state.sidebar?.isConnected) {
       observedMutationSidebar = undefined;
       observeMutations();
@@ -665,7 +591,7 @@
       const inSidebar = record.target === state.sidebar || state.sidebar?.contains?.(record.target);
       if (!inSidebar) continue;
       for (const node of changedNodes) {
-        if (nodeMayAffectLayout(node)) {
+        if (codexDom.nodeMayAffectLayout(node)) {
           scheduleLayout();
           return;
         }
@@ -739,6 +665,8 @@
       sessionMode: SESSION_MODE,
       managerToken: MANAGER_TOKEN,
       revision: REVISION,
+      domAdapterVersion: codexDom.VERSION,
+      language: copy.locale,
       hostCount: document.querySelectorAll(`#${USAGE_ID}`).length,
       styleCount: document.querySelectorAll(`#${STYLE_ID}`).length,
       detailsCount: document.querySelectorAll(`#${DETAILS_ID}`).length,

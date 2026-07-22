@@ -28,8 +28,9 @@ async function assembleRuntimeSource({
   sessionMode = "once",
   managerToken = "opsail-refit-codex:test",
 } = {}) {
-  const [model, runtime, css, en, zhCN] = await Promise.all([
+  const [model, domAdapter, runtime, css, en, zhCN] = await Promise.all([
     fs.readFile(new URL("opsail-refit-codex-usage-model.js", assetRoot), "utf8"),
+    fs.readFile(new URL("opsail-refit-codex-dom-adapter.js", assetRoot), "utf8"),
     fs.readFile(new URL("opsail-refit-codex-usage-runtime.js", assetRoot), "utf8"),
     fs.readFile(new URL("opsail-refit-codex-usage.css", assetRoot), "utf8"),
     fs.readFile(new URL("locales/en.json", assetRoot), "utf8").then(JSON.parse),
@@ -37,6 +38,7 @@ async function assembleRuntimeSource({
   ]);
   const replacements = [
     ["__OPSAIL_REFIT_CODEX_MODEL_SOURCE__", model],
+    ["__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__", domAdapter],
     ["__OPSAIL_REFIT_CODEX_VERSION_JSON__", JSON.stringify("test")],
     ["__OPSAIL_REFIT_CODEX_REVISION_JSON__", JSON.stringify("test-revision")],
     ["__OPSAIL_REFIT_CODEX_SESSION_MODE_JSON__", JSON.stringify(sessionMode)],
@@ -84,7 +86,11 @@ function fakeClock() {
   };
 }
 
-function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true } = {}) {
+function createRuntimeHarness({
+  bridgeAvailable = true,
+  nativeAccountRow = false,
+  sidebarAvailable = true,
+} = {}) {
   const eventRegistry = { count: 0 };
 
   class FakeEventTarget {
@@ -137,6 +143,7 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
         contains: (value) => classes.has(value),
       };
       this.rect = null;
+      this.rectProvider = null;
     }
 
     get isConnected() {
@@ -148,6 +155,12 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
 
     get scrollWidth() {
       return Math.max(24, this.textContent.length * 6 + 16);
+    }
+
+    get nextElementSibling() {
+      if (!this.parentElement) return null;
+      const index = this.parentElement.children.indexOf(this);
+      return index >= 0 ? this.parentElement.children[index + 1] || null : null;
     }
 
     append(...nodes) {
@@ -210,6 +223,7 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
     }
 
     getBoundingClientRect() {
+      if (this.rectProvider) return { ...this.rectProvider() };
       if (this.rect) return { ...this.rect };
       const width = this.id === "opsail-refit-codex-usage"
         ? Math.max(40, this.children[0]?.scrollWidth || 40)
@@ -243,6 +257,44 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
       };
       this.documentElement.append(this.head, this.body);
       if (sidebarAvailable) this.body.append(this.sidebar);
+      if (nativeAccountRow) {
+        const row = new FakeElement("div", this);
+        const accountSlot = new FakeElement("div", this);
+        const accountControl = new FakeElement("button", this);
+        const avatar = new FakeElement("img", this);
+        const trailingAction = new FakeElement("button", this);
+        row.rect = {
+          left: 0, top: 754, right: 240, bottom: 800, width: 240, height: 46,
+        };
+        const accountRect = () => {
+          const inline = row.children.some((child) => child.id === "opsail-refit-codex-usage");
+          return inline
+            ? { left: 8, top: 762, right: 100, bottom: 792, width: 92, height: 30 }
+            : { left: 8, top: 762, right: 192, bottom: 792, width: 184, height: 30 };
+        };
+        accountSlot.rectProvider = accountRect;
+        accountControl.rectProvider = accountRect;
+        avatar.rect = {
+          left: 16, top: 768, right: 34, bottom: 786, width: 18, height: 18,
+        };
+        trailingAction.rect = {
+          left: 192, top: 761, right: 224, bottom: 793, width: 32, height: 32,
+        };
+        avatar.closest = () => accountControl;
+        accountControl.append(avatar);
+        accountSlot.append(accountControl);
+        row.append(accountSlot, trailingAction);
+        this.sidebar.append(row);
+        const querySelectorAll = this.sidebar.querySelectorAll.bind(this.sidebar);
+        this.sidebar.querySelectorAll = (selector) => {
+          if (selector === "img, [data-testid*='avatar' i], [class*='avatar' i]") {
+            return [avatar];
+          }
+          if (selector === "button, [role='button']") return [accountControl, trailingAction];
+          return querySelectorAll(selector);
+        };
+        this.nativeLayout = { accountControl, accountSlot, avatar, row, trailingAction };
+      }
       this.visibilityState = "visible";
     }
 
@@ -317,6 +369,18 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
   }
 
   const document = new FakeDocument();
+  if (document.nativeLayout) {
+    const originalCreateElement = document.createElement.bind(document);
+    document.createElement = (tagName) => {
+      const element = originalCreateElement(tagName);
+      if (tagName === "section") {
+        element.rectProvider = () => element.parentElement === document.nativeLayout.row
+          ? { left: 108, top: 763, right: 184, bottom: 791, width: 76, height: 28 }
+          : { left: 100, top: 740, right: 176, bottom: 768, width: 76, height: 28 };
+      }
+      return element;
+    };
+  }
   const window = new FakeEventTarget();
   const sent = [];
   Object.assign(window, {
@@ -363,9 +427,12 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
     }),
     context,
     document,
-    respondWithWeekly() {
+    nativeLayout: document.nativeLayout || null,
+    respondWithWeekly({ resetsAt } = {}) {
       const requestId = sent.at(-1)?.request?.id;
       assert.ok(requestId);
+      const secondary = { usedPercent: 72, windowDurationMins: 10080 };
+      if (Number.isFinite(resetsAt)) secondary.resetsAt = resetsAt;
       window.dispatch("message", {
         data: {
           hostId: "local",
@@ -374,7 +441,7 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
             id: requestId,
             result: {
               rateLimits: {
-                secondary: { usedPercent: 72, windowDurationMins: 10080 },
+                secondary,
               },
             },
           },
@@ -385,6 +452,19 @@ function createRuntimeHarness({ bridgeAvailable = true, sidebarAvailable = true 
     sent,
     triggerResize() {
       for (const observer of activeResizeObservers) observer.callback([]);
+      flushAnimationFrames();
+    },
+    triggerLanguage(language) {
+      document.documentElement.lang = language;
+      for (const observer of [...activeMutationObservers]) {
+        observer.callback([{
+          type: "attributes",
+          target: document.documentElement,
+          attributeName: "lang",
+          addedNodes: [],
+          removedNodes: [],
+        }]);
+      }
       flushAnimationFrames();
     },
     window,
@@ -459,34 +539,72 @@ test("partial notifications merge by field presence", async () => {
   );
 });
 
-test("reset time is fully localized and no valid windows means no summary", async () => {
+test("reset time uses readable relative and local forms without losing the exact value", async () => {
   const model = await loadModel();
-  const copy = model.selectLocale("en-US");
+  const english = model.selectLocale("en-US");
+  const chinese = model.selectLocale("zh-CN");
+  const now = Date.UTC(2030, 0, 1, 0, 0, 0);
+  const resetsAt = (now + (6 * 24 + 16) * 60 * 60 * 1000) / 1000;
   const snapshot = model.normalizeSnapshot({
     primary: {
       usedPercent: 40,
       windowDurationMins: 1440,
-      resetsAt: 1893456000,
+      resetsAt,
     },
   });
-  const reset = model.presentWindows(snapshot, copy, "en-GB")[0].reset;
-  const expectedReset = new Intl.DateTimeFormat("en-GB", {
+  const englishReset = model.presentWindows(snapshot, english, "en-US", now)[0].reset;
+  const chineseReset = model.presentWindows(snapshot, chinese, "zh-CN", now)[0].reset;
+  const resetDate = new Date(resetsAt * 1000);
+  const expectedDate = new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "numeric",
+  }).format(resetDate);
+  const expectedWeekday = new Intl.DateTimeFormat("en-US", {
+    weekday: "short",
+  }).format(resetDate);
+  const expectedTime = new Intl.DateTimeFormat("en-US", {
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(resetDate);
+  const expectedFull = new Intl.DateTimeFormat("en-US", {
     dateStyle: "full",
     timeStyle: "long",
-  }).format(new Date(1893456000 * 1000));
-  assert.equal(reset, expectedReset);
-  assert.ok(reset.length > 12);
-  assert.doesNotMatch(reset, /…|\.\.\./);
+  }).format(resetDate);
+  assert.equal(englishReset.relative, "6d 16h");
+  assert.equal(
+    model.formatMessage(english.resetRelative, englishReset),
+    "Resets in 6d 16h",
+  );
+  assert.equal(
+    model.formatMessage(english.resetAbsolute, englishReset),
+    `${expectedWeekday}, ${expectedDate} · ${expectedTime} (local time)`,
+  );
+  assert.equal(englishReset.full, expectedFull);
+  assert.equal(chineseReset.relative, "6天16小时");
+  assert.equal(
+    model.formatMessage(chinese.resetRelative, chineseReset),
+    "6天16小时后重置",
+  );
+  assert.match(model.formatMessage(chinese.resetAbsolute, chineseReset), /本地时间/);
+  assert.doesNotMatch(englishReset.full, /…|\.\.\./);
 
   const empty = model.normalizeSnapshot({ primary: null, secondary: { usedPercent: null } });
-  assert.equal(model.presentWindows(empty, copy).length, 0);
-  assert.equal(model.summaryFor(model.presentWindows(empty, copy), copy), "");
+  assert.equal(model.presentWindows(empty, english).length, 0);
+  assert.equal(model.summaryFor(model.presentWindows(empty, english), english), "");
 });
 
 test("locale JSON selects an exact locale, then language family, then English", async () => {
   const model = await loadModel();
   assert.equal(model.selectLocale("zh-Hans-CN").locale, "zh-CN");
   assert.equal(model.selectLocale("fr-FR").locale, "en");
+  const chinese = model.selectLocale("zh-CN");
+  const weekly = model.normalizeSnapshot({
+    secondary: { usedPercent: 72, windowDurationMins: 10080 },
+  });
+  assert.equal(
+    model.summaryFor(model.presentWindows(weekly, chinese), chinese),
+    "周剩余 28%",
+  );
 });
 
 test("read coordination deduplicates, times out, gates focus, and refreshes only when visible", async () => {
@@ -582,10 +700,37 @@ test("tooltip placement clamps to sidebar and viewport and narrow gaps hide the 
   }), true);
 });
 
+test("inline capsule validation accepts safe flex reflow and rejects overlap or over-shrink", async () => {
+  const model = await loadModel();
+  const layout = {
+    accountSlot: { left: 8, top: 911, right: 100, bottom: 941, width: 92, height: 30 },
+    avatar: { left: 16, top: 917, right: 34, bottom: 935, width: 18, height: 18 },
+    host: { left: 108, top: 912, right: 184, bottom: 940, width: 76, height: 28 },
+    trailingSlot: { left: 192, top: 910, right: 224, bottom: 942, width: 32, height: 32 },
+    sidebar: { left: 0, top: 0, right: 240, bottom: 949, width: 240, height: 949 },
+    viewportBottom: 949,
+  };
+  assert.equal(model.isSafeInlineCapsuleLayout(layout), true);
+  assert.equal(model.isSafeInlineCapsuleLayout({
+    ...layout,
+    host: { ...layout.host, left: 92 },
+  }), false);
+  assert.equal(model.isSafeInlineCapsuleLayout({
+    ...layout,
+    host: { ...layout.host, right: 132, width: 24 },
+  }), false);
+  assert.equal(model.isSafeInlineCapsuleLayout({
+    ...layout,
+    accountSlot: { ...layout.accountSlot, right: 30, width: 22 },
+  }), false);
+});
+
 test("runtime and CSS enforce cleanup, quiet failure, theme colors, and complete detail text", async () => {
-  const [runtime, css] = await Promise.all([
+  const [domAdapter, runtime, css, payloadRust] = await Promise.all([
+    fs.readFile(new URL("opsail-refit-codex-dom-adapter.js", assetRoot), "utf8"),
     fs.readFile(new URL("opsail-refit-codex-usage-runtime.js", assetRoot), "utf8"),
     fs.readFile(new URL("opsail-refit-codex-usage.css", assetRoot), "utf8"),
+    fs.readFile(new URL("../src/payload.rs", assetRoot), "utf8"),
   ]);
   assert.match(runtime, /window\[STATE_KEY\]\?\.cleanup/);
   assert.match(runtime, /removeListeners\(\)/);
@@ -593,12 +738,27 @@ test("runtime and CSS enforce cleanup, quiet failure, theme colors, and complete
   assert.match(runtime, /resizeObserver\?\.disconnect/);
   assert.match(runtime, /observedSidebar === nextSidebar && observedRow === nextRow/);
   assert.match(runtime, /scheduler\.tooltipFrameKind === "timeout"/);
+  assert.match(runtime, /createOpsailRefitCodexDomAdapter/);
+  assert.doesNotMatch(runtime, /main\.main-surface|app-shell-left-panel/);
   assert.doesNotMatch(runtime, /\b(?:alert|confirm|prompt)\s*\(/);
   assert.doesNotMatch(runtime, /\bfetch\s*\(|new\s+WebSocket|location\.reload/);
+
+  assert.match(domAdapter, /const createOpsailRefitCodexDomAdapter/);
+  assert.match(domAdapter, /main\.main-surface/);
+  assert.match(domAdapter, /app-shell-left-panel/);
+  assert.match(domAdapter, /measureNativeLayout/);
+  assert.match(domAdapter, /nodeMayAffectLayout/);
+  assert.doesNotMatch(domAdapter, /\b(?:alert|confirm|prompt)\s*\(/);
+  assert.doesNotMatch(domAdapter, /\bfetch\s*\(|new\s+WebSocket|location\.reload/);
+  assert.doesNotMatch(payloadRust, /\bdocument\.|\bwindow\./);
 
   assert.match(css, /font-size:\s*10px/);
   assert.match(css, /cursor:\s*default/);
   assert.match(css, /font-variant-numeric:\s*tabular-nums/);
+  assert.match(
+    css,
+    /\.opsail-refit-codex-usage-summary\s*\{[\s\S]*?text-overflow:\s*ellipsis/,
+  );
   assert.match(css, /white-space:\s*pre-line/);
   assert.match(css, /overflow-y:\s*auto/);
   assert.match(css, /prefers-reduced-motion/);
@@ -607,11 +767,317 @@ test("runtime and CSS enforce cleanup, quiet failure, theme colors, and complete
   assert.match(css, /var\(--color-token-/);
 });
 
+test("DOM adapter owns renderer discovery and fails closed when native nodes disappear", async () => {
+  const source = await fs.readFile(
+    new URL("opsail-refit-codex-dom-adapter.js", assetRoot),
+    "utf8",
+  );
+  const shell = {};
+  const sidebar = {};
+  const selectors = [];
+  const document = {
+    querySelector(selector) {
+      selectors.push(selector);
+      if (selector === "main.main-surface") return shell;
+      if (selector.startsWith("aside.app-shell-left-panel")) return sidebar;
+      return null;
+    },
+  };
+  const context = {
+    document,
+    location: { protocol: "app:" },
+    window: { electronBridge: { sendMessageFromView() {} } },
+  };
+  const adapter = vm.runInNewContext(
+    `${source}\ncreateOpsailRefitCodexDomAdapter();`,
+    context,
+  );
+  assert.equal(adapter.VERSION, 1);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(adapter.probeRenderer())),
+    {
+      appProtocol: true,
+      bridge: true,
+      domAdapterVersion: 1,
+      shell: true,
+      sidebar: true,
+    },
+  );
+  assert.ok(selectors.includes(adapter.SELECTORS.shell));
+  assert.ok(selectors.includes(adapter.SELECTORS.sidebar));
+
+  context.document.querySelector = () => null;
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(adapter.probeRenderer())),
+    {
+      appProtocol: true,
+      bridge: true,
+      domAdapterVersion: 1,
+      shell: false,
+      sidebar: false,
+    },
+  );
+});
+
+test("DOM adapter reports the Codex language before system fallbacks", async () => {
+  const source = await fs.readFile(
+    new URL("opsail-refit-codex-dom-adapter.js", assetRoot),
+    "utf8",
+  );
+  const document = {
+    documentElement: { lang: "zh-CN" },
+    querySelector() { return null; },
+  };
+  const adapter = vm.runInNewContext(
+    `${source}\ncreateOpsailRefitCodexDomAdapter();`,
+    {
+      document,
+      location: { protocol: "app:" },
+      navigator: { language: "en-US", languages: ["en-US"] },
+      window: { electronBridge: { sendMessageFromView() {} } },
+    },
+  );
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(adapter.languageCandidates())),
+    ["zh-CN", "en-US"],
+  );
+  document.documentElement.lang = "en";
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(adapter.languageCandidates())),
+    ["en", "en-US"],
+  );
+});
+
+test("DOM adapter ignores offscreen controls when measuring the native account row", async () => {
+  const source = await fs.readFile(
+    new URL("opsail-refit-codex-dom-adapter.js", assetRoot),
+    "utf8",
+  );
+  const adapter = vm.runInNewContext(
+    `${source}\ncreateOpsailRefitCodexDomAdapter();`,
+    {
+      document: { querySelector() { return null; } },
+      location: { protocol: "app:" },
+      window: { electronBridge: { sendMessageFromView() {} } },
+    },
+  );
+  const element = (rect) => ({
+    parentElement: null,
+    closest() { return null; },
+    getBoundingClientRect() { return { ...rect }; },
+    querySelectorAll() { return []; },
+  });
+  const sidebar = element({
+    left: 0, top: 0, right: 240, bottom: 949, width: 240, height: 949,
+  });
+  const row = element({
+    left: 0, top: 903, right: 240, bottom: 949, width: 240, height: 46,
+  });
+  const accountSlot = element({
+    left: 8, top: 911.5, right: 192, bottom: 940.5, width: 184, height: 29,
+  });
+  const accountControl = element({
+    left: 8, top: 911.5, right: 192, bottom: 940.5, width: 184, height: 29,
+  });
+  const avatar = element({
+    left: 16, top: 917, right: 34, bottom: 935, width: 18, height: 18,
+  });
+  const validAction = element({
+    left: 200, top: 910, right: 232, bottom: 942, width: 32, height: 32,
+  });
+  const offscreenContainer = element({
+    left: 0, top: 1200, right: 240, bottom: 1320, width: 240, height: 120,
+  });
+  const offscreenAction = element({
+    left: 208, top: 1281, right: 228, bottom: 1301, width: 20, height: 20,
+  });
+  sidebar.marker = "sidebar";
+  row.marker = "row";
+  accountSlot.marker = "account-slot";
+  avatar.marker = "avatar";
+  validAction.marker = "valid-action";
+  offscreenAction.marker = "offscreen-action";
+
+  row.parentElement = sidebar;
+  accountSlot.parentElement = row;
+  accountControl.parentElement = accountSlot;
+  avatar.parentElement = accountControl;
+  validAction.parentElement = row;
+  offscreenContainer.parentElement = sidebar;
+  offscreenAction.parentElement = offscreenContainer;
+  avatar.closest = () => accountControl;
+  sidebar.querySelectorAll = (selector) => {
+    if (selector === adapter.SELECTORS.avatar) return [avatar];
+    if (selector === adapter.SELECTORS.action) return [validAction, offscreenAction];
+    return [];
+  };
+
+  const measured = adapter.measureNativeLayout(sidebar);
+  assert.equal(measured.avatar.element.marker, "avatar");
+  assert.equal(measured.trailingAction.element.marker, "valid-action");
+  assert.equal(measured.row.marker, "row");
+  assert.equal(measured.accountSlot.marker, "account-slot");
+  assert.equal(measured.trailingSlot.marker, "valid-action");
+});
+
+test("DOM adapter prefers the footer action aligned with the account avatar", async () => {
+  const source = await fs.readFile(
+    new URL("opsail-refit-codex-dom-adapter.js", assetRoot),
+    "utf8",
+  );
+  const adapter = vm.runInNewContext(
+    `${source}\ncreateOpsailRefitCodexDomAdapter();`,
+    {
+      document: { querySelector() { return null; } },
+      location: { protocol: "app:" },
+      window: { electronBridge: { sendMessageFromView() {} } },
+    },
+  );
+  const element = (marker, rect) => ({
+    marker,
+    parentElement: null,
+    closest() { return null; },
+    getBoundingClientRect() { return { ...rect }; },
+    querySelectorAll() { return []; },
+  });
+  const sidebar = element("sidebar", {
+    left: 0, top: 0, right: 240, bottom: 949, width: 240, height: 949,
+  });
+  const content = element("content", {
+    left: 0, top: 46, right: 240, bottom: 949, width: 240, height: 903,
+  });
+  const row = element("row", {
+    left: 0, top: 903, right: 240, bottom: 949, width: 240, height: 46,
+  });
+  const accountSlot = element("account-slot", {
+    left: 8, top: 911.5, right: 192, bottom: 940.5, width: 184, height: 29,
+  });
+  const accountControl = element("account-control", {
+    left: 8, top: 911.5, right: 192, bottom: 940.5, width: 184, height: 29,
+  });
+  const avatar = element("avatar", {
+    left: 16, top: 917, right: 34, bottom: 935, width: 18, height: 18,
+  });
+  const alignedAction = element("aligned-action", {
+    left: 200, top: 910, right: 232, bottom: 942, width: 32, height: 32,
+  });
+  const nearbyAction = element("nearby-action", {
+    left: 208, top: 920, right: 228, bottom: 940, width: 20, height: 20,
+  });
+
+  content.parentElement = sidebar;
+  row.parentElement = content;
+  accountSlot.parentElement = row;
+  accountControl.parentElement = accountSlot;
+  avatar.parentElement = accountControl;
+  alignedAction.parentElement = row;
+  nearbyAction.parentElement = content;
+  avatar.closest = () => accountControl;
+  sidebar.querySelectorAll = (selector) => {
+    if (selector === adapter.SELECTORS.avatar) return [avatar];
+    if (selector === adapter.SELECTORS.action) return [alignedAction, nearbyAction];
+    return [];
+  };
+
+  const measured = adapter.measureNativeLayout(sidebar);
+  assert.equal(measured.trailingAction.element.marker, "aligned-action");
+  assert.equal(measured.row.marker, "row");
+  assert.equal(measured.accountSlot.marker, "account-slot");
+  assert.equal(measured.trailingSlot.marker, "aligned-action");
+});
+
 test("the Rust-assembled renderer payload is valid JavaScript", async () => {
   const { replacements, source } = await assembleRuntimeSource();
+  const [domAdapter, probeTemplate, earlyTemplate, statusTemplate, disable] = await Promise.all([
+    fs.readFile(new URL("opsail-refit-codex-dom-adapter.js", assetRoot), "utf8"),
+    fs.readFile(new URL("opsail-refit-codex-renderer-probe.js", assetRoot), "utf8"),
+    fs.readFile(new URL("opsail-refit-codex-usage-early.js", assetRoot), "utf8"),
+    fs.readFile(new URL("opsail-refit-codex-usage-status.js", assetRoot), "utf8"),
+    fs.readFile(new URL("opsail-refit-codex-usage-disable.js", assetRoot), "utf8"),
+  ]);
+  const probe = probeTemplate
+    .split("__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__")
+    .join(domAdapter);
+  const early = earlyTemplate
+    .split("__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__")
+    .join(domAdapter)
+    .split("__OPSAIL_REFIT_CODEX_EARLY_REVISION_JSON__")
+    .join(JSON.stringify("test-revision"))
+    .split("__OPSAIL_REFIT_CODEX_CURRENT_PAYLOAD__")
+    .join(source);
+  const status = statusTemplate
+    .split("__OPSAIL_REFIT_CODEX_STATUS_REVISION_JSON__")
+    .join(JSON.stringify("test-revision"));
 
   for (const [marker] of replacements) assert.doesNotMatch(source, new RegExp(marker));
   assert.doesNotThrow(() => new vm.Script(source));
+  for (const marker of [
+    "__OPSAIL_REFIT_CODEX_DOM_ADAPTER_SOURCE__",
+    "__OPSAIL_REFIT_CODEX_EARLY_REVISION_JSON__",
+    "__OPSAIL_REFIT_CODEX_CURRENT_PAYLOAD__",
+  ]) {
+    assert.doesNotMatch(probe, new RegExp(marker));
+    assert.doesNotMatch(early, new RegExp(marker));
+  }
+  assert.doesNotThrow(() => new vm.Script(probe));
+  assert.doesNotThrow(() => new vm.Script(early));
+  assert.doesNotMatch(status, /__OPSAIL_REFIT_CODEX_STATUS_REVISION_JSON__/);
+  assert.doesNotThrow(() => new vm.Script(status));
+  assert.doesNotThrow(() => new vm.Script(disable));
+});
+
+test("runtime mounts one inline capsule and keeps it stable across remeasurement", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+  harness.respondWithWeekly();
+
+  const host = harness.document.getElementById("opsail-refit-codex-usage");
+  let diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.visible, true);
+  assert.equal(host.hidden, false);
+  assert.equal(host.dataset.opsailRefitCodexLayout, "inline");
+  assert.equal(host.parentElement, harness.nativeLayout.row);
+  assert.equal(host.nextElementSibling, harness.nativeLayout.trailingAction);
+  assert.equal(host.children[0].textContent, "weekly 28%");
+  assert.equal(
+    host.style.values.get("--opsail-refit-usage-inline-max-width"),
+    "100px",
+  );
+
+  harness.triggerResize();
+  diagnostics = harness.window.__OPSAIL_REFIT_CODEX_STATE__.diagnostics();
+  assert.equal(diagnostics.visible, true);
+  assert.equal(host.parentElement, harness.nativeLayout.row);
+  assert.equal(host.nextElementSibling, harness.nativeLayout.trailingAction);
+  assert.equal(
+    harness.nativeLayout.row.children.filter((child) => child === host).length,
+    1,
+  );
+});
+
+test("runtime follows Codex language changes instead of the system language", async () => {
+  const { source } = await assembleRuntimeSource();
+  const harness = createRuntimeHarness({ nativeAccountRow: true });
+  new vm.Script(source).runInContext(harness.context);
+  harness.respondWithWeekly({
+    resetsAt: Math.floor(Date.now() / 1000) + (6 * 24 + 16) * 60 * 60,
+  });
+
+  const host = harness.document.getElementById("opsail-refit-codex-usage");
+  const details = harness.document.getElementById("opsail-refit-codex-usage-details");
+  const meta = details.children[1].children[1];
+  assert.equal(host.children[0].textContent, "weekly 28%");
+  assert.match(meta.textContent, /^72% used\nResets in 6d 16h\n.*\(local time\)$/);
+  harness.triggerLanguage("zh-CN");
+  assert.equal(host.children[0].textContent, "周剩余 28%");
+  assert.match(meta.textContent, /^已用 72%\n6天16小时后重置\n.*（本地时间）$/);
+  assert.match(meta.attributes.get("aria-label"), /^已用 72%。.*重置$/);
+  assert.equal(
+    details.attributes.get("aria-label"),
+    "使用额度",
+  );
 });
 
 test("repeated renderer installation stays singular and cleanup releases every resource", async () => {
@@ -629,8 +1095,13 @@ test("repeated renderer installation stays singular and cleanup releases every r
   assert.equal(diagnostics.styleCount, 1);
   assert.equal(diagnostics.detailsCount, 1);
   assert.equal(diagnostics.listenerCount, 10);
+  assert.equal(diagnostics.domAdapterVersion, 1);
   assert.equal(diagnostics.sessionMode, "once");
   assert.equal(diagnostics.managerToken, "opsail-refit-codex:test");
+  assert.equal(
+    harness.document.getElementById("opsail-refit-codex-usage").parentElement,
+    harness.document.body,
+  );
   const firstCounts = harness.activeCounts();
   assert.equal(firstCounts.mutationObservers, 1);
   assert.equal(firstCounts.resizeObservers, 1);

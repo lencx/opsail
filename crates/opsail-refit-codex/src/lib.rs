@@ -31,13 +31,12 @@ pub use model::{
     CodexDoctorReport, CodexRefitOperation, CodexRefitReport, CodexRefitState, CodexTargetHealth,
     DoctorCheck, DoctorCheckState, LaunchPolicy, SessionMode,
 };
-use payload::{
-    UsagePayload, disable_expression, renderer_probe_expression, status_expression, usage_payload,
-};
+use payload::{UsagePayload, disable_expression, usage_payload};
 use state::{StateManagedSessionLock, StateStore, TargetRecord};
 
 pub const DEFAULT_CODEX_DEBUG_PORT: u16 = 55321;
 const USAGE_RUNTIME_LISTENER_COUNT: usize = 10;
+const DOM_ADAPTER_API_VERSION: u64 = 1;
 const APP_LAUNCH_TIMEOUT: Duration = Duration::from_secs(15);
 const MANAGER_STOP_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -331,10 +330,10 @@ impl CodexRefit {
             let Ok(mut session) = CdpSession::connect(target).await else {
                 continue;
             };
-            match probe_renderer(&mut session).await {
+            match probe_renderer(&mut session, &self.payload).await {
                 Ok(()) => {
                     valid_renderers = valid_renderers.saturating_add(1);
-                    if let Ok(status) = renderer_status(&mut session).await
+                    if let Ok(status) = renderer_status(&mut session, &self.payload).await
                         && let Some(mode) = status
                             .diagnostics
                             .filter(|diagnostics| diagnostics.installed)
@@ -440,7 +439,7 @@ impl CodexRefit {
                     continue;
                 }
             };
-            match probe_renderer(&mut cdp).await {
+            match probe_renderer(&mut cdp, &self.payload).await {
                 Ok(()) => sessions.push(CodexSession {
                     cdp,
                     port: self.port,
@@ -711,7 +710,7 @@ impl ManagedSession for CodexSession {
 
     fn health(&mut self) -> SessionFuture<'_, Result<CodexTargetHealth, CodexRefitError>> {
         Box::pin(async move {
-            let runtime = renderer_status(&mut self.cdp).await?;
+            let runtime = renderer_status(&mut self.cdp, &self.payload).await?;
             let target_id = self.cdp.target_id().to_owned();
             let record =
                 self.state
@@ -745,6 +744,7 @@ impl ManagedSession for CodexSession {
                     && diagnostics.resize_observer
                     && diagnostics.refresh_timer
                     && diagnostics.bridge_available
+                    && diagnostics.dom_adapter_version == DOM_ADAPTER_API_VERSION
             });
             if runtime.installed
                 && runtime.revision.as_deref() == Some(&self.payload.revision)
@@ -899,6 +899,7 @@ struct RendererProbe {
     shell: bool,
     sidebar: bool,
     bridge: bool,
+    dom_adapter_version: u64,
 }
 
 #[derive(Deserialize)]
@@ -929,6 +930,8 @@ struct RendererDiagnostics {
     refresh_timer: bool,
     bridge_available: bool,
     #[serde(default)]
+    dom_adapter_version: u64,
+    #[serde(default)]
     data_state: String,
 }
 
@@ -937,9 +940,12 @@ struct CleanupResult {
     clean: bool,
 }
 
-async fn probe_renderer(session: &mut CdpSession) -> Result<(), CodexRefitError> {
+async fn probe_renderer(
+    session: &mut CdpSession,
+    payload: &UsagePayload,
+) -> Result<(), CodexRefitError> {
     let probe: RendererProbe = serde_json::from_value(
-        session.evaluate(renderer_probe_expression()).await?,
+        session.evaluate(payload.renderer_probe()).await?,
     )
     .map_err(|_| {
         CodexRefitError::new(
@@ -947,7 +953,11 @@ async fn probe_renderer(session: &mut CdpSession) -> Result<(), CodexRefitError>
             "the renderer returned an invalid identity probe",
         )
     })?;
-    if !probe.app_protocol || !probe.shell || !probe.sidebar {
+    if probe.dom_adapter_version != DOM_ADAPTER_API_VERSION
+        || !probe.app_protocol
+        || !probe.shell
+        || !probe.sidebar
+    {
         return Err(CodexRefitError::new(
             CodexRefitErrorCode::TargetValidationFailed,
             "the renderer does not match the expected app shell and sidebar",
@@ -962,8 +972,11 @@ async fn probe_renderer(session: &mut CdpSession) -> Result<(), CodexRefitError>
     Ok(())
 }
 
-async fn renderer_status(session: &mut CdpSession) -> Result<RendererStatus, CodexRefitError> {
-    serde_json::from_value(session.evaluate(&status_expression()).await?).map_err(|_| {
+async fn renderer_status(
+    session: &mut CdpSession,
+    payload: &UsagePayload,
+) -> Result<RendererStatus, CodexRefitError> {
+    serde_json::from_value(session.evaluate(&payload.status()).await?).map_err(|_| {
         CodexRefitError::new(
             CodexRefitErrorCode::Stale,
             "the renderer returned an invalid refit health result",
@@ -1106,6 +1119,7 @@ mod tests {
                 "resizeObserver": true,
                 "refreshTimer": true,
                 "bridgeAvailable": true,
+                "domAdapterVersion": DOM_ADAPTER_API_VERSION,
                 "dataState": "ready"
             },
             "hostCount": 1,
@@ -1143,7 +1157,8 @@ mod tests {
 
     #[test]
     fn renderer_probe_contains_no_remote_or_model_channel() {
-        let expression = renderer_probe_expression();
+        let payload = usage_payload().unwrap();
+        let expression = payload.renderer_probe();
         assert!(expression.contains("location.protocol"));
         assert!(!expression.contains("fetch"));
         assert!(!expression.contains("account/rateLimits"));
@@ -1170,6 +1185,23 @@ mod tests {
         assert_eq!(value["launched"], true);
         assert_eq!(value["targets"][0]["state"], "stale");
         assert_eq!(value["targets"][0]["sessionMode"], "once");
+    }
+
+    #[test]
+    fn legacy_renderer_diagnostics_remain_parseable_for_reconciliation() {
+        let payload = usage_payload().unwrap();
+        let mut value = healthy_renderer_status(
+            &payload,
+            SessionMode::Once,
+            "opsail-refit-codex:legacy-health",
+        );
+        value["diagnostics"]
+            .as_object_mut()
+            .unwrap()
+            .remove("domAdapterVersion");
+
+        let status: RendererStatus = serde_json::from_value(value).unwrap();
+        assert_eq!(status.diagnostics.unwrap().dom_adapter_version, 0);
     }
 
     #[tokio::test]

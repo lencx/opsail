@@ -7,7 +7,7 @@ The crate owns the complete adapter boundary:
 - an internal, reusable refit lifecycle with idempotent enable, disable, status, rollback, cleanup, and health checks;
 - macOS application identity, signature, process ancestry, loopback listener, and renderer validation;
 - bounded Chrome DevTools Protocol discovery and transport;
-- Codex renderer bridge methods, selectors, rate-limit normalization, partial-update merging, refresh coordination, and UI payloads;
+- Codex renderer bridge methods, a versioned DOM adapter, rate-limit normalization, partial-update merging, refresh coordination, and UI payloads;
 - embedded locale JSON and theme-token-only CSS.
 
 The lifecycle remains an internal module while Codex is the only refit adapter. A shared crate should be extracted only after another adapter demonstrates a stable duplicated contract.
@@ -93,17 +93,43 @@ An Apple Events-based read-only probe is an unverified future consideration only
 
 The renderer reads through the existing local account bridge using `account/rateLimits/read` and listens for `account/rateLimits/updated`. It does not call a model or an external account endpoint, so a refresh does not consume model tokens.
 
-The UI derives window labels from each valid `windowDurationMins`, sorts shorter windows first, clamps finite `usedPercent` values to `0..100`, and displays rounded remaining percentages. It merges partial notifications by field presence and hides completely when no valid window exists. Reset timestamps are Unix seconds and use the system/browser locale's full date and time format independently of UI-copy fallback.
+The UI derives window labels from each valid `windowDurationMins`, sorts shorter windows first, clamps finite `usedPercent` values to `0..100`, and displays rounded remaining percentages. It merges partial notifications by field presence and hides completely when no valid window exists. Reset timestamps are Unix seconds. Visible details pair a compact relative duration with a short local date and time, while the localized exact value remains available to assistive technology.
 
 One read runs after injection. Notifications update immediately and schedule one debounced calibration read after 1.2 seconds. Focus refreshes are gated to 60 seconds, and a visible page receives a fallback refresh every 15 minutes. Requests are deduplicated and time out after 15 seconds. A failed refresh keeps the last successful snapshot with a quiet stale indicator.
 
 ## Localization and renderer behavior
 
-All user-facing copy and duration labels are loaded from embedded JSON files in `assets/locales`. Locale selection considers `document.documentElement.lang`, then `navigator.language`, matching exact locale, language family, and finally English. English and Simplified Chinese are included and checked for matching message keys at payload construction time.
+All user-facing copy, compact summary labels, relative-time units, and duration labels are loaded from embedded JSON files in `assets/locales`. The Codex Language setting exposed through `document.documentElement.lang` is authoritative; browser languages are fallbacks, followed by English. Date wording follows the selected Codex locale while the time zone remains the system-local zone. A `lang` change redraws the installed UI without reinjection. English and Simplified Chinese are included and checked for matching message keys at payload construction time.
 
 The capsule prefers a real position in the native account-row layout. A measured, fixed-position fallback is used only when a reliable row cannot be identified. Resize and relevant sidebar mutations trigger coalesced remeasurement; insufficient space hides the capsule instead of covering native controls. Details are portaled to `document.body`, positioned from measured rectangles, and clamped to both the sidebar and viewport.
 
 Renderer colors, borders, backgrounds, text, and progress styling use application theme tokens with semantic fallbacks. The feature supports keyboard focus, localized accessible labels, tooltip association, progressbar semantics, and reduced-motion preferences.
+
+## DOM adapter maintenance
+
+All knowledge of Codex's native shell, sidebar, account row, avatar, action controls, and layout geometry lives in `assets/opsail-refit-codex-dom-adapter.js`. The renderer identity probe, persistent early bootstrap, usage runtime, status probe, and cleanup expression are separate JavaScript assets; the first three receive the same adapter during Rust payload assembly. Native selectors and layout heuristics must not be duplicated in Rust or those templates, and Rust source must not contain renderer script bodies.
+
+The adapter exposes a small versioned contract: renderer probing, safe native-node discovery, bounded rectangle measurement, account-row measurement, and mutation relevance filtering. A selector-only change normally edits only the adapter. A structural UI change may update its measurement logic while leaving CDP transport, application identity, bridge methods, rate-limit semantics, and Opsail-owned DOM identifiers untouched. Payload revisions hash the adapter and every renderer asset, so a rebuilt binary detects an older installed runtime as stale and reconciles it idempotently.
+
+The repository's Opsail Skill contains the evidence, repair, test, and packaging workflow for maintaining this adapter. It must not guess selectors from names alone, launch or restart ChatGPT for inspection, copy account text or credentials into fixtures, or turn a repair into arbitrary renderer scripting. If current UI evidence is unavailable, maintenance stops with a request for a bounded screenshot or redacted DOM fixture.
+
+JavaScript remains source-managed but not hot-loaded from a user-writable path. Rust embeds the adapter, probe, early bootstrap, runtime, CSS, model, and locale JSON at compile time. This keeps the installed executable self-contained and prevents an untrusted local file from becoming renderer code.
+
+Run the focused maintenance checks after changing the adapter:
+
+```sh
+node --test packages/node/test/opsail-refit-codex-usage.test.js
+cargo test --locked -p opsail-refit-codex
+cargo clippy --locked -p opsail-refit-codex --all-targets -- -D warnings
+```
+
+Build the executable that carries the embedded adapter with:
+
+```sh
+cargo build --locked --release -p opsail
+```
+
+The resulting CLI is `target/release/opsail`. To verify the standalone library crate package, including every embedded asset, use `cargo package --locked -p opsail-refit-codex --list` and then `cargo package --locked -p opsail-refit-codex`. Publishing the library crate and producing the platform-specific CLI/npm archives remain release-workflow operations; changing the JS source alone does not update an already-installed binary.
 
 ## Library API
 

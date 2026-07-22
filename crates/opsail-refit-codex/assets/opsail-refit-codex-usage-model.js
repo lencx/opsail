@@ -4,6 +4,8 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
   const NOTIFICATION_CALIBRATION_MS = 1200;
   const VISIBLE_REFRESH_MS = 15 * 60 * 1000;
   const REQUEST_ID_PREFIX = "opsail-refit-codex-rate-limits";
+  const MIN_INLINE_CAPSULE_WIDTH = 36;
+  const MIN_ACCOUNT_SLOT_WIDTH = 32;
 
   const clamp = (value, minimum, maximum) => Math.min(maximum, Math.max(minimum, value));
   const normalizedLanguage = (value) => String(value || "").trim().replaceAll("_", "-").toLowerCase();
@@ -116,8 +118,8 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     };
   };
 
-  const labelForDuration = (duration, copy) => {
-    const labels = copy?.windowLabels || {};
+  const labelForDuration = (duration, copy, collection = "windowLabels") => {
+    const labels = copy?.[collection] || copy?.windowLabels || {};
     if (duration !== null && Math.abs(duration - 300) <= 15) return labels.fiveHours;
     if (duration !== null && Math.abs(duration - 10080) <= 504) return labels.weekly;
     if (duration !== null && Math.abs(duration - 1440) <= 72) return labels.daily;
@@ -129,26 +131,81 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     return labels.generic;
   };
 
-  const formatReset = (resetsAt, systemLocale) => {
+  const formatRelativeReset = (milliseconds, copy) => {
+    const units = copy?.relativeUnits;
+    if (!units || ![units.day, units.hour, units.minute, units.separator]
+      .every((value) => typeof value === "string")) return null;
+    const totalMinutes = Math.max(1, Math.ceil(milliseconds / (60 * 1000)));
+    const days = Math.floor(totalMinutes / (24 * 60));
+    const hours = Math.floor((totalMinutes % (24 * 60)) / 60);
+    const minutes = totalMinutes % 60;
+    const parts = [];
+    if (days > 0) {
+      parts.push(`${days}${units.day}`);
+      if (hours > 0) parts.push(`${hours}${units.hour}`);
+    } else if (hours > 0) {
+      parts.push(`${hours}${units.hour}`);
+      if (minutes > 0) parts.push(`${minutes}${units.minute}`);
+    } else {
+      parts.push(`${minutes || 1}${units.minute}`);
+    }
+    return parts.join(units.separator);
+  };
+
+  const formatReset = (resetsAt, copy, displayLocale, nowMs = Date.now()) => {
     if (resetsAt === null) return null;
     const value = new Date(resetsAt * 1000);
     if (!Number.isFinite(value.getTime())) return null;
-    const locale = normalizedLanguage(systemLocale) ? systemLocale : undefined;
+    const locale = normalizedLanguage(displayLocale) ? displayLocale : undefined;
     try {
-      return new Intl.DateTimeFormat(locale, {
+      const full = new Intl.DateTimeFormat(locale, {
         dateStyle: "full",
         timeStyle: "long",
       }).format(value);
+      const date = new Intl.DateTimeFormat(locale, {
+        month: "short",
+        day: "numeric",
+      }).format(value);
+      const weekday = new Intl.DateTimeFormat(locale, {
+        weekday: "short",
+      }).format(value);
+      const time = new Intl.DateTimeFormat(locale, {
+        hour: "numeric",
+        minute: "2-digit",
+      }).format(value);
+      const remainingMilliseconds = value.getTime()
+        - (Number.isFinite(nowMs) ? nowMs : Date.now());
+      return {
+        date,
+        full,
+        relative: remainingMilliseconds > 0
+          ? formatRelativeReset(remainingMilliseconds, copy)
+          : null,
+        soon: remainingMilliseconds <= 0,
+        time,
+        weekday,
+      };
     } catch {
       try {
-        return value.toLocaleString(locale);
+        const full = value.toLocaleString(locale);
+        return {
+          date: full,
+          full,
+          relative: null,
+          soon: false,
+          time: "",
+          weekday: "",
+        };
       } catch {
         return null;
       }
     }
   };
 
-  const presentWindows = (snapshot, copy, systemLocale) => [snapshot?.primary, snapshot?.secondary]
+  const presentWindows = (snapshot, copy, displayLocale, nowMs = Date.now()) => [
+    snapshot?.primary,
+    snapshot?.secondary,
+  ]
     .filter((windowValue) => windowValue
       && typeof windowValue.usedPercent === "number"
       && Number.isFinite(windowValue.usedPercent))
@@ -160,14 +217,22 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
       const remaining = Math.round(100 - windowValue.usedPercent);
       return {
         label: labelForDuration(windowValue.windowDurationMins, copy),
+        summaryLabel: labelForDuration(
+          windowValue.windowDurationMins,
+          copy,
+          "summaryWindowLabels",
+        ),
         used,
         remaining,
-        reset: formatReset(windowValue.resetsAt, systemLocale),
+        reset: formatReset(windowValue.resetsAt, copy, displayLocale, nowMs),
       };
     });
 
   const summaryFor = (windows, copy) => windows
-    .map((windowValue) => formatMessage(copy?.summaryItem, windowValue))
+    .map((windowValue) => formatMessage(copy?.summaryItem, {
+      ...windowValue,
+      label: windowValue.summaryLabel || windowValue.label,
+    }))
     .join(" / ");
 
   const finiteRect = (rect) => {
@@ -231,6 +296,42 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     capsuleWidth,
     gap,
   ].every(Number.isFinite) && rightBoundary - leftBoundary >= capsuleWidth + gap * 2;
+
+  const isSafeInlineCapsuleLayout = ({
+    accountSlot,
+    avatar,
+    host,
+    trailingSlot,
+    sidebar,
+    viewportBottom,
+    minimumHostWidth = MIN_INLINE_CAPSULE_WIDTH,
+    minimumAccountWidth = MIN_ACCOUNT_SLOT_WIDTH,
+  }) => {
+    const accountRect = finiteRect(accountSlot);
+    const avatarRect = finiteRect(avatar);
+    const hostRect = finiteRect(host);
+    const trailingRect = finiteRect(trailingSlot);
+    const sidebarRect = finiteRect(sidebar);
+    if (!accountRect || !avatarRect || !hostRect || !trailingRect || !sidebarRect) return false;
+    if (![viewportBottom, minimumHostWidth, minimumAccountWidth].every(Number.isFinite)) {
+      return false;
+    }
+    const maximumBottom = Math.min(viewportBottom, sidebarRect.bottom);
+    return accountRect.width >= minimumAccountWidth
+      && hostRect.width >= minimumHostWidth
+      && accountRect.left >= sidebarRect.left
+      && accountRect.right <= hostRect.left
+      && avatarRect.left >= accountRect.left
+      && avatarRect.right <= accountRect.right
+      && avatarRect.top >= accountRect.top
+      && avatarRect.bottom <= accountRect.bottom
+      && hostRect.right <= trailingRect.left
+      && trailingRect.right <= sidebarRect.right
+      && hostRect.left >= sidebarRect.left
+      && hostRect.right <= sidebarRect.right
+      && hostRect.top >= Math.max(0, sidebarRect.top)
+      && hostRect.bottom <= maximumBottom;
+  };
 
   const createReadCoordinator = ({
     now = () => Date.now(),
@@ -328,6 +429,7 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
 
   return {
     FOCUS_REFRESH_MIN_MS,
+    MIN_INLINE_CAPSULE_WIDTH,
     NOTIFICATION_CALIBRATION_MS,
     REQUEST_ID_PREFIX,
     REQUEST_TIMEOUT_MS,
@@ -336,6 +438,7 @@ const createOpsailRefitCodexUsageModel = (localeBundle) => {
     computeTooltipPlacement,
     createReadCoordinator,
     formatMessage,
+    isSafeInlineCapsuleLayout,
     mergeSnapshot,
     normalizeSnapshot,
     presentWindows,
