@@ -19,6 +19,7 @@ pub enum CodexRefitStage {
     WaitForEndpoint,
     InspectUsage,
     InjectUsage,
+    InjectModelPicker,
     ConfirmHealth,
     StartManager,
     StopManager,

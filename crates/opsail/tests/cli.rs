@@ -347,7 +347,7 @@ fn refit_codex_update_help_describes_the_offline_activation_boundary() {
 }
 
 #[test]
-fn refit_codex_enable_accepts_only_the_usage_feature() {
+fn refit_codex_enable_rejects_unknown_features() {
     let mut command = cargo_bin_cmd!("opsail");
     command
         .args(["refit", "codex", "enable", "theme"])
@@ -356,7 +356,8 @@ fn refit_codex_enable_accepts_only_the_usage_feature() {
         .stdout("")
         .stderr(
             predicate::str::contains("invalid value 'theme'")
-                .and(predicate::str::contains("usage")),
+                .and(predicate::str::contains("usage"))
+                .and(predicate::str::contains("unlock-model-picker")),
         );
 }
 
@@ -380,7 +381,9 @@ fn refit_codex_enable_help_documents_launch_once_and_persistent_default() {
                 .and(predicate::str::contains("stopped ChatGPT app once"))
                 .and(predicate::str::contains(
                     "background managed mode is the default",
-                )),
+                ))
+                .and(predicate::str::contains("<FEATURE>..."))
+                .and(predicate::str::contains("unlock-model-picker")),
         )
         .stderr("");
 

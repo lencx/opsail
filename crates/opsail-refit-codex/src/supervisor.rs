@@ -18,6 +18,7 @@ pub(super) struct PersistentSupervisor {
     manager_token: String,
     app_identity: ValidatedAppIdentity,
     launched_process: Option<LaunchedProcess>,
+    model_picker_unlock: bool,
     _managed_lock: StateManagedSessionLock,
 }
 
@@ -28,6 +29,7 @@ impl PersistentSupervisor {
         manager_token: String,
         app_identity: ValidatedAppIdentity,
         launched_process: Option<LaunchedProcess>,
+        model_picker_unlock: bool,
         managed_lock: StateManagedSessionLock,
     ) -> Self {
         Self {
@@ -36,6 +38,7 @@ impl PersistentSupervisor {
             manager_token,
             app_identity,
             launched_process,
+            model_picker_unlock,
             _managed_lock: managed_lock,
         }
     }
@@ -112,7 +115,12 @@ impl PersistentSupervisor {
                 }
                 .await;
                 match attempt {
-                    Ok((sessions, _)) => {
+                    Ok((mut sessions, _)) => {
+                        if self.model_picker_unlock {
+                            for session in &mut sessions {
+                                session.inject_model_picker().await?;
+                            }
+                        }
                         self.sessions = sessions;
                         backoff.reset();
                         break;

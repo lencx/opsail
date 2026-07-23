@@ -8,8 +8,18 @@ use clap::{Args, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use opsail_refit_codex::{
     CodexRefit, CodexRefitConfig, CodexRefitError, CodexRefitStage, DEFAULT_CODEX_DEBUG_PORT,
-    LaunchPolicy, RendererAssetUpdatePolicy, SessionMode,
+    LaunchPolicy, RendererAssetUpdatePolicy, SessionMode, unlock_model_picker,
 };
+
+#[derive(Debug, Args)]
+struct CodexUnlockArgs {
+    /// Start a validated, stopped ChatGPT app with remote debugging before injecting.
+    #[arg(short = 'l', long)]
+    launch: bool,
+
+    #[command(flatten)]
+    endpoint: CodexPortArgs,
+}
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -77,6 +87,8 @@ enum CodexRefitCommand {
     Doctor(CodexPortArgs),
     /// Check and install the latest validated renderer JavaScript from GitHub.
     Update(CodexUpdateArgs),
+    /// Unlock the model picker whitelist in a running Codex Desktop renderer via CDP.
+    UnlockModelPicker(CodexUnlockArgs),
 }
 
 #[derive(Debug, Args)]
@@ -90,8 +102,8 @@ struct CodexFeatureArgs {
 
 #[derive(Debug, Args)]
 struct CodexEnableArgs {
-    #[arg(value_enum)]
-    feature: CodexRefitFeature,
+    #[arg(value_enum, value_name = "FEATURE", required = true)]
+    features: Vec<CodexEnableFeature>,
 
     /// Inject only the current document, confirm health, close CDP, and exit; persistent managed mode is the default.
     #[arg(short = 'o', long)]
@@ -154,14 +166,34 @@ impl CodexEnableArgs {
     }
 
     fn should_spawn_background(&self) -> bool {
-        self.session_mode() == SessionMode::Persistent && !self.foreground && !self.background_child
+        self.has_usage()
+            && self.session_mode() == SessionMode::Persistent
+            && !self.foreground
+            && !self.background_child
+    }
+
+    fn has_usage(&self) -> bool {
+        self.features.contains(&CodexEnableFeature::Usage)
+    }
+
+    fn unlock_model_picker(&self) -> bool {
+        self.features
+            .contains(&CodexEnableFeature::UnlockModelPicker)
     }
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CodexRefitFeature {
     /// Show remaining account rate-limit windows in the sidebar account row.
     Usage,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CodexEnableFeature {
+    /// Show remaining account rate-limit windows in the sidebar account row.
+    Usage,
+    /// Unlock Codex Desktop's model picker whitelist for third-party providers.
+    UnlockModelPicker,
 }
 
 pub(crate) async fn run(args: CodexRefitArgs) -> Result<()> {
@@ -173,25 +205,41 @@ pub(crate) async fn run(args: CodexRefitArgs) -> Result<()> {
             if enable.background_child {
                 return run_background_manager(enable).await;
             }
-            let activity = CliActivity::start(if enable.launch {
-                "Starting and enabling the Codex usage refit…"
-            } else {
-                "Enabling the Codex usage refit…"
-            });
-            let adapter = CodexRefit::new(config_with_activity(enable.endpoint.port, &activity))
-                .map_err(diagnostic)?;
-            let mode = enable.session_mode();
-            let launch_policy = enable.launch_policy();
-            let session = match enable.feature {
-                CodexRefitFeature::Usage => adapter
-                    .enable_usage(mode, launch_policy)
+            if enable.has_usage() {
+                let activity = CliActivity::start(if enable.launch {
+                    "Starting and enabling Codex refits…"
+                } else {
+                    "Enabling Codex refits…"
+                });
+                let adapter =
+                    CodexRefit::new(config_with_activity(enable.endpoint.port, &activity))
+                        .map_err(diagnostic)?;
+                let session = adapter
+                    .enable_usage_with_model_picker(
+                        enable.session_mode(),
+                        enable.launch_policy(),
+                        enable.unlock_model_picker(),
+                    )
                     .await
-                    .map_err(diagnostic)?,
-            };
-            drop(adapter);
-            activity.finish();
-            write_json(session.report())?;
-            session.run().await.map_err(diagnostic)
+                    .map_err(diagnostic)?;
+                drop(adapter);
+                activity.finish();
+                write_json(session.report())?;
+                session.run().await.map_err(diagnostic)
+            } else if enable.unlock_model_picker() {
+                let activity = CliActivity::start(if enable.launch {
+                    "Starting Codex and unlocking model picker whitelist…"
+                } else {
+                    "Unlocking Codex model picker whitelist…"
+                });
+                let result = unlock_model_picker(enable.endpoint.port, enable.launch)
+                    .await
+                    .map_err(diagnostic)?;
+                activity.finish();
+                write_json(&result)
+            } else {
+                Err(miette!("at least one enable feature is required"))
+            }
         }
         CodexRefitCommand::Update(update) => {
             let activity = CliActivity::start("Checking Codex renderer updates…");
@@ -232,6 +280,18 @@ pub(crate) async fn run(args: CodexRefitArgs) -> Result<()> {
             activity.finish();
             write_json(&report)
         }
+        CodexRefitCommand::UnlockModelPicker(args) => {
+            let activity = CliActivity::start(if args.launch {
+                "Starting Codex and unlocking model picker whitelist…"
+            } else {
+                "Unlocking Codex model picker whitelist…"
+            });
+            let result = unlock_model_picker(args.endpoint.port, args.launch)
+                .await
+                .map_err(diagnostic)?;
+            activity.finish();
+            write_json(&result)
+        }
     }
 }
 
@@ -251,6 +311,7 @@ fn stage_message(stage: CodexRefitStage) -> &'static str {
         CodexRefitStage::WaitForEndpoint => "Waiting for ChatGPT's CDP endpoint…",
         CodexRefitStage::InspectUsage => "Inspecting the current usage refit…",
         CodexRefitStage::InjectUsage => "Injecting the usage capsule…",
+        CodexRefitStage::InjectModelPicker => "Injecting the model picker whitelist patch…",
         CodexRefitStage::ConfirmHealth => "Confirming renderer health…",
         CodexRefitStage::StartManager => "Starting the managed renderer session…",
         CodexRefitStage::StopManager => "Stopping the managed renderer session…",
@@ -323,15 +384,14 @@ fn background_command(enable: &CodexEnableArgs) -> Result<tokio::process::Comman
         .wrap_err("failed to resolve the current Opsail executable")?;
     let mut command = tokio::process::Command::new(executable);
     let port = enable.endpoint.port.to_string();
-    command.args([
-        "refit",
-        "codex",
-        "enable",
-        "usage",
-        "--background-child",
-        "--port",
-        &port,
-    ]);
+    command.args(["refit", "codex", "enable"]);
+    for feature in &enable.features {
+        command.arg(match feature {
+            CodexEnableFeature::Usage => "usage",
+            CodexEnableFeature::UnlockModelPicker => "unlock-model-picker",
+        });
+    }
+    command.args(["--background-child", "--port", &port]);
     if enable.launch {
         command.arg("--launch");
     }
@@ -462,7 +522,11 @@ async fn run_background_manager(enable: CodexEnableArgs) -> Result<()> {
             });
         let adapter = CodexRefit::new(config)?;
         adapter
-            .enable_usage(SessionMode::Persistent, enable.launch_policy())
+            .enable_usage_with_model_picker(
+                SessionMode::Persistent,
+                enable.launch_policy(),
+                enable.unlock_model_picker(),
+            )
             .await
     }
     .await;
@@ -523,7 +587,7 @@ mod tests {
 
     #[test]
     fn enable_parses_modes_launch_policy_and_port_defaults() {
-        for (arguments, expected_mode, expected_launch, expected_port) in [
+        for (arguments, expected_mode, expected_launch, expected_port, expected_model_picker) in [
             (
                 vec![
                     "opsail", "refit", "codex", "enable", "usage", "-o", "-l", "-p", "55400",
@@ -531,12 +595,28 @@ mod tests {
                 SessionMode::Once,
                 LaunchPolicy::LaunchIfStopped,
                 55400,
+                false,
             ),
             (
                 vec!["opsail", "refit", "codex", "enable", "usage"],
                 SessionMode::Persistent,
                 LaunchPolicy::AttachOnly,
                 DEFAULT_CODEX_DEBUG_PORT,
+                false,
+            ),
+            (
+                vec![
+                    "opsail",
+                    "refit",
+                    "codex",
+                    "enable",
+                    "usage",
+                    "unlock-model-picker",
+                ],
+                SessionMode::Persistent,
+                LaunchPolicy::AttachOnly,
+                DEFAULT_CODEX_DEBUG_PORT,
+                true,
             ),
         ] {
             let cli = Cli::try_parse_from(arguments).unwrap();
@@ -552,6 +632,8 @@ mod tests {
             assert_eq!(enable.session_mode(), expected_mode);
             assert_eq!(enable.launch_policy(), expected_launch);
             assert_eq!(enable.endpoint.port, expected_port);
+            assert!(enable.has_usage());
+            assert_eq!(enable.unlock_model_picker(), expected_model_picker);
             assert_eq!(
                 enable.should_spawn_background(),
                 expected_mode == SessionMode::Persistent
@@ -567,6 +649,7 @@ mod tests {
             "codex",
             "enable",
             "usage",
+            "unlock-model-picker",
             "--launch",
             "--foreground",
             "--port",
@@ -598,6 +681,7 @@ mod tests {
                 "codex",
                 "enable",
                 "usage",
+                "unlock-model-picker",
                 "--background-child",
                 "--port",
                 "55400",

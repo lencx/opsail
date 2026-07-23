@@ -54,6 +54,11 @@ impl CodexSession {
         show_launch_notice(&mut self.cdp, &self.payload).await
     }
 
+    /// Inject the model picker whitelist unlock script into this renderer session.
+    pub(super) async fn inject_model_picker(&mut self) -> Result<(), CodexRefitError> {
+        crate::model_picker::inject_model_picker_into_session(&mut self.cdp).await
+    }
+
     #[cfg(test)]
     pub(super) async fn close(&mut self) {
         self.cdp.close().await;

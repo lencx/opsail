@@ -12,6 +12,7 @@ mod github_update;
 mod launch;
 mod lifecycle;
 mod model;
+mod model_picker;
 mod payload;
 mod platform;
 mod renderer_assets;
@@ -38,6 +39,7 @@ pub use model::{
     RendererAssetActivation, RendererAssetInfo, RendererAssetSource, RendererAssetUpdatePolicy,
     ResetCreditState, SessionMode,
 };
+pub use model_picker::{ModelPickerUnlockResult, unlock_model_picker};
 #[cfg(test)]
 use payload::usage_payload;
 use payload::{UsagePayload, build_usage_payload};
@@ -310,6 +312,16 @@ impl CodexRefit {
         mode: SessionMode,
         launch_policy: LaunchPolicy,
     ) -> Result<CodexUsageSession, CodexRefitError> {
+        self.enable_usage_with_model_picker(mode, launch_policy, false)
+            .await
+    }
+
+    pub async fn enable_usage_with_model_picker(
+        &self,
+        mode: SessionMode,
+        launch_policy: LaunchPolicy,
+        model_picker_unlock: bool,
+    ) -> Result<CodexUsageSession, CodexRefitError> {
         let _operation_lock = self.state.try_operation_lock()?;
         match mode {
             SessionMode::Once => {
@@ -327,6 +339,12 @@ impl CodexRefit {
                         &manager_token,
                     )
                     .await?;
+                if model_picker_unlock {
+                    self.progress.report(CodexRefitStage::InjectModelPicker);
+                    for session in &mut sessions {
+                        session.inject_model_picker().await?;
+                    }
+                }
                 close_sessions(&mut sessions).await;
                 Ok(CodexUsageSession {
                     mode,
@@ -336,16 +354,24 @@ impl CodexRefit {
             }
             SessionMode::Persistent => {
                 let Some(managed_lock) = self.state.try_managed_session_lock()? else {
-                    return self.existing_persistent_session(launch_policy).await;
+                    return self
+                        .existing_persistent_session(launch_policy, model_picker_unlock)
+                        .await;
                 };
                 let manager_token = new_manager_token();
-                let (sessions, report, app_identity, launched_process) = self
+                let (mut sessions, report, app_identity, launched_process) = self
                     .connect_and_enable_with_policy(
                         SessionMode::Persistent,
                         launch_policy,
                         &manager_token,
                     )
                     .await?;
+                if model_picker_unlock {
+                    self.progress.report(CodexRefitStage::InjectModelPicker);
+                    for session in &mut sessions {
+                        session.inject_model_picker().await?;
+                    }
+                }
                 self.progress.report(CodexRefitStage::StartManager);
                 let mut supervisor_adapter = self.clone();
                 supervisor_adapter.progress = ProgressReporter::default();
@@ -358,6 +384,7 @@ impl CodexRefit {
                         manager_token,
                         app_identity,
                         launched_process,
+                        model_picker_unlock,
                         managed_lock,
                     )),
                 })
@@ -859,6 +886,7 @@ impl CodexRefit {
     async fn existing_persistent_session(
         &self,
         launch_policy: LaunchPolicy,
+        model_picker_unlock: bool,
     ) -> Result<CodexUsageSession, CodexRefitError> {
         let mut sessions = self.connect_sessions(&new_manager_token(), None).await?;
         let result = async {
@@ -878,6 +906,12 @@ impl CodexRefit {
                     CodexRefitErrorCode::Stale,
                     "an existing persistent manager did not expose a healthy managed runtime",
                 ));
+            }
+            if model_picker_unlock {
+                self.progress.report(CodexRefitStage::InjectModelPicker);
+                for session in &mut sessions {
+                    session.inject_model_picker().await?;
+                }
             }
             report.operation = CodexRefitOperation::Enable;
             report.port = self.port;
