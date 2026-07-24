@@ -19,7 +19,10 @@ use url::Url;
 use crate::error::{CodexRefitError, CodexRefitErrorCode};
 
 const DISCOVERY_MAX_BYTES: usize = 1024 * 1024;
-const MAX_CDP_MESSAGE_BYTES: usize = 4 * 1024 * 1024;
+// The current Codex renderer module scope can exceed 16 MiB when inspected
+// through Runtime.getProperties. Keep a finite ceiling with enough room for
+// the one provider-routing scope inspection.
+const MAX_CDP_MESSAGE_BYTES: usize = 24 * 1024 * 1024;
 const TARGET_ID_MAX_BYTES: usize = 200;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(2);
 const CDP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -144,6 +147,76 @@ impl CdpSession {
             .unwrap_or(Value::Null))
     }
 
+    pub(crate) async fn evaluate_remote_object(
+        &mut self,
+        expression: &str,
+        object_group: &str,
+    ) -> Result<Value, CodexRefitError> {
+        let result = self
+            .command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": expression,
+                    "awaitPromise": true,
+                    "returnByValue": false,
+                    "objectGroup": object_group,
+                    "userGesture": false
+                })),
+            )
+            .await?;
+        checked_runtime_result(result, "the renderer rejected the refit expression")
+    }
+
+    pub(crate) async fn get_properties(
+        &mut self,
+        object_id: &str,
+    ) -> Result<Value, CodexRefitError> {
+        self.command(
+            "Runtime.getProperties",
+            Some(json!({
+                "objectId": object_id,
+                "ownProperties": true,
+                "accessorPropertiesOnly": false,
+                "generatePreview": false
+            })),
+        )
+        .await
+    }
+
+    pub(crate) async fn call_function_on(
+        &mut self,
+        object_id: &str,
+        function_declaration: &str,
+        arguments: Value,
+    ) -> Result<Value, CodexRefitError> {
+        let result = self
+            .command(
+                "Runtime.callFunctionOn",
+                Some(json!({
+                    "objectId": object_id,
+                    "functionDeclaration": function_declaration,
+                    "arguments": arguments,
+                    "awaitPromise": true,
+                    "returnByValue": true,
+                    "userGesture": false
+                })),
+            )
+            .await?;
+        checked_runtime_result(result, "the renderer rejected the refit function")
+    }
+
+    pub(crate) async fn release_object_group(
+        &mut self,
+        object_group: &str,
+    ) -> Result<(), CodexRefitError> {
+        self.command(
+            "Runtime.releaseObjectGroup",
+            Some(json!({ "objectGroup": object_group })),
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn add_script(&mut self, source: &str) -> Result<String, CodexRefitError> {
         let result = self
             .command(
@@ -254,6 +327,21 @@ impl CdpSession {
             }
         }
     }
+}
+
+fn checked_runtime_result(result: Value, message: &'static str) -> Result<Value, CodexRefitError> {
+    if result.get("exceptionDetails").is_some() {
+        return Err(CodexRefitError::new(
+            CodexRefitErrorCode::InjectionFailed,
+            message,
+        ));
+    }
+    result.get("result").cloned().ok_or_else(|| {
+        CodexRefitError::new(
+            CodexRefitErrorCode::InjectionFailed,
+            "the renderer returned an invalid runtime result",
+        )
+    })
 }
 
 impl Drop for CdpSession {

@@ -1,0 +1,110 @@
+# Opsail gateway model event mapping profile, schema v1.
+#
+# Each upstream SSE `data:` field must contain one JSON object. The
+# discriminator and every field source use RFC 6901 JSON Pointer syntax.
+# Unknown events are ignored. Once a rule matches, missing or mistyped required
+# fields fail the stream instead of guessing.
+
+version = 1
+# Use `input = "sse-envelope"` when the discriminator comes from the SSE
+# `event:` line. Pointers then see `{ event = "...", data = <decoded JSON> }`.
+input = "json-data"
+discriminator = "/event/kind"
+
+[[rules]]
+match = "begin"
+emit = "run-started"
+[rules.fields.run_id]
+pointer = "/data/run_id"
+[rules.fields.model]
+pointer = "/data/model"
+
+[[rules]]
+match = "reasoning-delta"
+emit = "reasoning-summary-delta"
+[rules.where]
+"/data/visibility" = "summary"
+[rules.fields.item_id]
+pointer = "/data/item_id"
+[rules.fields.summary_index]
+pointer = "/data/index"
+[rules.fields.delta]
+pointer = "/data/text"
+
+[[rules]]
+match = "reasoning-done"
+emit = "reasoning-summary-completed"
+[rules.fields.item_id]
+pointer = "/data/item_id"
+[rules.fields.summary_index]
+pointer = "/data/index"
+[rules.fields.text]
+pointer = "/data/text"
+
+[[rules]]
+match = "answer-delta"
+emit = "assistant-text-delta"
+[rules.fields.item_id]
+pointer = "/data/item_id"
+[rules.fields.phase]
+value = "final_answer"
+[rules.fields.delta]
+pointer = "/data/text"
+
+[[rules]]
+match = "tool-start"
+emit = "tool-call-started"
+[rules.fields.item_id]
+pointer = "/data/item_id"
+[rules.fields.call_id]
+pointer = "/data/call_id"
+[rules.fields.name]
+pointer = "/data/name"
+
+[[rules]]
+match = "tool-arguments"
+emit = "tool-call-arguments-delta"
+[rules.fields.item_id]
+pointer = "/data/item_id"
+[rules.fields.call_id]
+pointer = "/data/call_id"
+[rules.fields.delta]
+pointer = "/data/delta"
+
+[[rules]]
+match = "tool-done"
+emit = "tool-call-completed"
+[rules.fields.item_id]
+pointer = "/data/item_id"
+[rules.fields.call_id]
+pointer = "/data/call_id"
+[rules.fields.name]
+pointer = "/data/name"
+[rules.fields.arguments]
+pointer = "/data/arguments"
+
+[[rules]]
+match = "usage"
+emit = "usage-updated"
+[rules.fields.input_tokens]
+pointer = "/data/input_tokens"
+[rules.fields.output_tokens]
+pointer = "/data/output_tokens"
+[rules.fields.total_tokens]
+pointer = "/data/total_tokens"
+
+[[rules]]
+match = "complete"
+emit = "run-completed"
+[rules.fields.response_id]
+pointer = "/data/run_id"
+[rules.fields.model]
+pointer = "/data/model"
+
+[[rules]]
+match = "failed"
+emit = "run-failed"
+[rules.fields.code]
+pointer = "/error/code"
+[rules.fields.message]
+pointer = "/error/message"

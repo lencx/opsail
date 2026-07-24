@@ -14,6 +14,9 @@ use url::Url;
 
 mod activity;
 mod codex;
+mod config;
+mod gateway;
+mod gateway_auth;
 mod machine;
 
 const PROPERTY_NAMES: &str = "content, markdown, contentHtml, html, title, author, description, site, published, modified, image, favicon, language, direction, url, canonicalUrl, domain, wordCount, quality, source, extraction";
@@ -31,6 +34,10 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 
+    /// Read Opsail settings from this TOML file instead of ~/.opsail/config.toml.
+    #[arg(long, value_name = "PATH", global = true)]
+    config: Option<PathBuf>,
+
     /// Increase diagnostic verbosity. Repeat for more detail.
     #[arg(short = 'v', long, action = ArgAction::Count, global = true)]
     verbose: u8,
@@ -43,6 +50,10 @@ enum Command {
     Read(Box<ReadArgs>),
     /// Apply a reversible, target-validated application refit.
     Refit(RefitArgs),
+    /// Initialize or inspect Opsail's versioned user configuration.
+    Config(config::ConfigArgs),
+    /// Run one of Opsail's bounded local gateways.
+    Gateway(gateway::GatewayArgs),
 }
 
 #[derive(Debug, Args)]
@@ -209,15 +220,15 @@ async fn async_main() -> ExitCode {
     init_tracing(cli.verbose);
 
     tokio::select! {
-        exit_code = execute(cli.command) => exit_code,
+        exit_code = execute(cli.command, cli.config) => exit_code,
         () = shutdown_signal() => ExitCode::from(130),
     }
 }
 
-async fn execute(command: Command) -> ExitCode {
+async fn execute(command: Command, config_path: Option<PathBuf>) -> ExitCode {
     match command {
         Command::Read(args) if args.machine => machine::run().await,
-        command => match run(command).await {
+        command => match run(command, config_path).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 let _ = writeln!(io::stderr().lock(), "{error:?}");
@@ -235,7 +246,8 @@ fn init_tracing(verbosity: u8) {
         _ => "trace",
     };
     let filter = EnvFilter::new(format!(
-        "error,opsail={level},opsail_read={level},opsail_chrome={level},opsail_refit_codex={level}"
+        "error,opsail={level},opsail_read={level},opsail_chrome={level},\
+         opsail_refit_codex={level},opsail_gateway_model={level}"
     ));
 
     tracing_subscriber::fmt()
@@ -308,16 +320,22 @@ fn parse_positive_usize(value: &str) -> std::result::Result<usize, String> {
         })
 }
 
-async fn run(command: Command) -> Result<()> {
+async fn run(command: Command, config_path: Option<PathBuf>) -> Result<()> {
     match command {
         Command::Read(args) => run_read(*args).await,
-        Command::Refit(args) => run_refit(args).await,
+        Command::Refit(args) => run_refit(args, config_path).await,
+        Command::Config(args) => config::run(args, config_path),
+        Command::Gateway(args) => {
+            let config = config::ConfigLocation::resolve(config_path)?.load()?;
+            gateway::run(args, &config).await
+        }
     }
 }
 
-async fn run_refit(args: RefitArgs) -> Result<()> {
+async fn run_refit(args: RefitArgs, config_path: Option<PathBuf>) -> Result<()> {
+    let config = config::ConfigLocation::resolve(config_path.clone())?.load()?;
     match args.target {
-        RefitTarget::Codex(args) => codex::run(args).await,
+        RefitTarget::Codex(args) => codex::run(args, &config, config_path.as_deref()).await,
     }
 }
 

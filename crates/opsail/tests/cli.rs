@@ -296,6 +296,91 @@ fn top_level_help_places_the_github_repository_before_usage() {
 }
 
 #[test]
+fn config_init_and_show_use_an_explicit_private_location() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join(".opsail").join("config.toml");
+
+    let mut initialize = cargo_bin_cmd!("opsail");
+    initialize
+        .arg("--config")
+        .arg(&path)
+        .args(["config", "init"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(r#""created": true"#))
+        .stderr("");
+
+    let mut show = cargo_bin_cmd!("opsail");
+    show.arg("--config")
+        .arg(&path)
+        .args(["config", "show"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("version = 1")
+                .and(predicate::str::contains("[refit.codex.model_picker]")),
+        )
+        .stderr("");
+}
+
+#[test]
+fn gateway_model_validates_a_mapping_without_starting_a_server() {
+    let directory = tempdir().unwrap();
+    let config = directory.path().join("config.toml");
+    let mapping = directory.path().join("mapping.toml");
+    fs::write(&config, "version = 1\n").unwrap();
+    fs::write(
+        &mapping,
+        r#"
+version = 1
+discriminator = "/kind"
+
+[[rules]]
+match = "done"
+emit = "run-completed"
+"#,
+    )
+    .unwrap();
+
+    let mut command = cargo_bin_cmd!("opsail");
+    let assert = command
+        .arg("--config")
+        .arg(config)
+        .args(["gateway", "model", "validate-mapping"])
+        .arg(&mapping)
+        .assert()
+        .success()
+        .stderr("");
+    let value: serde_json::Value = serde_json::from_slice(&assert.get_output().stdout).unwrap();
+    assert_eq!(value["valid"], true);
+    assert_eq!(value["schemaVersion"], 1);
+    assert_eq!(value["rules"], 1);
+}
+
+#[test]
+fn gateway_model_help_exposes_routing_security_and_mapping_controls() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args(["gateway", "model", "serve", "--help"])
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("--event-mapping")
+                .and(predicate::str::contains("--upstream-bearer-env"))
+                .and(predicate::str::contains("--upstream-bearer-command"))
+                .and(predicate::str::contains(
+                    "--upstream-bearer-command-refresh-interval-ms",
+                ))
+                .and(predicate::str::contains("--upstream-auth-codex-provider"))
+                .and(predicate::str::contains("--no-upstream-authorization"))
+                .and(predicate::str::contains("--stream-idle-timeout-seconds"))
+                .and(predicate::str::contains("--prompt-cache-routing"))
+                .and(predicate::str::contains("--forward-client-authorization").not()),
+        )
+        .stderr("");
+}
+
+#[test]
 fn read_without_arguments_shows_help_instead_of_reading_stdin() {
     let mut command = cargo_bin_cmd!("opsail");
     let binary_name = if cfg!(windows) {
@@ -437,6 +522,27 @@ fn refit_codex_rejects_privileged_ports_before_target_discovery() {
     let mut command = cargo_bin_cmd!("opsail");
     command
         .args(["refit", "codex", "status", "--port", "80"])
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(
+            predicate::str::contains("[opsail-refit-codex:target-validation-failed]")
+                .and(predicate::str::contains("between 1024 and 65535")),
+        );
+}
+
+#[test]
+fn model_picker_rejects_privileged_ports_before_target_discovery() {
+    let mut command = cargo_bin_cmd!("opsail");
+    command
+        .args([
+            "refit",
+            "codex",
+            "unlock-model-picker",
+            "--no-provider-routing",
+            "--port",
+            "80",
+        ])
         .assert()
         .code(1)
         .stdout("")

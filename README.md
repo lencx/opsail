@@ -37,7 +37,7 @@ See [`opsail-read`](https://github.com/lencx/opsail/blob/main/crates/opsail-read
 
 ### Refit Codex
 
-`opsail refit codex` provides a reversible, target-validated Codex adapter. Its first feature adds localized remaining-usage information to the Codex sidebar using the renderer's existing local bridge, without model calls or changes to the application bundle.
+`opsail refit codex` provides a reversible, target-validated Codex adapter. Its usage feature adds localized remaining-usage information to the Codex sidebar using the renderer's existing local bridge, without model calls or changes to the application bundle. Its model-picker compatibility exposes entries from Codex's effective model catalog and can route selected models to task-local providers without replacing global signed-in authentication.
 
 ![refit-codex](https://raw.githubusercontent.com/lencx/opsail/main/assets/refit-codex.png)
 
@@ -53,6 +53,17 @@ Interactive waits show their current validated lifecycle stage on `stderr`, whil
 
 See [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) for supported targets, attach and launch modes, lifecycle semantics, renderer updates, localization, security checks, and library APIs.
 
+### Gateway model and configuration
+
+`opsail gateway model` is a loopback-only boundary for explicitly routed third-party models. It preserves native Responses streams or maps bounded JSON-SSE shapes through `OpsailEvent v1` into Codex Responses events.
+
+```sh
+opsail config init
+opsail gateway model serve
+```
+
+Settings live in a private `~/.opsail/config.toml`, with CLI overrides. Client ChatGPT credentials cannot be forwarded; each gateway instance owns one third-party credential domain. Provider tokens can come from a named environment variable or a bounded Rust-managed command-auth cache. See [`opsail-gateway-model`](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway-model/README.md) for routing, schemas, security boundaries, and protocol scope.
+
 ## Packages
 
 | Package | Responsibility | Documentation |
@@ -61,6 +72,7 @@ See [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsa
 | [`opsail-read`](https://crates.io/crates/opsail-read) | Content acquisition, extraction, sanitization, and result contracts | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | Cross-platform Chrome lifecycle, CDP transport, and rendered capture | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
 | [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Validated Codex refit lifecycle, usage semantics, localization, and UI payload | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) |
+| [`opsail-gateway-model`](https://crates.io/crates/opsail-gateway-model) | Loopback model routing, canonical event normalization, and Codex Responses projection | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway-model/README.md) |
 | [`opsail`](https://www.npmjs.com/package/opsail) for Node.js | ESM API and native binary distribution | [README](https://github.com/lencx/opsail/blob/main/packages/node/README.md) |
 
 ## Install
@@ -83,7 +95,8 @@ Prebuilt native binaries are available from [GitHub Releases](https://github.com
 
 - [Content extraction and result model](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md)
 - [Chrome and CDP integration](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md)
-- [Codex sidebar refit](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)
+- [Codex refit lifecycle and model picker](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)
+- [Model gateway and canonical event mapping](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway-model/README.md)
 - [Node.js API and packaging](https://github.com/lencx/opsail/blob/main/packages/node/README.md)
 - [Development and contribution guide](https://github.com/lencx/opsail/blob/main/CONTRIBUTING.md)
 

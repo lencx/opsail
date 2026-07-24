@@ -12,6 +12,7 @@ mod github_update;
 mod launch;
 mod lifecycle;
 mod model;
+mod model_picker;
 mod payload;
 mod platform;
 mod renderer_assets;
@@ -38,6 +39,7 @@ pub use model::{
     RendererAssetActivation, RendererAssetInfo, RendererAssetSource, RendererAssetUpdatePolicy,
     ResetCreditState, SessionMode,
 };
+pub use model_picker::{ModelPickerUnlockResult, ModelProviderRouting, unlock_model_picker};
 #[cfg(test)]
 use payload::usage_payload;
 use payload::{UsagePayload, build_usage_payload};

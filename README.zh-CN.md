@@ -37,7 +37,7 @@ opsail read https://example.com/app --launch
 
 ### Codex Refit
 
-`opsail refit codex` 提供可逆且经过目标校验的 Codex 适配器。它的首个功能通过 renderer 已有的本地 bridge，在 Codex 左侧栏显示本地化的剩余额度信息，不调用模型，也不修改应用包。
+`opsail refit codex` 提供可逆且经过目标校验的 Codex 适配器。额度功能通过 renderer 已有的本地 bridge，在 Codex 左侧栏显示本地化的剩余额度信息，不调用模型，也不修改应用包。模型选择器兼容功能负责显示 Codex 有效模型目录中的条目，并可将指定模型路由到任务级 provider，而不替换全局登录认证。
 
 ![refit-codex](https://raw.githubusercontent.com/lencx/opsail/main/assets/refit-codex.png)
 
@@ -53,6 +53,18 @@ opsail refit codex enable usage --launch
 
 支持目标、附加与启动模式、生命周期语义、renderer 更新、多语言、安全校验和库 API 请参阅 [`opsail-refit-codex`](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)。
 
+### Gateway 模型能力与配置
+
+`opsail gateway model` 是仅监听本机回环地址的第三方模型边界。它可以严格保留原生 Responses 流，也可以把 provider 提供的推理摘要投影为 Codex commentary。对于未知的 JSON-SSE 事件结构，可通过受限且带版本号的映射先归一化为 `OpsailEvent v1`，再统一生成 Codex Responses 事件。
+
+```sh
+opsail config init
+opsail gateway model validate-mapping crates/opsail-gateway-model/examples/model-event-mapping.toml
+opsail gateway model serve
+```
+
+配置保存在权限私有的 `~/.opsail/config.toml` 中，运行时设置也都支持命令行覆盖。Codex/ChatGPT 客户端凭证无法通过网关转发；每个网关实例只拥有一个第三方凭证域，provider token 可来自指定环境变量，或由 Rust 管理的受限 command-auth 内存缓存。路由方式、Codex provider 配置、映射限制、安全边界和当前协议范围请参阅 [`opsail-gateway-model`](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway-model/README.md)。
+
 ## 包结构
 
 | 包 | 职责 | 文档 |
@@ -61,6 +73,7 @@ opsail refit codex enable usage --launch
 | [`opsail-read`](https://crates.io/crates/opsail-read) | 内容获取、正文提取、清理和结果契约 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md) |
 | [`opsail-chrome`](https://crates.io/crates/opsail-chrome) | 跨平台 Chrome 生命周期、CDP 传输和渲染捕获 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md) |
 | [`opsail-refit-codex`](https://crates.io/crates/opsail-refit-codex) | Codex 适配生命周期、额度语义、多语言和 UI payload | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md) |
+| [`opsail-gateway-model`](https://crates.io/crates/opsail-gateway-model) | 本机模型路由、统一事件归一化与 Codex Responses 投影 | [README](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway-model/README.md) |
 | Node.js [`opsail`](https://www.npmjs.com/package/opsail) | ESM API 与原生二进制分发 | [README](https://github.com/lencx/opsail/blob/main/packages/node/README.md) |
 
 ## 安装
@@ -83,7 +96,8 @@ npm install opsail
 
 - [内容提取与结果模型](https://github.com/lencx/opsail/blob/main/crates/opsail-read/README.md)
 - [Chrome 与 CDP 集成](https://github.com/lencx/opsail/blob/main/crates/opsail-chrome/README.md)
-- [Codex 左侧栏 Refit](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)
+- [Codex Refit 生命周期与模型选择器](https://github.com/lencx/opsail/blob/main/crates/opsail-refit-codex/README.md)
+- [模型网关与统一事件映射](https://github.com/lencx/opsail/blob/main/crates/opsail-gateway-model/README.md)
 - [Node.js API 与打包](https://github.com/lencx/opsail/blob/main/packages/node/README.md)
 - [开发与贡献指南](https://github.com/lencx/opsail/blob/main/CONTRIBUTING.md)
 

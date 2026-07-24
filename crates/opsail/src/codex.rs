@@ -1,4 +1,6 @@
+use std::collections::BTreeMap;
 use std::io::{self, Write as _};
+use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8,13 +10,15 @@ use clap::{Args, Subcommand, ValueEnum};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use opsail_refit_codex::{
     CodexRefit, CodexRefitConfig, CodexRefitError, CodexRefitStage, DEFAULT_CODEX_DEBUG_PORT,
-    LaunchPolicy, RendererAssetUpdatePolicy, SessionMode,
+    LaunchPolicy, ModelProviderRouting, RendererAssetUpdatePolicy, SessionMode,
+    unlock_model_picker,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::activity::CliActivity;
+use crate::config::OpsailConfig;
 use crate::{with_trailing_newline, write_stdout};
 
 const BACKGROUND_START_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,6 +28,125 @@ const BACKGROUND_STAGE_STABILITY_DELAY: Duration = Duration::from_millis(120);
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ModelProviderRoute {
+    model: String,
+    provider: String,
+}
+
+fn parse_model_provider_route(value: &str) -> std::result::Result<ModelProviderRoute, String> {
+    let (model, provider) = value
+        .split_once('=')
+        .ok_or_else(|| "route must use MODEL=PROVIDER".to_owned())?;
+    if [model, provider].iter().any(|part| {
+        part.is_empty()
+            || part.trim() != *part
+            || part.chars().any(char::is_control)
+            || part.len() > 512
+    }) {
+        return Err(
+            "route model and provider must be non-empty, trimmed, control-free, and at most 512 bytes"
+                .to_owned(),
+        );
+    }
+    Ok(ModelProviderRoute {
+        model: model.to_owned(),
+        provider: provider.to_owned(),
+    })
+}
+
+#[derive(Debug, Args)]
+struct CodexUnlockArgs {
+    /// Start a validated, stopped ChatGPT app with remote debugging before injecting.
+    #[arg(short = 'l', long)]
+    launch: bool,
+
+    /// Provider id for each matching --model; retained as a compact single-provider form.
+    #[arg(
+        long,
+        value_name = "PROVIDER",
+        requires = "model",
+        conflicts_with_all = ["route", "no_provider_routing"]
+    )]
+    model_provider: Option<String>,
+
+    /// Model slug to route to --model-provider; repeat for multiple models.
+    #[arg(
+        long,
+        value_name = "MODEL",
+        requires = "model_provider",
+        conflicts_with_all = ["route", "no_provider_routing"]
+    )]
+    model: Vec<String>,
+
+    /// Route one model to one provider as MODEL=PROVIDER; repeat for multiple providers.
+    #[arg(
+        long,
+        value_name = "MODEL=PROVIDER",
+        value_parser = parse_model_provider_route,
+        conflicts_with_all = ["model_provider", "model", "no_provider_routing"]
+    )]
+    route: Vec<ModelProviderRoute>,
+
+    /// Provider used when a routed task switches back to an unmapped native model.
+    #[arg(long, value_name = "PROVIDER")]
+    default_provider: Option<String>,
+
+    /// Ignore every provider route from config and inject only model visibility.
+    #[arg(
+        long,
+        conflicts_with_all = ["model_provider", "model", "route", "default_provider"]
+    )]
+    no_provider_routing: bool,
+
+    #[command(flatten)]
+    endpoint: CodexPortArgs,
+}
+
+impl CodexUnlockArgs {
+    fn routing(&self, config: &OpsailConfig) -> Result<ModelProviderRouting> {
+        let routes = if self.no_provider_routing {
+            BTreeMap::new()
+        } else if !self.route.is_empty() {
+            collect_routes(
+                self.route
+                    .iter()
+                    .map(|route| (route.model.clone(), route.provider.clone())),
+            )?
+        } else if let Some(provider) = &self.model_provider {
+            collect_routes(
+                self.model
+                    .iter()
+                    .cloned()
+                    .map(|model| (model, provider.clone())),
+            )?
+        } else {
+            config.refit.codex.model_picker.routes.clone()
+        };
+        let default_provider = self
+            .default_provider
+            .as_deref()
+            .unwrap_or_else(|| config.refit.codex.model_picker.default_provider());
+        ModelProviderRouting::new(routes, default_provider).map_err(diagnostic)
+    }
+}
+
+fn collect_routes(
+    routes: impl IntoIterator<Item = (String, String)>,
+) -> Result<BTreeMap<String, String>> {
+    let mut collected = BTreeMap::new();
+    for (model, provider) in routes {
+        if let Some(previous) = collected.insert(model.clone(), provider.clone())
+            && previous != provider
+        {
+            return Err(miette!(
+                "model {model:?} has conflicting provider routes {previous:?} and {provider:?}"
+            ));
+        }
+    }
+    Ok(collected)
+}
 
 #[derive(Debug, Default)]
 struct PendingBackgroundStage {
@@ -77,6 +200,8 @@ enum CodexRefitCommand {
     Doctor(CodexPortArgs),
     /// Check and install the latest validated renderer JavaScript from GitHub.
     Update(CodexUpdateArgs),
+    /// Expose catalog models and optionally route them per task without changing global Codex auth.
+    UnlockModelPicker(CodexUnlockArgs),
 }
 
 #[derive(Debug, Args)]
@@ -114,9 +239,15 @@ struct CodexEnableArgs {
 
 #[derive(Debug, Args)]
 struct CodexPortArgs {
-    /// 127.0.0.1 CDP port; defaults to 55321 and may be explicitly overridden.
-    #[arg(short = 'p', long, default_value_t = DEFAULT_CODEX_DEBUG_PORT)]
-    port: u16,
+    /// 127.0.0.1 CDP port; overrides refit.codex.debug_port and the 55321 fallback.
+    #[arg(short = 'p', long)]
+    port: Option<u16>,
+}
+
+impl CodexPortArgs {
+    fn resolve(&self, config: &OpsailConfig) -> u16 {
+        self.port.unwrap_or_else(|| config.refit.codex.debug_port())
+    }
 }
 
 #[derive(Debug, Args)]
@@ -164,22 +295,27 @@ enum CodexRefitFeature {
     Usage,
 }
 
-pub(crate) async fn run(args: CodexRefitArgs) -> Result<()> {
+pub(crate) async fn run(
+    args: CodexRefitArgs,
+    config: &OpsailConfig,
+    explicit_config_path: Option<&Path>,
+) -> Result<()> {
     match args.command {
         CodexRefitCommand::Enable(enable) => {
+            let port = enable.endpoint.resolve(config);
             if enable.should_spawn_background() {
-                return spawn_background_manager(&enable).await;
+                return spawn_background_manager(&enable, port, explicit_config_path).await;
             }
             if enable.background_child {
-                return run_background_manager(enable).await;
+                return run_background_manager(enable, port).await;
             }
             let activity = CliActivity::start(if enable.launch {
                 "Starting and enabling the Codex usage refit…"
             } else {
                 "Enabling the Codex usage refit…"
             });
-            let adapter = CodexRefit::new(config_with_activity(enable.endpoint.port, &activity))
-                .map_err(diagnostic)?;
+            let adapter =
+                CodexRefit::new(config_with_activity(port, &activity)).map_err(diagnostic)?;
             let mode = enable.session_mode();
             let launch_policy = enable.launch_policy();
             let session = match enable.feature {
@@ -209,28 +345,45 @@ pub(crate) async fn run(args: CodexRefitArgs) -> Result<()> {
             feature: CodexRefitFeature::Usage,
             endpoint,
         }) => {
+            let port = endpoint.resolve(config);
             let activity = CliActivity::start("Removing the Codex usage refit…");
-            let adapter = CodexRefit::new(config_with_activity(endpoint.port, &activity))
-                .map_err(diagnostic)?;
+            let adapter =
+                CodexRefit::new(config_with_activity(port, &activity)).map_err(diagnostic)?;
             let report = adapter.disable_usage().await.map_err(diagnostic)?;
             activity.finish();
             write_json(&report)
         }
         CodexRefitCommand::Status(endpoint) => {
+            let port = endpoint.resolve(config);
             let activity = CliActivity::start("Inspecting the Codex usage refit…");
-            let adapter = CodexRefit::new(config_with_activity(endpoint.port, &activity))
-                .map_err(diagnostic)?;
+            let adapter =
+                CodexRefit::new(config_with_activity(port, &activity)).map_err(diagnostic)?;
             let report = adapter.status().await.map_err(diagnostic)?;
             activity.finish();
             write_json(&report)
         }
         CodexRefitCommand::Doctor(endpoint) => {
+            let port = endpoint.resolve(config);
             let activity = CliActivity::start("Running Codex refit diagnostics…");
-            let adapter = CodexRefit::new(config_with_activity(endpoint.port, &activity))
-                .map_err(diagnostic)?;
+            let adapter =
+                CodexRefit::new(config_with_activity(port, &activity)).map_err(diagnostic)?;
             let report = adapter.doctor().await;
             activity.finish();
             write_json(&report)
+        }
+        CodexRefitCommand::UnlockModelPicker(args) => {
+            let port = args.endpoint.resolve(config);
+            let provider_routing = args.routing(config)?;
+            let activity = CliActivity::start(if args.launch {
+                "Starting Codex and installing model-picker compatibility…"
+            } else {
+                "Installing Codex model-picker compatibility…"
+            });
+            let result = unlock_model_picker(port, args.launch, provider_routing)
+                .await
+                .map_err(diagnostic)?;
+            activity.finish();
+            write_json(&result)
         }
     }
 }
@@ -317,12 +470,19 @@ impl Drop for BackgroundChildGuard {
     }
 }
 
-fn background_command(enable: &CodexEnableArgs) -> Result<tokio::process::Command> {
+fn background_command(
+    enable: &CodexEnableArgs,
+    port: u16,
+    explicit_config_path: Option<&Path>,
+) -> Result<tokio::process::Command> {
     let executable = std::env::current_exe()
         .into_diagnostic()
         .wrap_err("failed to resolve the current Opsail executable")?;
     let mut command = tokio::process::Command::new(executable);
-    let port = enable.endpoint.port.to_string();
+    let port = port.to_string();
+    if let Some(path) = explicit_config_path {
+        command.arg("--config").arg(path);
+    }
     command.args([
         "refit",
         "codex",
@@ -346,13 +506,17 @@ fn background_command(enable: &CodexEnableArgs) -> Result<tokio::process::Comman
     Ok(command)
 }
 
-async fn spawn_background_manager(enable: &CodexEnableArgs) -> Result<()> {
+async fn spawn_background_manager(
+    enable: &CodexEnableArgs,
+    port: u16,
+    explicit_config_path: Option<&Path>,
+) -> Result<()> {
     let activity = CliActivity::start(if enable.launch {
         "Starting ChatGPT and the Codex usage manager…"
     } else {
         "Starting the Codex usage manager…"
     });
-    let child = background_command(enable)?
+    let child = background_command(enable, port, explicit_config_path)?
         .spawn()
         .into_diagnostic()
         .wrap_err("failed to start the background Codex refit manager")?;
@@ -405,7 +569,7 @@ async fn spawn_background_manager(enable: &CodexEnableArgs) -> Result<()> {
                         pending_stage.replace(stage, tokio::time::Instant::now());
                     }
                     BackgroundStartupMessage::Ready { report } => {
-                        validate_background_report(&report, enable.endpoint.port)?;
+                        validate_background_report(&report, port)?;
                         activity.finish();
                         write_json(&report)?;
                         child.disarm();
@@ -447,19 +611,18 @@ fn validate_background_report(report: &Value, port: u16) -> Result<()> {
     }
 }
 
-async fn run_background_manager(enable: CodexEnableArgs) -> Result<()> {
+async fn run_background_manager(enable: CodexEnableArgs, port: u16) -> Result<()> {
     let startup_open = Arc::new(AtomicBool::new(true));
     let progress_open = Arc::clone(&startup_open);
     let result = async {
-        let config =
-            CodexRefitConfig::new(enable.endpoint.port).with_progress_handler(move |stage| {
-                if progress_open.load(Ordering::Acquire) {
-                    let _ = write_background_startup(&json!({
-                        "status": "progress",
-                        "stage": stage,
-                    }));
-                }
-            });
+        let config = CodexRefitConfig::new(port).with_progress_handler(move |stage| {
+            if progress_open.load(Ordering::Acquire) {
+                let _ = write_background_startup(&json!({
+                    "status": "progress",
+                    "stage": stage,
+                }));
+            }
+        });
         let adapter = CodexRefit::new(config)?;
         adapter
             .enable_usage(SessionMode::Persistent, enable.launch_policy())
@@ -551,7 +714,10 @@ mod tests {
             };
             assert_eq!(enable.session_mode(), expected_mode);
             assert_eq!(enable.launch_policy(), expected_launch);
-            assert_eq!(enable.endpoint.port, expected_port);
+            assert_eq!(
+                enable.endpoint.resolve(&OpsailConfig::default()),
+                expected_port
+            );
             assert_eq!(
                 enable.should_spawn_background(),
                 expected_mode == SessionMode::Persistent
@@ -585,7 +751,7 @@ mod tests {
         assert!(!enable.should_spawn_background());
 
         enable.foreground = false;
-        let command = background_command(&enable).unwrap();
+        let command = background_command(&enable, 55400, None).unwrap();
         let arguments = command
             .as_std()
             .get_args()
@@ -603,6 +769,19 @@ mod tests {
                 "55400",
                 "--launch",
             ]
+        );
+
+        let command =
+            background_command(&enable, 55400, Some(Path::new("/tmp/custom-opsail.toml"))).unwrap();
+        let arguments = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &arguments[..2],
+            ["--config", "/tmp/custom-opsail.toml"],
+            "the background child must load the same explicit config"
         );
     }
 
@@ -632,6 +811,72 @@ mod tests {
             panic!("expected forced Codex update arguments");
         };
         assert_eq!(update.policy(), RendererAssetUpdatePolicy::Force);
+    }
+
+    #[test]
+    fn model_picker_routes_use_cli_over_config_and_support_multiple_providers() {
+        let mut config = OpsailConfig::default();
+        config.refit.codex.model_picker.routes.insert(
+            "configured-model".to_owned(),
+            "configured-provider".to_owned(),
+        );
+        let cli = Cli::try_parse_from([
+            "opsail",
+            "refit",
+            "codex",
+            "unlock-model-picker",
+            "--route",
+            "model-a=provider-a",
+            "--route",
+            "model-b=provider-b",
+            "--default-provider",
+            "native",
+        ])
+        .unwrap();
+        let Command::Refit(RefitArgs {
+            target:
+                RefitTarget::Codex(CodexRefitArgs {
+                    command: CodexRefitCommand::UnlockModelPicker(args),
+                }),
+        }) = cli.command
+        else {
+            panic!("expected model-picker arguments");
+        };
+        let routing = args.routing(&config).unwrap();
+        assert_eq!(routing.routes.len(), 2);
+        assert_eq!(routing.routes["model-a"], "provider-a");
+        assert_eq!(routing.routes["model-b"], "provider-b");
+        assert!(!routing.routes.contains_key("configured-model"));
+        assert_eq!(routing.default_provider, "native");
+    }
+
+    #[test]
+    fn model_picker_can_explicitly_ignore_configured_routes() {
+        let mut config = OpsailConfig::default();
+        config
+            .refit
+            .codex
+            .model_picker
+            .routes
+            .insert("model".to_owned(), "provider".to_owned());
+        let cli = Cli::try_parse_from([
+            "opsail",
+            "refit",
+            "codex",
+            "unlock-model-picker",
+            "--no-provider-routing",
+        ])
+        .unwrap();
+        let Command::Refit(RefitArgs {
+            target:
+                RefitTarget::Codex(CodexRefitArgs {
+                    command: CodexRefitCommand::UnlockModelPicker(args),
+                }),
+        }) = cli.command
+        else {
+            panic!("expected model-picker arguments");
+        };
+        assert!(args.routing(&config).unwrap().routes.is_empty());
     }
 
     #[test]

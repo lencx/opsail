@@ -16,13 +16,16 @@ path = "src/main.rs"
 [dependencies]
 clap.workspace = true
 indicatif.workspace = true
+http.workspace = true
 libc.workspace = true
 miette.workspace = true
 opsail-read = { path = "../opsail-read", version = "0.2.0" }
 opsail-refit-codex = { path = "../opsail-refit-codex", version = "0.1.0" }
+opsail-gateway-model = { path = "../opsail-gateway-model", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true

@@ -193,3 +193,63 @@ Embedders can construct `CodexRefit` with `CodexRefitConfig` and call `enable_us
 A `stale` target with `healthy: true` means the installed runtime is structurally healthy but its local account snapshot is unavailable or stale; enable remains idempotent and does not reinject in that case. A `stale` target with `healthy: false` means renderer artifacts and the session lifecycle marker require reconciliation.
 
 Local managed markers, versioned renderer JavaScript, and advisory locks live under `~/Library/Application Support/opsail/refit/codex` on macOS and `%LOCALAPPDATA%\opsail\refit\codex` on Windows by default. macOS applies owner-only permission bits. Windows rejects symlinks and reparse points and replaces inherited access with a protected DACL granting full control only to the current user and SYSTEM; directory entries inherit that policy to descendants. Markers contain only bounded target identifiers, payload revisions, debugging ports, the persistent mode, non-secret installation tokens, and the owning Opsail manager PID plus its creation-time identity on Windows. CDP early-script identifiers remain only in the live session that owns them and are never treated as cross-connection receipts. CSS and locale JSON stay embedded; updated JavaScript is stored only in Opsail's state tree and never in a Codex configuration directory or the application installation tree.
+
+## Model picker and task-local providers
+
+`unlock-model-picker` is a separate compatibility operation from the usage
+refit:
+
+```sh
+opsail refit codex unlock-model-picker \
+  --launch \
+  --route sf-deepseek-v3.2=opsail-gateway-model
+```
+
+It does not create model descriptors. Models still come from Codex's effective
+catalog, including a configured `model_catalog_json`. The renderer patch only
+makes catalog entries that Codex marked hidden eligible for display and
+disables the current hidden-model gate. If a model is absent from the catalog,
+this command cannot invent it.
+
+Provider routing is explicit and task-local. For a configured model slug,
+Opsail patches `thread/start`, `thread/resume`, and `thread/fork` with that
+model's `modelProvider`. When an existing task changes between a native and a
+routed model, the dispatcher performs the Codex-required unsubscribe/resume
+transition before `turn/start`; concurrent switches are deduplicated and a
+failed switch attempts to restore the last known provider. It never writes a
+global `model_provider` value.
+
+Multiple providers can be routed independently:
+
+```sh
+opsail refit codex unlock-model-picker \
+  --route model-a=provider-a \
+  --route model-b=provider-b \
+  --default-provider openai
+```
+
+The compact single-provider form remains available:
+
+```sh
+opsail refit codex unlock-model-picker \
+  --model-provider opsail-gateway-model \
+  --model model-a \
+  --model model-b
+```
+
+Routes may instead be stored under
+`[refit.codex.model_picker.routes]` in `~/.opsail/config.toml`. Command-line
+routes replace configured routes for that invocation.
+`--no-provider-routing` installs only model visibility.
+
+The native signed-in provider should remain `openai`. A third-party provider
+must use its own authentication and should set `requires_openai_auth = false`;
+see [`opsail-gateway-model`](../opsail-gateway-model/README.md) for the
+loopback provider and credential-partition contract.
+
+The operation validates the same signed application, numeric loopback CDP
+listener, primary `app://-/index.html` renderer, and bounded route values
+before injection. The model-visibility bootstrap is registered for later
+documents in the current renderer target. The request-dispatcher route patch
+belongs to the current renderer instance; rerun `unlock-model-picker` after a
+renderer reconstruction or application restart.

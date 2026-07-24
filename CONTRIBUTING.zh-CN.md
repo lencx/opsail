@@ -16,12 +16,13 @@ crates/opsail          原生 CLI 解析、协议路由、诊断和退出行为
 crates/opsail-chrome   Chrome 可执行文件查找、自有生命周期、CDP 与 DOM 捕获
 crates/opsail-read     来源编排、HTML 获取、正文提取、清洗和结果 schema
 crates/opsail-refit-codex Codex refit 生命周期、目标安全校验与 renderer 集成
+crates/opsail-gateway-model 模型网关传输、统一事件、映射与 Codex 投影
 packages/node          公开 `opsail` npm facade 与原生二进制解析
 skills/bootstrap-opsail 面向 Agent 的临时安装控制面
 skills/opsail          统一的 Opsail 运行时 Agent Skill
 ```
 
-原生 `opsail` crate 负责统一命令入口，公开的 `opsail` npm package 是轻量进程适配层。生成的 `@opsail/<platform>-<arch>` package 仅承载二进制实现，不是额外 API。`opsail-chrome` 负责所有 Chrome 专属机制：跨平台可执行文件查找、隔离进程的启动与清理、借用 CDP 连接、target 生命周期、导航等待和渲染后 DOM 捕获；它不负责正文提取或清洗。`opsail-read` 选择并校验来源，获取非浏览器 HTML，将浏览器捕获委托给 `opsail-chrome`，并负责提取、清洗和 `ReadResult`。`opsail-refit-codex` 负责 Codex 专属的应用身份、进程与 loopback CDP 校验、renderer bridge、选择器、额度语义、本地化资源和 UI payload；在第二个适配器证明存在稳定共享契约前，refit 生命周期保持为其内部模块。未来行动在具备内聚的类型化 API 和独立测试后，应成为同级 `opsail-<action>` crate，再通过现有 CLI、npm facade 与统一运行时 Skill 暴露。在多个已实现模块证明有实际需要之前，不引入插件 ABI 或共享框架。
+原生 `opsail` crate 负责统一命令入口、带版本号的用户配置和 CLI 覆盖优先级，公开的 `opsail` npm package 是轻量进程适配层。生成的 `@opsail/<platform>-<arch>` package 仅承载二进制实现，不是额外 API。`opsail-chrome` 负责所有 Chrome 专属机制：跨平台可执行文件查找、隔离进程的启动与清理、借用 CDP 连接、target 生命周期、导航等待和渲染后 DOM 捕获；它不负责正文提取或清洗。`opsail-read` 选择并校验来源，获取非浏览器 HTML，将浏览器捕获委托给 `opsail-chrome`，并负责提取、清洗和 `ReadResult`。`opsail-refit-codex` 负责 Codex 专属的应用身份、进程与 loopback CDP 校验、renderer bridge、选择器、额度语义、模型可见性、任务级 provider 路由、本地化资源和 UI payload。`opsail-gateway-model` 负责第三方 loopback 传输、凭证分流、受限事件映射、`OpsailEventV1` 与 Codex Responses 投影；声明式映射必须保持不可执行，有状态协议应使用代码适配器。未来的 gateway 能力域应放在 `opsail gateway <domain>` 下，并拥有独立的内聚 crate 与类型契约。在至少两个已经实现的能力域证明存在相同且稳定的抽象前，不引入共享 gateway core。
 
 ## 库入口
 
@@ -42,6 +43,12 @@ skills/opsail          统一的 Opsail 运行时 Agent Skill
 `opsail-read` 的两个入口都返回 CLI JSON 输出所使用的带版本号 `ReadResult` 模型。浏览器捕获保留不同的来源信息：自有启动使用 `SourceKind::Chrome`，借用 endpoint 使用 `SourceKind::Cdp`。
 
 `opsail-refit-codex` 暴露通过 `CodexRefitConfig` 配置的 `CodexRefit`，提供异步的 `enable_usage`、`disable_usage`、`status` 与只读 `doctor` 操作。适配器支持经过校验的 macOS 应用 `/Applications/ChatGPT.app`，以及 Windows x64 和 ARM64 发布目标上当前用户已校验的 `OpenAI.Codex` Microsoft Store 包；Linux 和 32 位 Windows 发布不受支持。Enable 默认为只附加；只有显式使用类型化 `LaunchIfStopped` 策略时，才可通过平台校验后的启动机制启动一次应用，但不得退出、kill、重启、重载、修改或重新签名它。`doctor`、`status` 与 `disable` 绝不启动应用。连接必须只使用 `127.0.0.1`，并且只有平台应用身份、进程归属、renderer URL 与 shell、侧栏以及预期本机 bridge 全部通过校验后才能继续。Codex 协议名、选择器、额度语义、本地化 JSON 和 UI 文案均属于此 crate，不进入共享模块。
+
+`opsail-gateway-model` 暴露 `GatewayServer`、原生与映射 SSE
+投影器、`EventMappingProfileV1` 和 `OpsailEventV1`。客户端认证绝不能作为
+upstream 认证；传输请求头与响应头必须由网关重新生成，不能复制客户端值；每个
+网关实例只属于一个 provider 凭证域，跨 provider 的请求私有状态必须剥离；映射
+失败必须在流内终止，不能猜测或泄漏输入值。
 
 ## 开发流程
 
